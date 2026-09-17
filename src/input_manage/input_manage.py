@@ -203,11 +203,7 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
 
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            _clean(df).to_excel(writer, sheet_name=_sheet_name(name), index=False)
-    body = buf.getvalue()
+    body = to_xlsx(sheets)
 
     now = datetime.now(KST)
     # 이력을 먼저 올린다. 순서가 반대면, 본 파일은 바뀌었는데 이력이 없는
@@ -217,6 +213,15 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
     _trim_history(book)
     _append_audit(now, user_id, book, before, sheets)
     return etag
+
+
+def to_xlsx(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """시트들을 엑셀 파일 한 벌로. 저장과 내려받기가 같은 것을 쓴다."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            _clean(df).to_excel(writer, sheet_name=_sheet_name(name), index=False)
+    return buf.getvalue()
 
 
 def _history_name(now: datetime, user_id: str, body: bytes) -> str:
@@ -429,6 +434,12 @@ S_NONCE = "_im_nonce"
 # 스크립트를 처음부터 다시 돌리므로 그 전에 그린 st.success 는 화면에 남지
 # 않는다. 그래서 문구를 여기 맡겨 두고 다음 판에서 그린다.
 S_TOAST = "_im_toast"
+# 내려받을 엑셀. 만들어 둔 뒤에야 st.download_button 을 그릴 수 있다.
+#
+# 버튼에 바로 못 붙이는 이유: st.download_button 은 파일 내용을 미리 받아야
+# 하는데, 8000행짜리 엑셀을 만드는 데 1초 넘게 걸린다. 그걸 화면 그릴 때마다
+# 하면 칸 하나 고칠 때마다 그 값을 치르게 된다. 그래서 누를 때만 만든다.
+S_DOWNLOAD = "_im_download"
 
 
 def _load(book: str) -> None:
@@ -469,6 +480,9 @@ def show_input_manage() -> None:
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다. 이전 파일의 미저장 수정은
     # 들고 가지 않는다 -- 시트 이름이 겹칠 때 엉뚱한 표에 얹히기 때문이다.
     if reload_now or st.session_state.get(S_BOOK) != book:
+        # 만들어 둔 내려받기 파일은 버린다. 안 그러면 파일을 바꿔 골랐는데
+        # 이전 파일 내용이 담긴 버튼이 그대로 남는다.
+        st.session_state.pop(S_DOWNLOAD, None)
         _load(book)
         if reload_now:
             st.rerun()
@@ -499,10 +513,21 @@ def show_input_manage() -> None:
             counts[f"{name} (지움)"] = max(len(sheets[name]), 1)
     total = sum(counts.values())
 
-    left, _gap = st.columns([1, 5])
-    with left:
+    save_col, make_col, get_col, _gap = st.columns([1, 1.2, 1.6, 3])
+    with save_col:
         if st.button("저장", type="primary", disabled=total == 0, width="stretch"):
             _save(book, edited, user_id)
+    with make_col:
+        if st.button("엑셀 만들기", width="stretch",
+                     help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 만듭니다"):
+            st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited))
+    with get_col:
+        ready = st.session_state.get(S_DOWNLOAD)
+        if ready:
+            st.download_button(f"⬇ {ready[0]}", ready[1], file_name=ready[0],
+                               width="stretch",
+                               mime="application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet")
 
     if total:
         changed = ", ".join(f"{n}({c})" for n, c in counts.items() if c)
@@ -529,6 +554,7 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
     # 그려지고, '고친 칸' 은 0 으로 돌아간다.
     st.session_state[S_SHEETS] = {k: v.copy() for k, v in edited.items()}
     st.session_state[S_STAMP] = stamp
+    st.session_state.pop(S_DOWNLOAD, None)
     st.session_state[S_TOAST] = f"'{book}' 저장했습니다 ({user_id})."
     st.rerun()
 

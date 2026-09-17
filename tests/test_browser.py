@@ -270,7 +270,7 @@ def test_undo_puts_back_what_a_delete_removed(page):
     grid(page).get_by_text("행 삭제", exact=True).click()
     page.wait_for_timeout(600)
     assert table(page)["rows"] != before["rows"]
-    grid(page).get_by_text("되돌리기", exact=True).click()
+    grid(page).locator("button[data-act='undo']").click()
     page.wait_for_timeout(600)
     assert table(page)["rows"] == before["rows"]
 
@@ -347,11 +347,90 @@ def test_adding_a_sheet(page):
     wait_dirty(page)
 
 
-def test_the_cell_address_box_says_where_you_are(page):
-    """수백 줄짜리에서 '지금 어디를 보고 있나' 는 제일 먼저 잃는 정보다."""
+# ------------------------------------------- 주소 / 수식줄 / 찾기 / 내려받기
+
+def test_the_address_box_uses_excel_notation(page):
+    """A1, E1493 처럼 적어야 한다 -- 사람끼리 자리를 말할 때 쓰는 말이 그거다."""
+    reset(page)
+    click_cell(page, 0, 0)
+    assert grid(page).locator("#addr").inner_text() == "A2"
+    click_cell(page, 2, 4)
+    assert grid(page).locator("#addr").inner_text() == "E4"
+
+
+def test_the_address_row_matches_what_excel_would_show(page):
+    """화면 1행은 엑셀에서 2행이다 (엑셀 1행은 칸 이름 줄).
+
+    여기가 어긋나면 "A5 고쳐줘" 하고 엑셀을 열었을 때 한 줄씩 밀린다.
+    """
+    reset(page)
+    click_cell(page, 1, 1)
+    assert grid(page).locator("#addr").inner_text() == "B3"
+
+
+def test_the_formula_bar_shows_the_selected_value(page):
     reset(page)
     click_cell(page, 1, 2)
+    want = table(page)["rows"][1][2]
+    assert grid(page).locator("#val").input_value() == want
+
+
+def test_editing_in_the_formula_bar_changes_the_cell(page):
+    reset(page)
+    click_cell(page, 0, 3)
+    box = grid(page).locator("#val")
+    box.click()
+    box.fill("수식줄에서")
+    box.press("Enter")
+    wait_dirty(page)
+    assert table(page)["rows"][0][3] == "수식줄에서"
+
+
+def test_find_counts_and_jumps(page):
+    reset(page)
+    click_cell(page, 0, 0)          # 격자에 초점을 준다 (Ctrl+F 가 거기로 가게)
+    page.keyboard.press("Control+f")
+    page.wait_for_timeout(500)
+    assert "on" in (grid(page).locator("#find").get_attribute("class") or "")
+    grid(page).locator("#findInput").fill("AA94")
+    page.wait_for_timeout(700)
+    assert grid(page).locator("#findHits").inner_text() == "1 / 3"
+    assert grid(page).locator("td.hit-now").count() == 1
+    grid(page).locator("#findNext").click()
     page.wait_for_timeout(400)
-    addr = grid(page).locator("#addr").inner_text()
-    assert "2행" in addr, addr
-    assert table(page)["cols"][2] in addr, addr
+    assert grid(page).locator("#findHits").inner_text() == "2 / 3"
+    # 찾은 자리로 선택이 따라간다
+    assert grid(page).locator("#addr").inner_text() == "B3"
+
+
+def test_find_says_so_when_there_is_nothing(page):
+    reset(page)
+    click_cell(page, 0, 0)
+    page.keyboard.press("Control+f")
+    page.wait_for_timeout(400)
+    grid(page).locator("#findInput").fill("그런값없음")
+    page.wait_for_timeout(600)
+    assert grid(page).locator("#findHits").inner_text() == "없음"
+
+
+def test_the_excel_download_appears_only_after_you_make_it(page):
+    """8000행 엑셀을 만드는 데 1초가 넘어서, 화면 그릴 때마다 만들 수는 없다."""
+    reset(page)
+    assert page.get_by_role("button", name="엑셀 만들기").is_visible()
+    assert not page.locator("text=⬇").count()
+    page.get_by_role("button", name="엑셀 만들기").click()
+    page.wait_for_timeout(2500)
+    assert page.locator("text=⬇").count() == 1
+
+
+def test_the_download_is_dropped_when_you_switch_files(page):
+    """안 버리면 파일을 바꿔 골랐는데 이전 파일 내용이 담긴 버튼이 남는다."""
+    reset(page)
+    page.get_by_role("button", name="엑셀 만들기").click()
+    page.wait_for_timeout(2000)
+    assert page.locator("text=⬇").count() == 1
+    page.get_by_role("combobox").click()
+    page.wait_for_timeout(600)
+    page.get_by_text("FAB_INPUT_TTS_r0", exact=True).click()
+    page.wait_for_timeout(3000)
+    assert page.locator("text=⬇").count() == 0
