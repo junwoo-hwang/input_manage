@@ -83,6 +83,10 @@
                      color: #80868b; font-variant-numeric: tabular-nums;
                      white-space: nowrap; }
 
+  /* 화면에서는 안 보이되 초점은 받을 수 있어야 한다. display:none 이나
+     visibility:hidden 이면 초점을 못 받아 자판이 안 들어온다. */
+  #ghost { position: fixed; top: 0; left: -9999px; width: 1px; height: 1px;
+           opacity: 0; border: 0; padding: 0; }
   .empty { padding: 18px; color: #5f6368; }
 </style>
 </head>
