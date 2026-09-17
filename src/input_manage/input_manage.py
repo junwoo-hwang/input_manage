@@ -469,7 +469,9 @@ def show_input_manage() -> None:
         st.warning(f"`{BUCKET_NAME}/{FOLDER_PATH}/` 아래에 .xlsx 가 없습니다.")
         return
 
-    top, refresh = st.columns([5, 1])
+    # 고르개는 파일 이름만 들어가면 되므로 좁게 둔다. 화면 폭을 다 쓰면
+    # 정작 넓어야 할 표가 그만큼 아래로 밀린다.
+    top, refresh, _rest = st.columns([2, 1.2, 5.8])
     with top:
         book = st.selectbox("관리할 파일", books, key="im_book_pick")
     with refresh:
