@@ -13,17 +13,32 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from src.input_manage import storage
+from src.input_manage import input_manage as im
 from tests import fake_s3
 
-storage.s3io = fake_s3
-storage.PREFIX = "2GAPU/input"
+im.s3 = fake_s3
+im.FOLDER_PATH = "2GAPU/input"
+
+
+BIG_ROWS = int(__import__("os").environ.get("IM_LOCAL_ROWS", "0"))
+
+
+def big_step(n):
+    """실제 파일 크기(8000행 넘음)에서 어떻게 도는지 보려고 부풀린 시트."""
+    return pd.DataFrame({
+        "step_seq": [f"{(i + 1) * 10:04d}" for i in range(n)],
+        "step_id": [f"AA{940000 + i}TR01" for i in range(n)],
+        "step_desc": ["PRE", "MAIN", "POST"][:1] * n,
+        "ppid": [f"P-ULY-{i % 50:02d}" for i in range(n)],
+        "사용": ["Y" if i % 7 else "N" for i in range(n)],
+        "비고": [""] * n,
+    })
 
 
 def seed():
     books = {
         "FAB_INPUT_ULY_r0": {
-            "STEP": pd.DataFrame([
+            "STEP": big_step(BIG_ROWS) if BIG_ROWS else pd.DataFrame([
                 {"step_seq": "0010", "step_id": "AA941234TR01", "step_desc": "PRE",
                  "ppid": "P-ULY-01", "사용": "Y"},
                 {"step_seq": "0020", "step_id": "AA941235TR01", "step_desc": "MAIN",
@@ -34,6 +49,13 @@ def seed():
             "ITEM": pd.DataFrame([
                 {"item_id": "item1", "unit": "mV", "owner": "홍길동", "비고": ""},
                 {"item_id": "item3", "unit": "uA", "owner": "김철수", "비고": "관리 강화"},
+            ]),
+            "PROBE CARD": pd.DataFrame([
+                {"card": "PC001", "상태": "사용", "교체주기": "90"},
+                {"card": "PC002", "상태": "점검", "교체주기": "60"},
+            ]),
+            "EQP": pd.DataFrame([
+                {"eqp": "PRB01", "line": "L1", "사용": "Y"},
             ]),
         },
         "FAB_INPUT_TTS_r0": {

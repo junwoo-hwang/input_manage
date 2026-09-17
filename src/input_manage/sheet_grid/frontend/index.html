@@ -3,62 +3,87 @@
 <head>
 <meta charset="utf-8">
 <style>
+  /* 엑셀 눈에 익은 색으로 맞춘다. 초록(#217346)은 엑셀이 고른 칸에 쓰는 색,
+     회색(#f5f5f5)은 머리글 줄 색이다. */
   :root {
-    --line: #d0d7de;
-    --head: #f1f3f5;
-    --sel: rgba(26, 86, 219, 0.12);
-    --anchor: #1a56db;
+    --line: #d4d4d4;
+    --head: #f5f5f5;
+    --head-line: #b7b7b7;
+    --accent: #217346;
+    --sel: rgba(33, 115, 70, 0.10);
+    --text: #202124;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; font-family: "Pretendard", -apple-system,
-               "Segoe UI", "Malgun Gothic", sans-serif; font-size: 13px; }
+  html, body { margin: 0; padding: 0; color: var(--text);
+               font-family: "Pretendard", -apple-system, "Segoe UI",
+                            "Malgun Gothic", sans-serif; font-size: 12.5px; }
 
-  .bar { display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
-         padding: 4px 0 6px; }
+  /* ---- 위 도구 줄 ---- */
+  .bar { display: flex; align-items: center; gap: 3px; flex-wrap: wrap;
+         padding: 0 0 6px; }
   .bar button { font-size: 12px; padding: 3px 9px; cursor: pointer;
-                border: 1px solid var(--line); border-radius: 5px;
-                background: #fff; color: #24292f; }
-  .bar button:hover { background: #f3f4f6; }
-  .bar button:disabled { opacity: .45; cursor: default; background: #fff; }
-  .bar .sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
-  .bar .where { margin-left: auto; color: #656d76; font-size: 12px;
-                font-variant-numeric: tabular-nums; }
+                border: 1px solid var(--line); border-radius: 4px;
+                background: #fff; color: var(--text); }
+  .bar button:hover { background: #eef3f0; border-color: var(--accent); }
+  .bar .sep { width: 1px; height: 18px; background: var(--line); margin: 0 5px; }
 
-  /* 표는 제 크기대로 두고 이 상자가 가로/세로로 스크롤된다. 표를 상자에
-     맞춰 줄이면 칸이 좁아져 값이 잘리는데, 기준 정보는 값을 읽으려고 보는
-     화면이라 그게 더 나쁘다. */
-  .scroll { border: 1px solid var(--line); border-radius: 6px; overflow: auto;
-            background: #fff; }
+  /* 지금 고른 칸의 자리와 값. 엑셀의 이름 상자 + 수식 입력줄 자리다.
+     수백 줄짜리에서 '지금 어디를 보고 있나' 가 제일 먼저 잃는 정보다. */
+  .formula { display: flex; align-items: stretch; gap: 0; margin-bottom: 4px;
+             border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .formula .addr { flex: 0 0 150px; padding: 4px 8px; background: var(--head);
+                   border-right: 1px solid var(--line); color: #5f6368;
+                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .formula .val { flex: 1; padding: 4px 8px; white-space: nowrap;
+                  overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+  /* ---- 표 ---- */
+  .scroll { border: 1px solid var(--head-line); overflow: auto; background: #fff; }
+  .scroll:focus, .scroll.armed { outline: none; }
   table { border-collapse: separate; border-spacing: 0; table-layout: fixed; }
   th, td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
-           padding: 3px 6px; height: 27px; overflow: hidden; white-space: pre;
+           padding: 2px 6px; height: 24px; overflow: hidden; white-space: pre;
            text-overflow: ellipsis; background: #fff; }
 
-  /* 머리글은 스크롤해도 붙어 있는다. 기준 정보는 아래로 수백 줄이라,
-     칸 이름이 사라지면 지금 보는 값이 무슨 값인지 알 수가 없다. */
+  /* 머리글은 스크롤해도 붙어 있는다. 아래로 수백 줄인데 칸 이름이 사라지면
+     지금 보는 값이 무슨 값인지 알 수가 없다. */
   thead th { position: sticky; top: 0; z-index: 3; background: var(--head);
-             font-weight: 600; text-align: left; }
-  /* 줄 번호 칸도 옆으로 스크롤할 때 붙어 있는다 */
+             border-bottom: 1px solid var(--head-line); font-weight: 600;
+             text-align: left; color: #3c4043; }
   .rowhead { position: sticky; left: 0; z-index: 2; background: var(--head);
-             color: #656d76; text-align: center; font-variant-numeric: tabular-nums;
-             width: 46px; min-width: 46px; cursor: pointer; user-select: none; }
+             border-right: 1px solid var(--head-line); color: #5f6368;
+             text-align: center; font-variant-numeric: tabular-nums;
+             width: 44px; min-width: 44px; cursor: pointer; user-select: none; }
   thead .rowhead { z-index: 4; }
   th.colhead { cursor: pointer; user-select: none; }
-  th.colhead.picked, td.picked { background: #e7ebf0; }
+  th.colhead.picked, td.picked { background: #e8eeeb; color: var(--accent); }
 
   td { cursor: cell; }
   td.sel { background: var(--sel); }
-  td.anchor { outline: 2px solid var(--anchor); outline-offset: -2px; }
-  td.editing { outline: 2px solid var(--anchor); outline-offset: -2px;
-               white-space: pre; overflow: visible; }
+  td.anchor { outline: 2px solid var(--accent); outline-offset: -2px; }
+  td.editing { outline: 2px solid var(--accent); outline-offset: -2px;
+               white-space: pre; overflow: visible; z-index: 5; position: relative; }
 
-  .scroll:focus, .scroll.armed { outline: none;
-            box-shadow: 0 0 0 2px rgba(26, 86, 219, .25); }
-  /* 화면에서는 안 보이되 초점은 받을 수 있어야 한다. display:none 이나
-     visibility:hidden 이면 초점을 못 받아 자판이 안 들어온다. */
-  #ghost { position: fixed; top: 0; left: -9999px; width: 1px; height: 1px;
-           opacity: 0; border: 0; padding: 0; }
-  .empty { padding: 18px; color: #656d76; }
+  /* ---- 아래 시트 탭 (엑셀과 같은 자리) ---- */
+  .sheetbar { display: flex; align-items: stretch; gap: 2px; padding: 3px 0 0;
+              border-top: 1px solid var(--line); overflow-x: auto; }
+  .sheetbar .tab { flex: 0 0 auto; padding: 4px 14px; cursor: pointer;
+                   border: 1px solid var(--line); border-top: none;
+                   border-radius: 0 0 4px 4px; background: var(--head);
+                   color: #5f6368; white-space: nowrap; user-select: none; }
+  .sheetbar .tab:hover { background: #eef3f0; }
+  .sheetbar .tab.on { background: #fff; color: var(--accent); font-weight: 600;
+                      border-top: 2px solid var(--accent); padding-top: 3px; }
+  .sheetbar .add { flex: 0 0 auto; padding: 4px 10px; cursor: pointer;
+                   border: 1px dashed var(--line); border-top: none;
+                   border-radius: 0 0 4px 4px; background: transparent;
+                   color: #5f6368; }
+  .sheetbar .add:hover { color: var(--accent); border-color: var(--accent); }
+  .sheetbar .count { margin-left: auto; align-self: center; padding: 0 6px;
+                     color: #80868b; font-variant-numeric: tabular-nums;
+                     white-space: nowrap; }
+
+  .empty { padding: 18px; color: #5f6368; }
 </style>
 </head>
 <body>
@@ -73,23 +98,28 @@
   <span class="sep"></span>
   <button type="button" data-act="undo" title="Ctrl+Z">되돌리기</button>
   <button type="button" data-act="redo" title="Ctrl+Y">다시</button>
-  <span class="where" id="where"></span>
 </div>
+
+<div class="formula">
+  <div class="addr" id="addr"></div>
+  <div class="val" id="val"></div>
+</div>
+
 <!-- 고른 칸에 글자를 치기 시작하면 받아주는 숨은 입력칸.
      격자 자체에 자판을 받으면 한글이 안 들어온다: 한글은 keydown 이 아니라
-     조합(composition) 으로 들어오는데, 그건 편집 가능한 요소에만 온다.
-     그래서 늘 이 칸에 초점을 두고, 여기에 글자가 들어오는 순간 그 글자로
-     칸 편집을 시작한다. -->
+     조합(composition)으로 들어오는데 그건 편집 가능한 요소에만 온다. 그래서
+     늘 이 칸에 초점을 두고, 글자가 들어오는 순간 칸 편집으로 넘긴다. -->
 <input id="ghost" autocomplete="off" aria-hidden="true">
-<div class="scroll" id="scroll" tabindex="0"><div class="empty" id="empty">불러오는 중...</div></div>
+<div class="scroll" id="scroll" tabindex="0"><div class="empty">불러오는 중...</div></div>
+<div class="sheetbar" id="sheetbar"></div>
 
 <script>
 // ===================================================================
 // Streamlit 컴포넌트 규약.
 //
 // 별도 빌드(npm/React) 없이 iframe 과 부모 사이의 postMessage 만으로
-// 맞춘다. 사내망에서 npm 을 받아야 하는 빌드 단계를 하나 더 두는 것보다,
-// 규약 세 가지를 직접 지키는 쪽이 유지보수가 싸다.
+// 맞춘다. 사내망에서 npm 빌드 단계를 하나 더 두는 것보다, 규약 세 가지를
+// 직접 지키는 쪽이 유지보수가 싸다.
 // ===================================================================
 const send = (msg) => window.parent.postMessage(
   Object.assign({ isStreamlitMessage: true }, msg), "*");
@@ -104,16 +134,24 @@ function syncHeight() {
 }
 
 // ===================================================================
-// 표 상태
+// 상태
+//
+// 시트 전체를 이 컴포넌트가 들고 있다. streamlit 의 탭으로 시트를 나누면
+// 탭이 표 위에 붙어서 엑셀과 다르게 보이고, 시트마다 iframe 이 하나씩
+// 생겨서 시트 사이를 오갈 때마다 화면이 끊긴다.
 // ===================================================================
-let cols = [];          // 칸 이름
-let rows = [];          // rows[r][c] = 문자열
+let sheets = [];        // [{name, cols, rows}]
+let active = 0;
 let version = null;     // 파이썬이 준 판 번호. 이게 바뀔 때만 상태를 갈아엎는다
 let maxHeight = 520;
 
-// 고른 자리. anchor 는 방금 누른 칸, focus 는 끌고 간 끝.
-let anchor = { r: 0, c: 0 };
-let focus = { r: 0, c: 0 };
+// 마지막으로 칠한 선택 범위. 선택이 바뀔 때 표를 통째로 다시 만들지 않고
+// 이 사각형과 새 사각형의 칸만 손보려고 들고 있는다 -- 8500행이면 표를 다시
+// 만드는 데 5초가 걸려서, 칸 하나 고르는 것조차 못 쓸 만큼 느려진다.
+let painted = null;
+
+let anchor = { r: 0, c: 0 };    // 방금 누른 칸
+let focus = { r: 0, c: 0 };     // 끌고 간 끝
 let dragging = false;
 let editingCell = null;
 
@@ -122,10 +160,21 @@ const redoStack = [];
 const UNDO_MAX = 60;
 
 const scroll = document.getElementById("scroll");
-const whereBox = document.getElementById("where");
+const sheetbar = document.getElementById("sheetbar");
+const addrBox = document.getElementById("addr");
+const valBox = document.getElementById("val");
+const ghost = document.getElementById("ghost");
+
+const sheet = () => sheets[active] || { name: "", cols: [], rows: [] };
+const cols = () => sheet().cols;
+const rows = () => sheet().rows;
 
 function snapshot() {
-  return { cols: cols.slice(), rows: rows.map(r => r.slice()) };
+  return {
+    active,
+    sheets: sheets.map(s => ({ name: s.name, cols: s.cols.slice(),
+                               rows: s.rows.map(r => r.slice()) })),
+  };
 }
 
 function pushUndo() {
@@ -135,10 +184,11 @@ function pushUndo() {
 }
 
 function restore(state) {
-  cols = state.cols.slice();
-  rows = state.rows.map(r => r.slice());
+  sheets = state.sheets.map(s => ({ name: s.name, cols: s.cols.slice(),
+                                    rows: s.rows.map(r => r.slice()) }));
+  active = Math.min(state.active, sheets.length - 1);
   clampSelection();
-  render();
+  renderAll();
   publish();
 }
 
@@ -146,33 +196,42 @@ function restore(state) {
 // 값 다루기
 // ===================================================================
 function cell(r, c) {
-  const row = rows[r];
+  const row = rows()[r];
   if (!row) return "";
   const v = row[c];
   return v === undefined || v === null ? "" : String(v);
 }
 
 function setCell(r, c, value) {
-  while (rows.length <= r) rows.push(new Array(cols.length).fill(""));
-  const row = rows[r];
-  while (row.length < cols.length) row.push("");
+  const s = sheet();
+  while (s.rows.length <= r) s.rows.push(new Array(s.cols.length).fill(""));
+  const row = s.rows[r];
+  while (row.length < s.cols.length) row.push("");
   row[c] = value;
 }
 
 function ensureCols(n) {
-  while (cols.length < n) cols.push(nextColName());
-  for (const row of rows) while (row.length < cols.length) row.push("");
+  const s = sheet();
+  while (s.cols.length < n) s.cols.push(nextColName());
+  for (const row of s.rows) while (row.length < s.cols.length) row.push("");
 }
 
-// 새 열 이름. 이미 쓰는 이름과 겹치면 안 된다 -- 겹친 채로 저장하면
-// pandas 가 같은 이름 칸 둘을 만들고, 그걸 읽는 쪽에서 값 대신 칸 이름이
-// 나오는 표가 된다.
+// 새 칸 이름. 쓰고 있는 이름과 겹치면 안 된다 -- 겹친 채로 저장하면 pandas 가
+// 같은 이름 칸 둘을 만들고, 그걸 읽는 쪽에서 값 대신 칸 이름이 나오는 표가 된다.
 function nextColName(base) {
-  const used = new Set(cols.map(String));
+  const used = new Set(cols().map(String));
   const stem = base || "새칸";
   if (!used.has(stem)) return stem;
   for (let i = 2; ; i++) {
     const name = `${stem}${i}`;
+    if (!used.has(name)) return name;
+  }
+}
+
+function nextSheetName() {
+  const used = new Set(sheets.map(s => s.name));
+  for (let i = sheets.length + 1; ; i++) {
+    const name = `Sheet${i}`;
     if (!used.has(name)) return name;
   }
 }
@@ -185,8 +244,8 @@ function selRange() {
 }
 
 function clampSelection() {
-  const maxR = Math.max(rows.length - 1, 0);
-  const maxC = Math.max(cols.length - 1, 0);
+  const maxR = Math.max(rows().length - 1, 0);
+  const maxC = Math.max(cols().length - 1, 0);
   for (const p of [anchor, focus]) {
     p.r = Math.min(Math.max(p.r, 0), maxR);
     p.c = Math.min(Math.max(p.c, 0), maxC);
@@ -196,24 +255,74 @@ function clampSelection() {
 // ===================================================================
 // 그리기
 // ===================================================================
-function render() {
-  if (!cols.length) {
+// 표의 뼈대(줄 수, 칸 수, 시트)가 바뀌었을 때만 통째로 다시 만든다.
+function renderAll() {
+  renderGrid();
+  renderSheetBar();
+  renderFormula();
+  syncHeight();
+}
+
+// 고른 자리만 바뀌었을 때. 표는 그대로 두고 칠한 것만 옮긴다.
+function repaintSelection() {
+  const now = selRange();
+  paintRange(painted, false);
+  paintRange(now, true);
+  painted = now;
+  renderSheetBar();
+  renderFormula();
+}
+
+function paintRange(range, on) {
+  if (!range) return;
+  const { r0, r1, c0, c1 } = range;
+  for (let c = c0; c <= c1; c++) {
+    const th = scroll.querySelector(`th.colhead[data-c="${c}"]`);
+    if (th) th.classList.toggle("picked", on);
+  }
+  for (let r = r0; r <= r1; r++) {
+    const head = scroll.querySelector(`td.rowhead[data-r="${r}"]`);
+    if (head) head.classList.toggle("picked", on);
+    for (let c = c0; c <= c1; c++) {
+      const td = cellEl(r, c);
+      if (td) { td.classList.toggle("sel", on); td.classList.remove("anchor"); }
+    }
+  }
+  if (on) {
+    const td = cellEl(anchor.r, anchor.c);
+    if (td) td.classList.add("anchor");
+  }
+}
+
+// 칸 하나만 바뀌었을 때. 그 칸의 글자만 고쳐 쓴다.
+function repaintCell(r, c) {
+  const td = cellEl(r, c);
+  if (td) td.textContent = cell(r, c);
+  renderFormula();
+}
+
+function renderGrid() {
+  if (!cols().length) {
     scroll.innerHTML = `<div class="empty">칸이 없습니다. '열 오른쪽' 으로 만드세요.</div>`;
-    syncHeight();
     return;
   }
+  scroll.style.maxHeight = maxHeight + "px";
   const { r0, r1, c0, c1 } = selRange();
+  const cs = cols(), rs = rows();
   const parts = ['<table><thead><tr><th class="rowhead"></th>'];
-  for (let c = 0; c < cols.length; c++) {
+  for (let c = 0; c < cs.length; c++) {
     const picked = c >= c0 && c <= c1 ? " picked" : "";
-    parts.push(`<th class="colhead${picked}" data-c="${c}" title="${esc(cols[c])}"`
-               + ` style="width:${colWidth(c)}px">${esc(cols[c])}</th>`);
+    parts.push(`<th class="colhead${picked}" data-c="${c}" title="${esc(cs[c])}"`
+               + ` style="width:${colWidth(c)}px">${esc(cs[c])}</th>`);
   }
   parts.push("</tr></thead><tbody>");
-  for (let r = 0; r < rows.length; r++) {
+  // 줄을 전부 그린다. 8000행이면 칸이 8만 개라 첫 그림이 몇 초 걸리지만,
+  // 보이는 만큼만 그리면 브라우저 Ctrl+F 로 못 찾고 스크롤 막대가 실제
+  // 줄과 어긋나 보인다 -- 기준 정보는 눈으로 훑어 찾는 일이 많은 표다.
+  for (let r = 0; r < rs.length; r++) {
     const picked = r >= r0 && r <= r1 ? " picked" : "";
     parts.push(`<tr><td class="rowhead${picked}" data-r="${r}">${r + 1}</td>`);
-    for (let c = 0; c < cols.length; c++) {
+    for (let c = 0; c < cs.length; c++) {
       const inSel = r >= r0 && r <= r1 && c >= c0 && c <= c1;
       const cls = (inSel ? "sel" : "") + (r === anchor.r && c === anchor.c ? " anchor" : "");
       parts.push(`<td class="${cls}" data-r="${r}" data-c="${c}">${esc(cell(r, c))}</td>`);
@@ -222,24 +331,41 @@ function render() {
   }
   parts.push("</tbody></table>");
   scroll.innerHTML = parts.join("");
-  scroll.style.maxHeight = maxHeight + "px";
-  whereBox.textContent =
-    `${rows.length}행 x ${cols.length}열 · 선택 ${r1 - r0 + 1}x${c1 - c0 + 1}`;
-  syncHeight();
+  painted = { r0, r1, c0, c1 };
 }
 
-// 칸 너비는 내용 길이로 대충 잡는다. 열마다 재서 맞추면 수백 줄짜리에서
+function renderSheetBar() {
+  const { r0, r1, c0, c1 } = selRange();
+  const parts = [];
+  sheets.forEach((s, i) => {
+    parts.push(`<div class="tab${i === active ? " on" : ""}" data-i="${i}"`
+               + ` title="${esc(s.name)} · ${s.rows.length}행 x ${s.cols.length}열`
+               + ` (두 번 누르면 이름 바꾸기)">${esc(s.name)}</div>`);
+  });
+  parts.push('<button type="button" class="add" id="addSheet" title="시트 추가">+</button>');
+  parts.push(`<span class="count">${rows().length}행 x ${cols().length}열`
+             + ` · 선택 ${r1 - r0 + 1}x${c1 - c0 + 1}</span>`);
+  sheetbar.innerHTML = parts.join("");
+}
+
+function renderFormula() {
+  if (!cols().length) { addrBox.textContent = ""; valBox.textContent = ""; return; }
+  addrBox.textContent = `${sheet().name} · ${anchor.r + 1}행 · ${cols()[anchor.c]}`;
+  valBox.textContent = cell(anchor.r, anchor.c);
+}
+
+// 칸 너비는 내용 길이로 대충 잡는다. 열마다 실제로 재서 맞추면 수백 줄에서
 // 눈에 띄게 느려지는데, 어차피 늘려 볼 수 있으면 되는 값이다.
 function colWidth(c) {
-  let w = String(cols[c]).length;
-  const n = Math.min(rows.length, 200);
+  let w = String(cols()[c]).length;
+  const rs = rows();
+  const n = Math.min(rs.length, 200);
   for (let r = 0; r < n; r++) w = Math.max(w, cell(r, c).length);
-  return Math.min(Math.max(w * 8 + 22, 72), 320);
+  return Math.min(Math.max(w * 7.6 + 20, 68), 320);
 }
 
 function esc(text) {
-  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
-                     .replace(/>/g, "&gt;");
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function cellEl(r, c) {
@@ -255,7 +381,10 @@ function cellEl(r, c) {
 let publishTimer = null;
 function publish(immediate) {
   clearTimeout(publishTimer);
-  const go = () => setValue({ cols: cols.slice(), rows: rows.map(r => r.slice()) });
+  const go = () => setValue({
+    sheets: sheets.map(s => ({ name: s.name, cols: s.cols.slice(),
+                               rows: s.rows.map(r => r.slice()) })),
+  });
   if (immediate) go(); else publishTimer = setTimeout(go, 350);
 }
 
@@ -291,7 +420,7 @@ function endEdit(commit) {
   if (commit && text !== before) {
     pushUndo();
     setCell(r, c, text);
-    render();
+    repaintCell(r, c);
     publish();
   } else {
     td.textContent = cell(r, c);
@@ -301,6 +430,22 @@ function endEdit(commit) {
   armGhost();
 }
 
+function armGhost() {
+  ghost.value = "";
+  ghost.focus({ preventScroll: true });
+  scroll.classList.add("armed");
+}
+
+// 숨은 입력칸에 글자가 들어왔다 = 고른 칸에 글자를 치기 시작했다. 그 글자를
+// 씨앗 삼아 칸 편집으로 넘긴다. 한글은 여러 번의 조합을 거쳐 완성되므로,
+// 넘긴 뒤로는 칸이 직접 조합을 받는다.
+ghost.addEventListener("input", () => {
+  const seed = ghost.value;
+  ghost.value = "";
+  if (!seed || editingCell || !cols().length) return;
+  startEdit(anchor.r, anchor.c, seed);
+});
+
 // ===================================================================
 // 마우스
 // ===================================================================
@@ -309,22 +454,23 @@ scroll.addEventListener("mousedown", (e) => {
   // 않게 하려고) 그게 브라우저의 기본 초점 이동까지 막는다. 그러면 자판과
   // 붙여넣기가 이 격자가 아니라 바깥 문서로 가서 아무 일도 안 일어난다.
   if (!editingCell) armGhost();
+
   const th = e.target.closest("th.colhead");
-  if (th) {                                    // 열 머리글: 그 열 전체 선택
+  if (th) {                                    // 열 머리글: 그 열 전체
     endEdit(true);
     const c = Number(th.dataset.c);
     anchor = { r: 0, c };
-    focus = { r: Math.max(rows.length - 1, 0), c };
-    render();
+    focus = { r: Math.max(rows().length - 1, 0), c };
+    repaintSelection();
     return;
   }
   const rowHead = e.target.closest("tbody td.rowhead");
-  if (rowHead) {                               // 줄 번호: 그 줄 전체 선택
+  if (rowHead) {                               // 줄 번호: 그 줄 전체
     endEdit(true);
     const r = Number(rowHead.dataset.r);
     anchor = { r, c: 0 };
-    focus = { r, c: Math.max(cols.length - 1, 0) };
-    render();
+    focus = { r, c: Math.max(cols().length - 1, 0) };
+    repaintSelection();
     return;
   }
   const td = e.target.closest("td[data-c]");
@@ -339,7 +485,7 @@ scroll.addEventListener("mousedown", (e) => {
     focus = { r, c };
     dragging = true;                           // 끌어서 범위 선택
   }
-  render();
+  repaintSelection();
   e.preventDefault();
 });
 
@@ -350,7 +496,7 @@ scroll.addEventListener("mouseover", (e) => {
   const r = Number(td.dataset.r), c = Number(td.dataset.c);
   if (r === focus.r && c === focus.c) return;
   focus = { r, c };
-  render();
+  repaintSelection();
 });
 
 document.addEventListener("mouseup", () => { dragging = false; });
@@ -363,19 +509,62 @@ scroll.addEventListener("dblclick", (e) => {
 });
 
 function renameCol(c) {
-  const name = window.prompt("칸 이름", cols[c]);
+  const name = window.prompt("칸 이름", cols()[c]);
   if (name === null) return;
   const trimmed = name.trim();
   if (!trimmed) return;
-  if (trimmed !== cols[c] && cols.includes(trimmed)) {
+  if (trimmed !== cols()[c] && cols().includes(trimmed)) {
     window.alert(`'${trimmed}' 은(는) 이미 있는 칸 이름입니다.`);
     return;
   }
   pushUndo();
-  cols[c] = trimmed;
-  render();
+  sheet().cols[c] = trimmed;
+  renderAll();
   publish();
 }
+
+// ===================================================================
+// 아래 시트 탭
+// ===================================================================
+sheetbar.addEventListener("click", (e) => {
+  if (e.target.closest("#addSheet")) {
+    pushUndo();
+    sheets.push({ name: nextSheetName(), cols: ["새칸"], rows: [[""]] });
+    active = sheets.length - 1;
+    anchor = focus = { r: 0, c: 0 };
+    renderAll();
+    publish();
+    return;
+  }
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  const i = Number(tab.dataset.i);
+  if (i === active) return;
+  endEdit(true);
+  active = i;
+  anchor = { r: 0, c: 0 };
+  focus = { r: 0, c: 0 };
+  renderAll();
+  armGhost();
+});
+
+sheetbar.addEventListener("dblclick", (e) => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  const i = Number(tab.dataset.i);
+  const name = window.prompt("시트 이름", sheets[i].name);
+  if (name === null) return;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed === sheets[i].name) return;
+  if (sheets.some((s, j) => j !== i && s.name === trimmed)) {
+    window.alert(`'${trimmed}' 은(는) 이미 있는 시트 이름입니다.`);
+    return;
+  }
+  pushUndo();
+  sheets[i].name = trimmed;
+  renderAll();
+  publish();
+});
 
 // ===================================================================
 // 자판
@@ -386,8 +575,8 @@ document.addEventListener("keydown", (e) => {
       e.preventDefault();
       const { r, c } = editingCell;
       endEdit(true);
-      anchor = focus = { r: Math.min(r + 1, rows.length - 1), c };
-      render();
+      anchor = focus = { r: Math.min(r + 1, rows().length - 1), c };
+      repaintSelection();
     } else if (e.key === "Escape") {
       e.preventDefault();
       endEdit(false);
@@ -395,12 +584,12 @@ document.addEventListener("keydown", (e) => {
       e.preventDefault();
       const { r, c } = editingCell;
       endEdit(true);
-      anchor = focus = { r, c: Math.min(c + 1, cols.length - 1) };
-      render();
+      anchor = focus = { r, c: Math.min(c + 1, cols().length - 1) };
+      repaintSelection();
     }
     return;
   }
-  if (!cols.length) return;
+  if (!cols().length) return;
 
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === "c") { copySelection(); e.preventDefault(); return; }
@@ -414,51 +603,24 @@ document.addEventListener("keydown", (e) => {
   if (move) {
     e.preventDefault();
     const target = e.shiftKey ? focus : anchor;
-    target.r = Math.min(Math.max(target.r + move[0], 0), rows.length - 1);
-    target.c = Math.min(Math.max(target.c + move[1], 0), cols.length - 1);
+    target.r = Math.min(Math.max(target.r + move[0], 0), rows().length - 1);
+    target.c = Math.min(Math.max(target.c + move[1], 0), cols().length - 1);
     if (!e.shiftKey) focus = { r: anchor.r, c: anchor.c };
-    render();
+    repaintSelection();
     scrollIntoView();
     return;
   }
-  if (e.key === "Enter") {
-    e.preventDefault();
-    startEdit(anchor.r, anchor.c);
-    return;
-  }
-  if (e.key === "Delete" || e.key === "Backspace") {
-    e.preventDefault();
-    clearSelection();
-    return;
-  }
+  if (e.key === "Enter") { e.preventDefault(); startEdit(anchor.r, anchor.c); return; }
+  if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); clearSelection(); return; }
   if (e.key === "Tab") {
     e.preventDefault();
-    anchor.c = Math.min(anchor.c + (e.shiftKey ? -1 : 1), cols.length - 1);
-    anchor.c = Math.max(anchor.c, 0);
+    anchor.c = Math.max(Math.min(anchor.c + (e.shiftKey ? -1 : 1), cols().length - 1), 0);
     focus = { r: anchor.r, c: anchor.c };
-    render();
+    repaintSelection();
     return;
   }
-  // 글자를 치면 바로 그 글자로 고쳐 쓰기 시작한다 -- 그 처리는 숨은
-  // 입력칸의 input 이벤트가 한다 (아래). keydown 으로 하면 한글이 빠진다.
-});
-
-const ghost = document.getElementById("ghost");
-
-function armGhost() {
-  ghost.value = "";
-  ghost.focus({ preventScroll: true });
-  scroll.classList.add("armed");
-}
-
-// 숨은 입력칸에 글자가 들어왔다 = 고른 칸에 글자를 치기 시작했다.
-// 그 글자를 씨앗 삼아 칸 편집으로 넘긴다. 한글은 여러 번의 조합을 거쳐
-// 완성되므로, 넘긴 뒤로는 칸이 직접 조합을 받는다.
-ghost.addEventListener("input", () => {
-  const seed = ghost.value;
-  ghost.value = "";
-  if (!seed || editingCell || !cols.length) return;
-  startEdit(anchor.r, anchor.c, seed);
+  // 글자를 치면 바로 그 글자로 고쳐 쓰기 시작한다 -- 그 처리는 위 숨은
+  // 입력칸의 input 이벤트가 한다. keydown 으로 하면 한글이 빠진다.
 });
 
 function scrollIntoView() {
@@ -470,8 +632,7 @@ function clearSelection() {
   const { r0, r1, c0, c1 } = selRange();
   pushUndo();
   for (let r = r0; r <= r1; r++)
-    for (let c = c0; c <= c1; c++) setCell(r, c, "");
-  render();
+    for (let c = c0; c <= c1; c++) { setCell(r, c, ""); repaintCell(r, c); }
   publish();
 }
 
@@ -491,7 +652,7 @@ function redo() {
 // 클립보드
 //
 // 엑셀은 클립보드에 탭으로 칸을, 줄바꿈으로 줄을 나눈 글자를 넣는다.
-// 그래서 같은 꼴로 주고받으면 엑셀 <-> 이 화면이 그대로 오간다.
+// 같은 꼴로 주고받으면 엑셀 <-> 이 화면이 그대로 오간다.
 // ===================================================================
 function selectionAsTsv() {
   const { r0, r1, c0, c1 } = selRange();
@@ -521,6 +682,7 @@ function fallbackCopy(text) {
   box.select();
   try { document.execCommand("copy"); } catch (_) { /* 브라우저가 막으면 포기 */ }
   box.remove();
+  armGhost();
 }
 
 document.addEventListener("paste", (e) => {
@@ -545,14 +707,14 @@ function pasteTsv(text) {
       setCell(anchor.r + i, anchor.c + j, grid[i][j]);
   focus = { r: anchor.r + grid.length - 1, c: anchor.c + wide - 1 };
   clampSelection();
-  render();
+  renderAll();
   publish();
 }
 
 // ===================================================================
 // 행/열 넣고 빼기
 // ===================================================================
-function blankRow() { return new Array(cols.length).fill(""); }
+function blankRow() { return new Array(cols().length).fill(""); }
 
 document.getElementById("bar").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
@@ -560,7 +722,9 @@ document.getElementById("bar").addEventListener("click", (e) => {
   const act = btn.dataset.act;
   if (act === "undo") return undo();
   if (act === "redo") return redo();
+  if (!cols().length && act !== "col-right" && act !== "col-left") return;
 
+  const s = sheet();
   const { r0, r1, c0, c1 } = selRange();
   const nRows = r1 - r0 + 1, nCols = c1 - c0 + 1;
   pushUndo();
@@ -568,29 +732,29 @@ document.getElementById("bar").addEventListener("click", (e) => {
   if (act === "row-above" || act === "row-below") {
     // 고른 줄 수만큼 넣는다. 세 줄을 고르고 누르면 세 줄이 생긴다 (엑셀과 같게)
     const at = act === "row-above" ? r0 : r1 + 1;
-    const fresh = Array.from({ length: nRows }, blankRow);
-    rows.splice(at, 0, ...fresh);
+    s.rows.splice(at, 0, ...Array.from({ length: nRows }, blankRow));
     anchor = { r: at, c: c0 };
     focus = { r: at + nRows - 1, c: c1 };
   } else if (act === "row-del") {
-    rows.splice(r0, nRows);
-    if (!rows.length) rows.push(blankRow());
+    s.rows.splice(r0, nRows);
+    if (!s.rows.length) s.rows.push(blankRow());
   } else if (act === "col-left" || act === "col-right") {
     const at = act === "col-left" ? c0 : c1 + 1;
     for (let k = 0; k < nCols; k++) {
-      cols.splice(at + k, 0, nextColName());
-      for (const row of rows) row.splice(at + k, 0, "");
+      s.cols.splice(at + k, 0, nextColName());
+      for (const row of s.rows) row.splice(at + k, 0, "");
     }
     anchor = { r: r0, c: at };
     focus = { r: r1, c: at + nCols - 1 };
   } else if (act === "col-del") {
-    cols.splice(c0, nCols);
-    for (const row of rows) row.splice(c0, nCols);
-    if (!cols.length) { cols.push(nextColName()); for (const row of rows) row.push(""); }
+    s.cols.splice(c0, nCols);
+    for (const row of s.rows) row.splice(c0, nCols);
+    if (!s.cols.length) { s.cols.push(nextColName()); for (const row of s.rows) row.push(""); }
   }
   clampSelection();
-  render();
+  renderAll();
   publish();
+  armGhost();
 });
 
 // ===================================================================
@@ -603,20 +767,33 @@ window.addEventListener("message", (event) => {
 
   // 판 번호가 그대로면 건드리지 않는다. 값을 올려보낼 때마다 streamlit 이
   // 스크립트를 다시 돌리면서 이 자리로 같은 데이터가 되돌아오는데, 그때마다
-  // 갈아엎으면 방금 고친 칸과 고른 자리가 통째로 날아간다.
+  // 갈아엎으면 방금 고친 칸과 고른 자리, 보고 있던 시트가 통째로 날아간다.
   if (args.version === version) { syncHeight(); return; }
 
   version = args.version;
-  cols = (args.cols || []).map(String);
-  rows = (args.rows || []).map(row =>
-    (row || []).map(v => (v === null || v === undefined ? "" : String(v))));
-  for (const row of rows) while (row.length < cols.length) row.push("");
-  if (!rows.length) rows.push(blankRow());
+  sheets = (args.sheets || []).map(s => {
+    const cs = (s.cols || []).map(String);
+    const rs = (s.rows || []).map(row =>
+      (row || []).map(v => (v === null || v === undefined ? "" : String(v))));
+    for (const row of rs) while (row.length < cs.length) row.push("");
+    if (!rs.length) rs.push(new Array(cs.length).fill(""));
+    return { name: String(s.name), cols: cs, rows: rs };
+  });
+  if (!sheets.length) sheets = [{ name: "Sheet1", cols: ["새칸"], rows: [[""]] }];
+  active = 0;
   anchor = { r: 0, c: 0 };
   focus = { r: 0, c: 0 };
+  painted = null;
   undoStack.length = 0;
   redoStack.length = 0;
-  render();
+  renderAll();
+
+  // 새 판을 곧바로 올려보낸다. streamlit 은 컴포넌트가 마지막에 올린 값을
+  // key 로 기억하고 있어서, 이걸 안 하면 '다시 불러오기' 를 눌러 표는 새로
+  // 그려졌는데 파이썬 쪽은 여전히 버린 수정을 들고 있다 -- 저장 버튼이 계속
+  // 켜져 있고, 그 상태로 저장하면 버린 값이 되살아난다.
+  clearTimeout(publishTimer);
+  publish(true);
 });
 
 send({ type: "streamlit:componentReady", apiVersion: 1 });
