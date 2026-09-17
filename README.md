@@ -61,13 +61,12 @@ INPUT_S3_ENDPOINT   기본 http://s3.dataplatform.samsungds.net:9020
 
 | 파일 | 하는 일 |
 |---|---|
-| `src/input_manage/input_manage.py` | 화면. 포털이 부르는 `show_input_manage()` 하나 |
-| `src/input_manage/storage.py` | 엑셀 읽기/쓰기, 이력, 감사, 동시 편집 방어 |
-| `src/input_manage/s3io.py` | S3 에 닿는 유일한 자리 |
-| `src/input_manage/sheet_grid/` | 격자(컴포넌트). `frontend/index.html` 하나가 전부 |
+| `src/input_manage/input_manage.py` | 전부. S3 · 엑셀 읽기쓰기 · 화면. 포털이 부르는 것은 `show_input_manage()` 하나 |
+| `src/input_manage/sheet_grid/frontend/index.html` | 격자. streamlit 컴포넌트라 이 파일만 따로일 수밖에 없다 |
 
-`storage.py` 는 `s3io` 의 함수 다섯 개 말고는 S3 를 모른다. 그래서 테스트는
-메모리 가짜 저장소로 S3 없이 돈다.
+`input_manage.py` 안에서 S3 에 닿는 것은 위쪽 다섯 함수(`s3` 묶음)뿐이다.
+테스트는 그것만 가짜로 갈아끼워서 S3 없이 돌고, 사내 헬퍼로 바꿔 끼울 때도
+거기만 손대면 된다.
 
 ## 8000행에서
 
