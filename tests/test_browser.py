@@ -238,10 +238,10 @@ def test_inserting_and_deleting_a_row(page):
     reset(page)
     n = len(table(page)["rows"])
     click_cell(page, 0, 0)
-    grid(page).get_by_text("행 아래", exact=True).click()
+    grid(page).locator("#bar [data-act='row-below']").click()
     page.wait_for_timeout(600)
     assert len(table(page)["rows"]) == n + 1
-    grid(page).get_by_text("행 삭제", exact=True).click()
+    grid(page).locator("#bar [data-act='row-del']").click()
     page.wait_for_timeout(600)
     assert len(table(page)["rows"]) == n
 
@@ -251,14 +251,14 @@ def test_inserting_and_deleting_a_column(page):
     reset(page)
     cols = table(page)["cols"]
     click_cell(page, 0, 0)
-    grid(page).get_by_text("열 오른쪽", exact=True).click()
+    grid(page).locator("#bar [data-act='col-right']").click()
     page.wait_for_timeout(600)
     grown = table(page)["cols"]
     assert len(grown) == len(cols) + 1
     assert grown[1] not in cols, "새 칸 이름이 기존 것과 겹칩니다"
 
     click_cell(page, 0, 1)
-    grid(page).get_by_text("열 삭제", exact=True).click()
+    grid(page).locator("#bar [data-act='col-del']").click()
     page.wait_for_timeout(600)
     assert table(page)["cols"] == cols
 
@@ -267,7 +267,7 @@ def test_undo_puts_back_what_a_delete_removed(page):
     reset(page)
     before = table(page)
     click_cell(page, 0, 0)
-    grid(page).get_by_text("행 삭제", exact=True).click()
+    grid(page).locator("#bar [data-act='row-del']").click()
     page.wait_for_timeout(600)
     assert table(page)["rows"] != before["rows"]
     grid(page).locator("button[data-act='undo']").click()
@@ -434,3 +434,93 @@ def test_the_download_is_dropped_when_you_switch_files(page):
     page.get_by_text("FAB_INPUT_TTS_r0", exact=True).click()
     page.wait_for_timeout(3000)
     assert page.locator("text=⬇").count() == 0
+
+
+# ------------------------------------------------- 오른쪽 클릭 차림표
+
+def open_menu(page, r, c):
+    grid(page).locator(f"td[data-r='{r}'][data-c='{c}']").click(button="right")
+    page.wait_for_timeout(500)
+    return grid(page).locator("#menu")
+
+
+def test_right_click_opens_the_menu_not_the_browser_one(page):
+    reset(page)
+    menu = open_menu(page, 1, 1)
+    assert "on" in (menu.get_attribute("class") or "")
+    items = menu.locator(".item").all_inner_texts()
+    assert any("복사" in i for i in items)
+    assert any("위에 행 삽입" in i for i in items)
+    assert any("열 삭제" in i for i in items)
+
+
+def test_the_menu_closes_when_you_click_away(page):
+    reset(page)
+    open_menu(page, 1, 1)
+    grid(page).locator("td[data-r='0'][data-c='0']").click()
+    page.wait_for_timeout(400)
+    assert "on" not in (grid(page).locator("#menu").get_attribute("class") or "")
+
+
+def test_right_clicking_outside_the_selection_moves_it(page):
+    """엑셀과 같게. 안 그러면 엉뚱한 자리에 행이 들어간다."""
+    reset(page)
+    grid(page).locator("td[data-r='0'][data-c='0']").click()
+    page.wait_for_timeout(300)
+    open_menu(page, 2, 3)
+    assert grid(page).locator("#addr").inner_text() == "D4"
+
+
+def test_right_clicking_inside_the_selection_keeps_it(page):
+    reset(page)
+    a = grid(page).locator("td[data-r='0'][data-c='0']")
+    b = grid(page).locator("td[data-r='2'][data-c='2']")
+    a.hover(); page.mouse.down(); b.hover(); page.mouse.up()
+    page.wait_for_timeout(400)
+    open_menu(page, 1, 1)
+    assert grid(page).locator("td.sel").count() == 9, "범위 선택이 풀렸습니다"
+
+
+def test_inserting_a_row_from_the_menu(page):
+    reset(page)
+    n = len(table(page)["rows"])
+    menu = open_menu(page, 0, 0)
+    menu.locator("[data-act='row-below']").click()
+    wait_dirty(page)
+    assert len(table(page)["rows"]) == n + 1
+
+
+def test_inserting_a_column_from_the_menu(page):
+    reset(page)
+    n = len(table(page)["cols"])
+    menu = open_menu(page, 0, 0)
+    menu.locator("[data-act='col-right']").click()
+    wait_dirty(page)
+    assert len(table(page)["cols"]) == n + 1
+
+
+def test_clearing_from_the_menu(page):
+    reset(page)
+    menu = open_menu(page, 0, 1)
+    menu.locator("[data-act='clear']").click()
+    wait_dirty(page)
+    assert table(page)["rows"][0][1] == ""
+
+
+def test_copying_from_the_menu(page):
+    reset(page)
+    want = table(page)["rows"][1][2]
+    menu = open_menu(page, 1, 2)
+    menu.locator("[data-act='copy']").click()
+    page.wait_for_timeout(700)
+    assert page.evaluate("navigator.clipboard.readText()") == want
+
+
+def test_cutting_from_the_menu_copies_and_clears(page):
+    reset(page)
+    want = table(page)["rows"][1][3]
+    menu = open_menu(page, 1, 3)
+    menu.locator("[data-act='cut']").click()
+    wait_dirty(page)
+    assert page.evaluate("navigator.clipboard.readText()") == want
+    assert table(page)["rows"][1][3] == ""

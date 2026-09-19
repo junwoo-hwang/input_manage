@@ -117,6 +117,20 @@
                      color: #80868b; font-variant-numeric: tabular-nums;
                      white-space: nowrap; }
 
+  /* ---- 오른쪽 클릭 차림표 ---- */
+  .menu { display: none; position: absolute; z-index: 40; min-width: 194px;
+          padding: 4px 0; background: #fff; border: 1px solid var(--line);
+          border-radius: 5px; box-shadow: 0 6px 18px rgba(0,0,0,.16); }
+  .menu.on { display: block; }
+  .menu .item { display: flex; align-items: center; gap: 10px; padding: 5px 12px;
+                cursor: pointer; white-space: nowrap; }
+  .menu .item:hover { background: #eef3f0; }
+  .menu .item .key { margin-left: auto; color: #9aa0a6; font-size: 11px;
+                     font-variant-numeric: tabular-nums; }
+  .menu .item.off { opacity: .4; cursor: default; }
+  .menu .item.off:hover { background: transparent; }
+  .menu .line { height: 1px; margin: 4px 0; background: var(--line); }
+
   /* 화면에서는 안 보이되 초점은 받을 수 있어야 한다. display:none 이나
      visibility:hidden 이면 초점을 못 받아 자판이 안 들어온다. */
   #ghost { position: fixed; top: 0; left: -9999px; width: 1px; height: 1px;
@@ -205,6 +219,24 @@
 <input id="ghost" autocomplete="off" aria-hidden="true">
 <div class="scroll" id="scroll" tabindex="0"><div class="empty">불러오는 중...</div></div>
 <div class="sheetbar" id="sheetbar"></div>
+
+<!-- 오른쪽 클릭 차림표. 차림표의 모든 항목은 도구 줄이나 단축키로도 되는
+     것들이다 -- 오른쪽 클릭은 엑셀에서 손이 먼저 가는 자리라서 같이 둔다. -->
+<div class="menu" id="menu">
+  <div class="item" data-act="cut">잘라내기<span class="key">Ctrl+X</span></div>
+  <div class="item" data-act="copy">복사<span class="key">Ctrl+C</span></div>
+  <div class="item" data-act="paste">붙여넣기<span class="key">Ctrl+V</span></div>
+  <div class="line"></div>
+  <div class="item" data-act="row-above">위에 행 삽입</div>
+  <div class="item" data-act="row-below">아래에 행 삽입</div>
+  <div class="item" data-act="row-del">행 삭제</div>
+  <div class="line"></div>
+  <div class="item" data-act="col-left">왼쪽에 열 삽입</div>
+  <div class="item" data-act="col-right">오른쪽에 열 삽입</div>
+  <div class="item" data-act="col-del">열 삭제</div>
+  <div class="line"></div>
+  <div class="item" data-act="clear">내용 지우기<span class="key">Delete</span></div>
+</div>
 
 <script>
 // ===================================================================
@@ -591,6 +623,12 @@ scroll.addEventListener("mousedown", (e) => {
   // 붙여넣기가 이 격자가 아니라 바깥 문서로 가서 아무 일도 안 일어난다.
   if (!editingCell) armGhost();
 
+  // 오른쪽 클릭은 여기서 아무것도 건드리지 않는다. 그대로 두면 아래에서
+  // 선택을 그 칸 하나로 접어 버려서, 범위를 골라 놓고 오른쪽 클릭하면
+  // 범위가 사라진 채로 차림표가 뜬다 (엑셀은 범위를 지킨다).
+  // 선택을 옮길지는 contextmenu 쪽에서 판단한다.
+  if (e.button !== 0) return;
+
   const th = e.target.closest("th.colhead");
   if (th) {                                    // 열 머리글: 그 열 전체
     endEdit(true);
@@ -725,6 +763,7 @@ document.addEventListener("keydown", (e) => {
     }
     return;
   }
+  if (e.key === "Escape") closeMenu();
   if (!cols().length) return;
 
   const mod = e.ctrlKey || e.metaKey;
@@ -946,12 +985,18 @@ function blankRow() { return new Array(cols().length).fill(""); }
 
 document.getElementById("bar").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
-  if (!btn) return;
-  const act = btn.dataset.act;
+  if (btn) doAction(btn.dataset.act);
+});
+
+function doAction(act) {
   if (act === "undo") return undo();
   if (act === "redo") return redo();
   if (act === "find") return openFind();
   if (act === "fit") return fitWidths();
+  if (act === "copy") return copySelection();
+  if (act === "cut") { copySelection(); clearSelection(); return; }
+  if (act === "paste") return pasteFromClipboard();
+  if (act === "clear") return clearSelection();
   if (!cols().length && act !== "col-right" && act !== "col-left") return;
 
   const s = sheet();
@@ -985,7 +1030,85 @@ document.getElementById("bar").addEventListener("click", (e) => {
   renderAll();
   publish();
   armGhost();
+}
+
+
+// ===================================================================
+// 오른쪽 클릭 차림표
+//
+// 여기 있는 것은 전부 도구 줄이나 단축키로도 되는 일이다. 그래도 두는
+// 이유는 엑셀에서 오른쪽 클릭이 손이 먼저 가는 자리라서다.
+// ===================================================================
+const menu = document.getElementById("menu");
+
+function openMenu(x, y) {
+  menu.classList.add("on");
+  // 차림표는 iframe 밖으로 못 나간다 (부모 페이지 위로 넘칠 수 없다).
+  // 그래서 끝에 붙으면 반대쪽으로 펼치고, 그래도 프레임보다 길면 프레임을
+  // 늘린다 -- 시트가 몇 줄뿐일 때 프레임이 차림표보다 짧아서 아래쪽
+  // 항목(열 삽입, 내용 지우기)이 통째로 잘려 안 보였다.
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  const maxX = document.documentElement.clientWidth - w - 4;
+  const maxY = document.documentElement.clientHeight - h - 4;
+  menu.style.left = Math.max(2, Math.min(x, maxX)) + "px";
+  menu.style.top = Math.max(2, Math.min(y, maxY)) + "px";
+  syncHeight();
+}
+
+function closeMenu() {
+  if (!menu.classList.contains("on")) return;
+  menu.classList.remove("on");
+  syncHeight();                 // 늘려 둔 프레임을 되돌린다
+}
+
+scroll.addEventListener("contextmenu", (e) => {
+  const td = e.target.closest("td[data-c], th.colhead, td.rowhead");
+  if (!td) return;
+  e.preventDefault();
+  endEdit(true);
+
+  // 오른쪽 클릭한 칸이 이미 고른 범위 안이면 선택을 그대로 둔다 (엑셀과 같게).
+  // 밖이면 그 칸 하나를 고른다 -- 안 그러면 엉뚱한 자리에 행을 넣게 된다.
+  const r = Number(td.dataset.r), c = Number(td.dataset.c);
+  if (Number.isFinite(r) && Number.isFinite(c)) {
+    const { r0, r1, c0, c1 } = selRange();
+    if (r < r0 || r > r1 || c < c0 || c > c1) {
+      anchor = focus = { r, c };
+      repaintSelection();
+    }
+  }
+  armGhost();
+  openMenu(e.clientX, e.clientY);
 });
+
+menu.addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (!item || item.classList.contains("off")) return;
+  closeMenu();
+  doAction(item.dataset.act);
+});
+
+document.addEventListener("mousedown", (e) => {
+  if (!menu.contains(e.target)) closeMenu();
+}, true);
+document.addEventListener("scroll", closeMenu, true);
+window.addEventListener("blur", closeMenu);
+
+
+// 차림표의 '붙여넣기'. Ctrl+V 와 달리 브라우저가 클립보드를 읽어줘야 하는데,
+// 그건 권한이 필요하고 iframe 에서는 막혀 있는 경우가 많다. 막히면 조용히
+// 아무 일도 안 일어나게 두지 않고 Ctrl+V 를 쓰라고 알려준다.
+function pasteFromClipboard() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) {
+    window.alert("이 브라우저에서는 차림표 붙여넣기가 막혀 있습니다.\nCtrl+V 를 눌러 주세요.");
+    return;
+  }
+  navigator.clipboard.readText()
+    .then((text) => { if (text) pasteTsv(text); })
+    .catch(() => window.alert(
+      "브라우저가 클립보드 읽기를 막았습니다.\nCtrl+V 를 눌러 주세요."));
+}
+
 
 // ===================================================================
 // 파이썬 -> 여기

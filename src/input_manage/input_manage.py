@@ -302,7 +302,18 @@ def changed_cells(before: pd.DataFrame | None, after: pd.DataFrame) -> int:
     if not cols or rows == 0:
         return 0
     a, b = _as_text(before, cols, rows), _as_text(after, cols, rows)
-    return int((a != b).to_numpy().sum())
+    n = int((a != b).to_numpy().sum())
+
+    # 값만 견주면 '빈 칸을 새로 넣은 것' 이 0 으로 나온다 -- 없는 칸도 빈
+    # 글자로 채워 맞추기 때문이다. 그러면 열을 하나 넣고 저장을 누를 수가
+    # 없다. 내용이 있는 칸은 이미 위에서 세어졌으므로, 비어 있는 채로
+    # 생기거나 없어진 칸만 한 개씩 더한다.
+    before_cols = set(map(str, before.columns))
+    after_cols = set(map(str, after.columns))
+    for name in (after_cols - before_cols) | (before_cols - after_cols):
+        if not (b[name] if name in after_cols else a[name]).str.strip().any():
+            n += 1
+    return n
 
 
 def _append_audit(now: datetime, user_id: str, book: str,

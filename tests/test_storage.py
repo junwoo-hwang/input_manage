@@ -213,3 +213,23 @@ def test_sheet_names_excel_would_refuse_do_not_break_the_save(name):
     im.save_workbook("A", {name: pd.DataFrame([{"a": 1}])}, "hong")
     got = list(im.load_workbook("A")[0])[0]
     assert len(got) <= 31 and not set(got) & set(':\\/?*[]'), got
+
+
+def test_adding_an_empty_column_counts_as_a_change():
+    """값만 견주면 0 이 나와서 열을 넣고 저장을 누를 수가 없다."""
+    before = pd.DataFrame([{"a": "1"}, {"a": "2"}])
+    after = pd.DataFrame([{"a": "1", "새칸": ""}, {"a": "2", "새칸": ""}])
+    assert im.changed_cells(before, after) == 1
+
+
+def test_removing_an_empty_column_counts_as_a_change():
+    before = pd.DataFrame([{"a": "1", "빈칸": ""}])
+    after = pd.DataFrame([{"a": "1"}])
+    assert im.changed_cells(before, after) == 1
+
+
+def test_a_column_added_with_content_is_not_counted_twice():
+    """내용이 있으면 그 값이 이미 세어졌으므로 더하지 않는다."""
+    before = pd.DataFrame([{"a": "1"}])
+    after = pd.DataFrame([{"a": "1", "b": "2"}])
+    assert im.changed_cells(before, after) == 1
