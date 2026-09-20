@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import inspect
 import io
 import os
 import threading
@@ -453,6 +454,14 @@ S_TOAST = "_im_toast"
 S_DOWNLOAD = "_im_download"
 
 
+# 칸 너비를 꽉 채우라고 말하는 법이 streamlit 버전마다 다르다. 새 버전은
+# width="stretch", 예전 버전은 use_container_width=True 다. 포털이 어느
+# 버전인지 모르는 채로 한쪽만 쓰면 화면이 아예 안 뜬다 (TypeError).
+_WIDE = ({"width": "stretch"}
+         if "width" in inspect.signature(st.button).parameters
+         else {"use_container_width": True})
+
+
 def _load(book: str) -> None:
     sheets, stamp = load_workbook(book)
     st.session_state[S_BOOK] = book
@@ -487,7 +496,7 @@ def show_input_manage() -> None:
         book = st.selectbox("관리할 파일", books, key="im_book_pick")
     with refresh:
         st.write("")
-        reload_now = st.button("다시 불러오기", width="stretch",
+        reload_now = st.button("다시 불러오기", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다. 이전 파일의 미저장 수정은
@@ -528,17 +537,17 @@ def show_input_manage() -> None:
 
     save_col, make_col, get_col, _gap = st.columns([1, 1.2, 1.6, 3])
     with save_col:
-        if st.button("저장", type="primary", disabled=total == 0, width="stretch"):
+        if st.button("저장", type="primary", disabled=total == 0, **_WIDE):
             _save(book, edited, user_id)
     with make_col:
-        if st.button("엑셀 만들기", width="stretch",
+        if st.button("엑셀 만들기", **_WIDE,
                      help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 만듭니다"):
             st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited))
     with get_col:
         ready = st.session_state.get(S_DOWNLOAD)
         if ready:
             st.download_button(f"⬇ {ready[0]}", ready[1], file_name=ready[0],
-                               width="stretch",
+                               **_WIDE,
                                mime="application/vnd.openxmlformats-officedocument."
                                     "spreadsheetml.sheet")
 
@@ -582,4 +591,4 @@ def _show_history(book: str) -> None:
         if log.empty:
             st.caption("아직 저장된 적이 없습니다.")
         else:
-            st.dataframe(log, width="stretch", hide_index=True)
+            st.dataframe(log, hide_index=True, **_WIDE)
