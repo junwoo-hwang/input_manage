@@ -52,6 +52,8 @@ AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
 BUCKET_NAME = os.getenv("INPUT_S3_BUCKET", "G-DVC")
 FOLDER_PATH = os.getenv("INPUT_S3_PREFIX", "2GAPU/input").strip("/")
 S3_ENDPOINT = os.getenv("INPUT_S3_ENDPOINT", "http://s3.dataplatform.samsungds.net:9020")
+# 저장할 때마다 사본을 쌓아 두는 폴더 (기준 정보 폴더 바로 아래)
+HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
 
 _client_lock = threading.Lock()
 _client = None
@@ -494,7 +496,7 @@ def list_workbooks() -> list[str]:
     for key in s3.list_keys(FOLDER_PATH + "/"):
         name = key[len(FOLDER_PATH) + 1:]
         if "/" in name or not name.lower().endswith(".xlsx") or name.startswith("_"):
-            continue                       # _history/ 안의 것과 내부 파일은 뺀다
+            continue                       # 이력 폴더 안의 것과 임시 파일은 뺀다
         names.append(name[:-len(".xlsx")])
     return names
 
@@ -574,11 +576,43 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
 
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
-    #
-    # 옆에 남기는 파일은 없다. 누가 언제 무엇을 바꿨는지는 이 엑셀 안의
-    # REV_INFO 시트에 한 줄로 쌓인다 -- 기준 정보를 받아 보는 사람이
-    # 파일 하나만 열면 이력까지 같이 보는 것이 맞다.
-    return s3.put_object(key, to_xlsx(sheets, formulas))
+    body = to_xlsx(sheets, formulas)
+
+    # 이력 폴더에 한 벌 먼저 넣는다. 본 파일을 먼저 덮어쓰고 나면, 그 뒤에
+    # 이력 넣기가 실패했을 때 되돌릴 것이 없는 채로 끝난다. 순서를 이렇게
+    # 두면 '사본을 못 남기면 덮어쓰지도 않는다' 가 된다.
+    s3.put_object(_history_key(book, user_id), body)
+    return s3.put_object(key, body)
+
+
+def _history_key(book: str, user_id: str, now: datetime | None = None) -> str:
+    """이력 폴더에 넣을 이름. 260921_원래이름_junwoo.hwang.xlsx
+
+    날짜가 앞에 오므로 폴더를 이름순으로 보면 그대로 시간순이 된다.
+
+    같은 사람이 같은 날 두 번 저장하면 이름이 겹친다. 그대로 두면 앞의 것이
+    조용히 덮어써지는데, 되돌릴 판이 하나 사라지는 셈이라 그럴 수 없다.
+    겹치면 뒤에 번호를 붙인다.
+    """
+    now = now or datetime.now(KST)
+    base = f"{now:%y%m%d}_{book}_{_safe(user_id)}"
+    taken = {k.rsplit("/", 1)[-1] for k in s3.list_keys(_key(HISTORY_DIR) + "/")}
+    name = f"{base}.xlsx"
+    n = 2
+    while name in taken:
+        name = f"{base}_{n}.xlsx"
+        n += 1
+    return _key(HISTORY_DIR, name)
+
+
+def _safe(text: str) -> str:
+    """파일 이름에 넣어도 되는 꼴로. 빈 값이면 'unknown'.
+
+    사번이나 이름이 그대로 들어오므로 / 나 .. 가 섞이면 이력이 폴더 밖에
+    떨어진다.
+    """
+    kept = "".join(c for c in str(text or "") if c.isalnum() or c in "-_.")
+    return kept.strip(".")[:40] or "unknown"
 
 
 def to_xlsx(sheets: dict[str, pd.DataFrame],

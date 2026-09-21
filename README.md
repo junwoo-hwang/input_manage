@@ -7,11 +7,25 @@ SF GDVC 포털의 메뉴 하나. S3 drive 에 있는 기준 정보 엑셀을 **�
 G-DVC / 2GAPU/input /
     FAB_INPUT_ULY_r0.xlsx     <- 이 폴더의 .xlsx 가 곧 편집 대상 목록
     FAB_INPUT_TTS_r0.xlsx
+    이력 /
+        260921_FAB_INPUT_ULY_r0_junwoo.hwang.xlsx    <- 저장할 때마다 한 벌
+        260921_FAB_INPUT_ULY_r0_junwoo.hwang_2.xlsx  <- 같은 날 또 저장하면
 ```
 
-**옆에 남기는 파일은 없다.** 누가 언제 무엇을 바꿨는지는 그 엑셀 안의
-`REV_INFO` 시트에 한 줄씩 쌓인다 — 기준 정보를 받아 보는 사람이 파일
-하나만 열면 이력까지 같이 보는 것이 맞다.
+**누가 언제 무엇을 바꿨는지**는 그 엑셀 안의 `REV_INFO` 시트에 한 줄씩
+쌓인다 — 기준 정보를 받아 보는 사람이 파일 하나만 열면 이력까지 같이
+보는 것이 맞다. 옆에 감사용 파일을 따로 두면 그 둘이 갈리기 시작한다.
+
+**되돌릴 사본**은 다른 얘기라 `이력/` 폴더에 쌓는다. 저장할 때마다
+`{YYMMDD}_{파일이름}_{사번}.xlsx` 로 한 벌 넣는다. 날짜가 앞에 오므로 폴더를
+이름순으로 보면 그대로 시간순이다. 같은 사람이 같은 날 또
+저장하면 이름이 겹치는데, 그대로 두면 앞의 판이 조용히 덮어써지므로 뒤에
+번호를 붙인다. **사본을 못 남기면 본 파일도 안 건드린다** — 그 순서로
+넣었다.
+
+폴더 이름은 `INPUT_S3_HISTORY_DIR` 로 바꿀 수 있다 (기본 `이력`).
+지우는 코드는 없다. 쌓이는 속도는 저장 횟수만큼이고, 너무 늘면 사람이
+지우면 된다.
 
 ## 되는 것
 
@@ -34,6 +48,7 @@ G-DVC / 2GAPU/input /
 - **`변경 이력`** 을 펼치면 그 `REV_INFO` 시트를 최근 것부터 보여준다
 - 저장하면 S3 의 그 엑셀이 바로 바뀌고, **창에서 본 변경내용이 그대로**
   `REV_INFO` 의 `관련` 칸에 들어간다 (사람이 적은 것 먼저, 그 아래에)
+- 같은 값으로 **`이력/` 폴더에 사본 한 벌**이 들어간다 (되돌릴 때 쓴다)
 
 ### 수식 (`VLOOKUP` 같은 것)
 
@@ -77,9 +92,10 @@ ICON_MAP = {
 
 ```
 AWS_ACCESS_KEY / AWS_SECRET_KEY        필수
-INPUT_S3_BUCKET     기본 G-DVC
-INPUT_S3_PREFIX     기본 2GAPU/input
-INPUT_S3_ENDPOINT   기본 http://s3.dataplatform.samsungds.net:9020
+INPUT_S3_BUCKET       기본 G-DVC
+INPUT_S3_PREFIX       기본 2GAPU/input
+INPUT_S3_ENDPOINT     기본 http://s3.dataplatform.samsungds.net:9020
+INPUT_S3_HISTORY_DIR  기본 이력
 ```
 
 ## 구조
@@ -166,7 +182,7 @@ render / setComponentValue)만 직접 지킨다.
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 playwright install chromium
-pytest -q            # 155개
+pytest -q            # 164개
 ```
 
 - `tests/test_storage.py` — 저장이 조용히 덮어써지거나 반쯤 되다 말지 않는가

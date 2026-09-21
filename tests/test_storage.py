@@ -112,15 +112,17 @@ def test_a_failed_save_leaves_the_stored_file_intact():
 
 # ------------------------------------- 이력은 REV_INFO 시트 한 곳에만
 
-def test_saving_leaves_no_files_beside_the_workbook():
-    """옆에 _history/ 나 _audit.csv 를 만들지 않는다.
+def test_the_only_things_written_are_the_workbook_and_its_copy():
+    """감사 기록은 옆 파일이 아니라 엑셀 안의 REV_INFO 시트에 쌓인다.
 
-    기준 정보를 받아 보는 사람이 파일 하나만 열면 이력까지 같이 보게
-    하려고 그렇게 정했다. 옆 파일이 생기면 그 둘이 갈리기 시작한다.
+    옆에 파일을 두면 그 둘이 갈리기 시작한다. 되돌릴 사본은 다른 얘기라
+    이력 폴더에 따로 쌓는다.
     """
     im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
     im.save_workbook("A", sheets(S=[{"a": 2}]), "kim")
-    assert list(fake_s3.STORE) == ["2GAPU/input/A.xlsx"], list(fake_s3.STORE)
+    rest = [k for k in fake_s3.STORE
+            if k != "2GAPU/input/A.xlsx" and "/이력/" not in k]
+    assert rest == [], rest
 
 
 def test_the_change_log_lands_in_the_workbook_itself():
@@ -501,3 +503,89 @@ def test_the_auto_part_alone_is_fine_when_nothing_was_typed():
     out = im.append_rev_info(rev_book(), "2026-09-21", "사유", "나", "",
                              "[STEP] ...")
     assert out["REV_INFO"].iloc[-1]["관련"] == "[STEP] ..."
+
+
+# --------------------------------------------- 이력 폴더에 사본 쌓기
+
+def hist(book="A"):
+    return sorted(k.rsplit("/", 1)[-1]
+                  for k in fake_s3.STORE if "/이력/" in k)
+
+
+def test_every_save_drops_a_copy_in_the_history_folder():
+    im.save_workbook("FAB_INPUT_ULY_r0", sheets(S=[{"a": 1}]), "junwoo.hwang")
+    got = hist()
+    assert len(got) == 1
+    assert "_FAB_INPUT_ULY_r0_" in got[0], got
+    assert got[0].endswith("_junwoo.hwang.xlsx"), got
+
+
+def test_the_folder_sorts_by_time_because_the_date_comes_first():
+    """이름순으로 봐도 시간순이 되게 날짜를 앞에 둔다."""
+    import datetime as dt
+    today = dt.datetime.now(im.KST).strftime("%y%m%d")
+    im.save_workbook("Z파일", sheets(S=[{"a": 1}]), "hong")
+    im.save_workbook("A파일", sheets(S=[{"a": 1}]), "kim")
+    assert all(k.startswith(today) for k in hist()), hist()
+
+
+def test_the_copy_is_named_by_the_day_and_the_person():
+    import datetime as dt
+    today = dt.datetime.now(im.KST).strftime("%y%m%d")
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "junwoo.hwang")
+    assert hist() == [f"{today}_A_junwoo.hwang.xlsx"], hist()
+
+
+def test_the_copy_holds_what_was_just_saved():
+    im.save_workbook("A", sheets(S=[{"a": "새값"}]), "hong")
+    key = next(k for k in fake_s3.STORE if "/이력/" in k)
+    assert im.read_xlsx(fake_s3.STORE[key])["S"]["a"].tolist() == ["새값"]
+
+
+def test_two_saves_on_the_same_day_by_the_same_person_do_not_collide():
+    """그대로 두면 앞의 판이 조용히 덮어써진다 -- 되돌릴 것이 하나 사라진다."""
+    im.save_workbook("A", sheets(S=[{"a": "첫째"}]), "hong")
+    im.save_workbook("A", sheets(S=[{"a": "둘째"}]), "hong")
+    im.save_workbook("A", sheets(S=[{"a": "셋째"}]), "hong")
+    got = hist()
+    assert len(got) == 3, got
+    kept = sorted(im.read_xlsx(fake_s3.STORE[k])["S"]["a"][0]
+                  for k in fake_s3.STORE if "/이력/" in k)
+    assert kept == ["둘째", "셋째", "첫째"], kept
+
+
+def test_the_history_copy_does_not_show_up_as_a_workbook():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    assert im.list_workbooks() == ["A"]
+
+
+def test_a_weird_user_id_cannot_escape_the_history_folder():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "../../etc/passwd")
+    keys = [k for k in fake_s3.STORE if "/이력/" in k]
+    assert len(keys) == 1
+    assert "/이력/" in keys[0] and "_A_" in keys[0], keys
+    assert ".." not in keys[0], keys
+
+
+def test_no_copy_no_overwrite():
+    """사본을 못 남기면 본 파일도 안 건드린다."""
+    im.save_workbook("A", sheets(S=[{"a": "원래"}]), "hong")
+    before = fake_s3.STORE["2GAPU/input/A.xlsx"]
+    real = fake_s3.put_object
+
+    def no_history(key, data):
+        if "/이력/" in key:
+            raise RuntimeError("이력 폴더에 못 씁니다")
+        return real(key, data)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(fake_s3, "put_object", no_history)
+        with pytest.raises(RuntimeError):
+            im.save_workbook("A", sheets(S=[{"a": "새것"}]), "hong")
+    assert fake_s3.STORE["2GAPU/input/A.xlsx"] == before
+    assert im.load_workbook("A")[0]["S"]["a"].tolist() == ["원래"]
+
+
+def test_downloading_does_not_touch_the_history_folder():
+    im.to_xlsx(sheets(S=[{"a": 1}]))
+    assert not [k for k in fake_s3.STORE if "/이력/" in k]
