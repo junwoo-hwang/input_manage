@@ -21,6 +21,7 @@ streamlit 컴포넌트가 iframe 에 띄우는 방식이라 파일이 나뉠 수
 from __future__ import annotations
 
 import csv
+import difflib
 import hashlib
 import inspect
 import io
@@ -669,6 +670,113 @@ def changed_cells(before: pd.DataFrame | None, after: pd.DataFrame) -> int:
     return n
 
 
+# ----------------------------------------------------------------------
+# 무엇이 바뀌었나 -- 저장 전에 사람에게 보여 줄 것
+# ----------------------------------------------------------------------
+REV_SHEET = "REV_INFO"
+# 그 시트에 적을 칸들. 없는 칸은 건너뛰고, 있는 칸만 채운다.
+REV_DATE, REV_REMARK, REV_USER, REV_LINK = "Date", "Remark", "user", "관련"
+
+
+def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
+                limit: int = 300) -> tuple[list[dict], int]:
+    """어느 줄이 어떻게 바뀌었는지. ([{kind, row, values}], 전체 개수)
+
+    kind 는 '신규' / '수정' / '삭제' 다. 자리만 비교하면(첫 줄부터 차례로)
+    가운데에 줄 하나를 끼워 넣었을 때 그 아래가 전부 '수정' 으로 나온다.
+    그래서 difflib 으로 '무엇이 그대로이고 무엇이 끼어들었나' 를 먼저 맞춘다.
+
+    limit 은 팝업에 띄울 개수다. 몇 천 줄을 붙여넣고 저장하는 일이 있는데,
+    그걸 다 그리면 팝업이 안 뜬다. 넘치는 것은 개수로만 알린다.
+    """
+    cols = list(dict.fromkeys([*map(str, (before.columns if before is not None else [])),
+                               *map(str, after.columns)]))
+    old = _as_text(before, cols, len(before)) if before is not None else None
+    new = _as_text(after, cols, len(after))
+    old_rows = [tuple(r) for r in old.itertuples(index=False, name=None)] if old is not None else []
+    new_rows = [tuple(r) for r in new.itertuples(index=False, name=None)]
+
+    out: list[dict] = []
+    total = 0
+
+    def add(kind: str, n: int, values: tuple):
+        nonlocal total
+        total += 1
+        if len(out) < limit:
+            out.append({"kind": kind, "row": n,
+                        "values": dict(zip(cols, values))})
+
+    matcher = difflib.SequenceMatcher(None, old_rows, new_rows, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag in ("replace", "insert"):
+            for j in range(j1, j2):
+                # 빈 줄을 새로 만들어 두고 안 채운 것은 '바뀐 것' 이 아니다
+                if tag == "insert" and not any(v.strip() for v in new_rows[j]):
+                    continue
+                add("수정" if tag == "replace" else "신규", j + 1, new_rows[j])
+        if tag in ("replace", "delete"):
+            for i in range(i1, i2):
+                if tag == "replace" and i - i1 < j2 - j1:
+                    continue            # 같은 자리의 '수정' 으로 이미 셌다
+                add("삭제", i + 1, old_rows[i])
+    return out, total
+
+
+def workbook_changes(before: dict[str, pd.DataFrame],
+                     after: dict[str, pd.DataFrame]) -> dict:
+    """{시트이름: {"rows": [...], "total": n, "note": "..."}}. 안 바뀐 시트는 뺀다."""
+    out: dict[str, dict] = {}
+    for name, df in after.items():
+        old = before.get(name)
+        rows, total = row_changes(old, df)
+        notes = []
+        if old is None:
+            notes.append("새 시트")
+        else:
+            gone = [c for c in map(str, old.columns) if c not in map(str, df.columns)]
+            new_cols = [c for c in map(str, df.columns) if c not in map(str, old.columns)]
+            if new_cols:
+                notes.append("칸 추가: " + ", ".join(new_cols))
+            if gone:
+                notes.append("칸 삭제: " + ", ".join(gone))
+        if total or notes:
+            out[name] = {"rows": rows, "total": total, "note": " · ".join(notes)}
+    for name in before:
+        if name not in after:
+            out[name] = {"rows": [], "total": 0, "note": "시트 삭제"}
+    return out
+
+
+def rev_columns(sheets: dict[str, pd.DataFrame]) -> list[str] | None:
+    """REV_INFO 시트의 칸 이름들. 그 시트가 없으면 None."""
+    df = sheets.get(REV_SHEET)
+    return None if df is None else [str(c) for c in df.columns]
+
+
+def append_rev_info(sheets: dict[str, pd.DataFrame], when: str, remark: str,
+                    user: str, link: str) -> dict[str, pd.DataFrame]:
+    """REV_INFO 시트 맨 아래에 이번 변경 한 줄을 붙인 사본을 돌려준다.
+
+    맨 아래에 붙이는 이유는 그래야 위의 줄 번호가 그대로이기 때문이다.
+    위에 끼워 넣으면 다음에 열었을 때 '무엇이 바뀌었나' 가 전부 한 칸씩
+    밀려 보인다.
+    """
+    df = sheets.get(REV_SHEET)
+    if df is None:
+        return sheets
+    want = {REV_DATE: when, REV_REMARK: remark, REV_USER: user, REV_LINK: link}
+    row = {}
+    for col in df.columns:
+        key = str(col).strip().lower()
+        row[col] = next((v for k, v in want.items() if k.lower() == key), "")
+    out = dict(sheets)
+    out[REV_SHEET] = pd.concat(
+        [df, pd.DataFrame([row], columns=df.columns)], ignore_index=True)
+    return out
+
+
 def _append_audit(now: datetime, user_id: str, book: str,
                   before: dict[str, pd.DataFrame],
                   after: dict[str, pd.DataFrame]) -> None:
@@ -728,13 +836,20 @@ _grid = components.declare_component("input_manage_sheet_grid", path=str(_FRONTE
 
 
 def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
-               max_height: int = 520) -> dict[str, pd.DataFrame]:
-    """격자를 그리고, 사람이 고친 시트들을 돌려준다.
+               max_height: int = 520, want_full: str = "") -> dict:
+    """격자를 그리고, 격자가 올려준 것을 그대로 돌려준다.
+
+    돌려주는 것: {"rev": n, "dirty": bool} 이고, 표를 달라고 했을 때만
+    {"full": True, "token": ..., "sheets": [...]} 가 붙는다.
 
     version 은 '이 데이터가 갈렸다' 를 알리는 표다. 격자는 이 값이 바뀔
     때만 제 상태를 갈아엎는다 -- 값을 올려보낼 때마다 streamlit 이 스크립트를
     다시 돌리면서 같은 데이터가 되돌아오는데, 그때마다 새로 그리면 방금 고친
     칸과 고른 자리, 보고 있던 시트가 날아간다.
+
+    want_full 은 '지금 표를 통째로 올려달라' 는 표다. 평소에는 빈 글자다 --
+    칸 하나 고칠 때마다 15,000행을 통째로 주고받으면 한 번에 2.6초가 걸린다.
+    저장이나 엑셀 만들기처럼 진짜로 값이 필요할 때만 표를 하나 들려 보낸다.
     """
     payload = [{
         "name": str(name),
@@ -744,10 +859,8 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
     } for name, df in sheets.items()]
 
     got = _grid(sheets=payload, version=version, max_height=max_height,
-                key=key, default=None)
-    if not got:
-        return sheets
-    return to_frames(got)
+                want_full=want_full, key=key, default=None)
+    return got or {}
 
 
 def to_frames(payload: dict) -> dict[str, pd.DataFrame]:
@@ -804,6 +917,16 @@ S_TOAST = "_im_toast"
 # 하는데, 8000행짜리 엑셀을 만드는 데 1초 넘게 걸린다. 그걸 화면 그릴 때마다
 # 하면 칸 하나 고칠 때마다 그 값을 치르게 된다. 그래서 누를 때만 만든다.
 S_DOWNLOAD = "_im_download"
+# 격자에 '표를 통째로 올려달라' 고 하면서 들려 보낸 표. 격자가 그 표를 달고
+# 올려주면 그때가 우리가 요청한 그 값이다.
+#
+# 이 왕복이 필요한 이유: 평소에 격자는 '고친 게 있다' 만 올린다. 칸 하나
+# 고칠 때마다 15,000행을 통째로 주고받으면 한 번에 2.6초가 걸리기 때문이다.
+# 그래서 저장이나 엑셀 만들기처럼 값이 진짜 필요한 순간에만 달라고 한다.
+S_WANT = "_im_want"
+S_PENDING = "_im_pending"    # 표를 받으면 할 일: "save" | "download"
+S_EDITED = "_im_edited"      # 격자가 올려준 지금 값
+S_REVIEW = "_im_review"      # 저장 팝업에 띄울 변경 내역
 
 
 # 칸 너비를 꽉 채우라고 말하는 법이 streamlit 버전마다 다르다. 새 버전은
@@ -813,6 +936,10 @@ _WIDE = ({"width": "stretch"}
          if "width" in inspect.signature(st.button).parameters
          else {"use_container_width": True})
 
+# st.dialog 는 예전 streamlit 에 없다. 없으면 팝업 대신 화면 안에 펼쳐서
+# 보여준다 -- 보기는 덜 좋아도 저장 전에 확인하는 절차는 그대로 지킨다.
+_HAS_DIALOG = hasattr(st, "dialog")
+
 
 def _load(book: str) -> None:
     sheets, stamp = load_workbook(book)
@@ -820,6 +947,9 @@ def _load(book: str) -> None:
     st.session_state[S_SHEETS] = sheets
     st.session_state[S_STAMP] = stamp
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
+    # 다른 파일의 값과 진행 중이던 저장은 들고 가지 않는다
+    for key in (S_EDITED, S_REVIEW, S_WANT, S_PENDING):
+        st.session_state.pop(key, None)
 
 
 def show_input_manage() -> None:
@@ -867,34 +997,23 @@ def show_input_manage() -> None:
         return
 
     user_id = st.session_state.get("user_id") or "unknown"
-    edited = sheet_grid(
+    got = sheet_grid(
         sheets,
         version=f"{book}|{st.session_state[S_STAMP]}|{st.session_state[S_NONCE]}",
         key="im_grid",
+        want_full=st.session_state.get(S_WANT, ""),
     )
-
-    # 칸 값만 세면 안 된다. 시트를 새로 만들거나 이름을 바꾸거나 지운 것도
-    # '고친 것' 인데, 빈 시트를 하나 더한 경우 칸 기준으로는 0 이 나와서
-    # 저장 버튼이 안 켜진다 (실제로 그랬다).
-    counts: dict[str, int] = {}
-    for name, df in edited.items():
-        if name in sheets:
-            counts[name] = changed_cells(sheets[name], df)
-        else:
-            counts[f"{name} (새 시트)"] = max(changed_cells(None, df), 1)
-    for name in sheets:
-        if name not in edited:
-            counts[f"{name} (지움)"] = max(len(sheets[name]), 1)
-    total = sum(counts.values())
+    dirty = bool(got.get("dirty"))
+    _take_full(got, book)
 
     save_col, make_col, get_col, _gap = st.columns([1, 1.2, 1.6, 3])
     with save_col:
-        if st.button("저장", type="primary", disabled=total == 0, **_WIDE):
-            _save(book, edited, user_id)
+        if st.button("저장", type="primary", disabled=not dirty, **_WIDE):
+            _ask_full("save")
     with make_col:
         if st.button("엑셀 만들기", **_WIDE,
                      help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 만듭니다"):
-            st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited))
+            _ask_full("download")
     with get_col:
         ready = st.session_state.get(S_DOWNLOAD)
         if ready:
@@ -903,13 +1022,125 @@ def show_input_manage() -> None:
                                mime="application/vnd.openxmlformats-officedocument."
                                     "spreadsheetml.sheet")
 
-    if total:
-        changed = ", ".join(f"{n}({c})" for n, c in counts.items() if c)
-        st.info(f"저장하지 않은 수정 {total}칸 — {changed}")
+    if st.session_state.get(S_WANT):
+        st.caption("표를 받아오는 중입니다...")
+    elif dirty:
+        st.info("저장하지 않은 수정이 있습니다. "
+                "저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
     else:
         st.caption("고친 것 없음")
 
+    if st.session_state.get(S_REVIEW):
+        _review(book, user_id)
+
     _show_history(book)
+
+
+def _ask_full(what: str) -> None:
+    """격자에게 '지금 표를 통째로 올려달라' 고 한다. 다음 판에서 받는다."""
+    st.session_state[S_PENDING] = what
+    st.session_state[S_WANT] = f"{what}-{datetime.now(KST):%H%M%S%f}"
+    st.rerun()
+
+
+def _take_full(got: dict, book: str) -> None:
+    """격자가 올려준 표를 받아 두고, 달라고 한 이유대로 처리한다.
+
+    토큰을 맞춰 보는 이유는 streamlit 이 컴포넌트가 마지막에 올린 값을
+    계속 되돌려주기 때문이다. 그것만 보고 일하면 저장이 끝난 뒤에도 매 판마다
+    또 저장하려 든다.
+    """
+    want = st.session_state.get(S_WANT)
+    if not want or not got.get("full") or got.get("token") != want:
+        return
+    st.session_state.pop(S_WANT, None)
+    edited = to_frames(got)
+    st.session_state[S_EDITED] = edited
+    what = st.session_state.pop(S_PENDING, None)
+    if what == "download":
+        st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited))
+    elif what == "save":
+        st.session_state[S_REVIEW] = workbook_changes(
+            st.session_state[S_SHEETS], edited)
+    st.rerun()
+
+
+def _review(book: str, user_id: str) -> None:
+    """저장 전에 '무엇이 바뀌는가' 를 보여주고 REV_INFO 를 받는다."""
+    if _HAS_DIALOG:
+        kw = ({"width": "large"}
+              if "width" in inspect.signature(st.dialog).parameters else {})
+        st.dialog("저장하기 전에 — 무엇이 바뀌나", **kw)(_review_body)(book, user_id)
+    else:
+        with st.container(border=True):
+            _review_body(book, user_id)
+
+
+def _review_body(book: str, user_id: str) -> None:
+    changes: dict = st.session_state[S_REVIEW]
+    edited: dict[str, pd.DataFrame] = st.session_state[S_EDITED]
+
+    if not any(v["total"] or v["note"] for v in changes.values()):
+        st.info("바뀐 것이 없습니다. 저장할 것이 없어요.")
+        if st.button("닫기", **_WIDE):
+            st.session_state.pop(S_REVIEW, None)
+            st.rerun()
+        return
+
+    for name, info in changes.items():
+        head = f"**{name}** — {info['total']}줄"
+        if info["note"]:
+            head += f" · {info['note']}"
+        st.markdown(head)
+        if info["rows"]:
+            # st.dataframe 이 아니라 st.table 이다. dataframe 은 캔버스로
+            # 그려서 눈으로는 보이지만 글자로는 안 잡히고, 스크롤을 따로
+            # 해야 한다. 여기는 '읽고 판단하는' 표라 통째로 펼쳐 두는 쪽이 낫다.
+            st.table(pd.DataFrame(
+                [{"": r["kind"], "행": r["row"], **r["values"]}
+                 for r in info["rows"]]).set_index(""))
+        if info["total"] > len(info["rows"]):
+            st.caption(f"…외 {info['total'] - len(info['rows'])}줄은 접었습니다. "
+                       f"전부 보려면 '엑셀 만들기' 로 받아서 비교하세요.")
+
+    st.divider()
+
+    cols = rev_columns(st.session_state[S_SHEETS])
+    if cols is None:
+        st.caption(f"이 파일에는 `{REV_SHEET}` 시트가 없어 변경 사유는 안 받습니다.")
+        remark = link = ""
+        who = user_id
+        ok = True
+    else:
+        st.markdown(f"**{REV_SHEET} 에 남길 기록**")
+        today = f"{datetime.now(KST):%Y-%m-%d}"
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            # 날짜는 사람이 못 바꾼다. 언제 바꿨는지는 기록이지 입력이 아니다.
+            st.text_input(REV_DATE, value=today, disabled=True,
+                          key="im_rev_date")
+        with c2:
+            who = st.text_input(f"{REV_USER} — 바꾼 사람", value=user_id,
+                                key="im_rev_user")
+        remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark")
+        link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link")
+        ok = bool(remark.strip() and who.strip())
+        if not ok:
+            st.caption(f"{REV_REMARK} 와 {REV_USER} 를 적어야 저장할 수 있습니다.")
+
+    go, cancel, _gap = st.columns([1, 1, 3])
+    with go:
+        if st.button("저장", type="primary", disabled=not ok, **_WIDE):
+            body = edited
+            if cols is not None:
+                body = append_rev_info(edited, f"{datetime.now(KST):%Y-%m-%d}",
+                                       remark.strip(), who.strip(), link.strip())
+            st.session_state.pop(S_REVIEW, None)
+            _save(book, body, who.strip() or user_id)
+    with cancel:
+        if st.button("취소", **_WIDE):
+            st.session_state.pop(S_REVIEW, None)
+            st.rerun()
 
 
 def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
@@ -929,6 +1160,11 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
     st.session_state[S_SHEETS] = {k: v.copy() for k, v in edited.items()}
     st.session_state[S_STAMP] = stamp
     st.session_state.pop(S_DOWNLOAD, None)
+    st.session_state.pop(S_EDITED, None)
+    # 다음 저장 때 지난번 사유가 그대로 남아 있으면, 그걸 못 보고 그대로
+    # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
+    for key in ("im_rev_remark", "im_rev_link"):
+        st.session_state.pop(key, None)
     st.session_state[S_TOAST] = f"'{book}' 저장했습니다 ({user_id})."
     st.rerun()
 

@@ -107,6 +107,36 @@ def wait_dirty(page):
         "() => document.body.innerText.includes('저장하지 않은 수정')", timeout=30000)
 
 
+def open_review(page, table=True):
+    """저장을 눌러 '무엇이 바뀌나' 창을 띄운다.
+
+    바뀐 줄을 담은 표는 창보다 한 박자 늦게 도착한다 (streamlit 이 화면을
+    조각내어 보낸다). 표를 볼 검사는 그것까지 기다려야 한다.
+    """
+    page.get_by_role("button", name="저장", exact=True).first.click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('무엇이 바뀌나')", timeout=60000)
+    if table:
+        page.wait_for_selector("[role='dialog'] [data-testid='stTable'], "
+                               "[data-testid='stTable']", timeout=60000)
+
+
+def review_text(page):
+    """'무엇이 바뀌나' 창 안의 글자만. 뒤에 깔린 화면 글자와 안 섞이게."""
+    box = page.locator("[role='dialog']")
+    return box.inner_text() if box.count() else page.inner_text("body")
+
+
+def confirm_save(page, remark="사유", user="검사자"):
+    """저장 -> 사유 적기 -> 진짜 저장. '저장했습니다' 가 뜰 때까지 기다린다."""
+    open_review(page, table=False)
+    page.get_by_label("Remark — 사유").fill(remark)
+    page.get_by_label("user — 바꾼 사람").fill(user)
+    page.get_by_role("button", name="저장", exact=True).last.click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+
+
 def paste(page, text):
     """엑셀에서 긁어온 것처럼 클립보드에 넣고 붙여넣는다.
 
@@ -286,12 +316,9 @@ def test_typing_into_a_cell_and_saving_changes_what_is_stored(page, typed):
     page.keyboard.type(typed)
     page.keyboard.press("Enter")
     wait_dirty(page)
-    assert "저장하지 않은 수정 1칸" in page.inner_text("body"), page.inner_text("body")[:400]
-    save = page.get_by_role("button", name="저장")
+    save = page.get_by_role("button", name="저장", exact=True)
     assert save.is_enabled(), "저장 버튼이 안 켜졌습니다"
-    save.click()
-    page.wait_for_function(
-        "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+    confirm_save(page, remark="검사")
     reset(page)
     assert table(page)["rows"][0][2] == typed, "저장한 값이 안 남았습니다"
 
@@ -555,3 +582,91 @@ def test_the_grid_is_not_a_table_element(page):
     """
     assert grid(page).locator("table").count() == 0
     assert grid(page).locator(".tbl .row .cell").count() > 0
+
+
+# ------------------------------------------------- 저장 전에 보여주는 창
+
+def test_the_review_says_which_rows_changed_and_how(page):
+    """고친 줄은 '수정', 새로 만든 줄은 '신규' 로 나와야 한다."""
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("고침")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page)
+    body = review_text(page)
+    assert "STEP" in body
+    assert "수정" in body, body[:600]
+    assert "고침" in body, f"바뀐 줄의 값이 안 보입니다: {body[:600]}"
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(600)
+
+
+def test_a_new_row_is_marked_new_not_edited(page):
+    reset(page)
+    click_cell(page, 0, 0)
+    grid(page).locator("#bar [data-act='row-below']").click()
+    page.wait_for_timeout(300)
+    click_cell(page, 1, 0)
+    page.keyboard.type("새줄")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page)
+    body = review_text(page)
+    assert "신규" in body, body[:600]
+    assert "새줄" in body, body[:600]
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(600)
+
+
+def test_saving_needs_a_reason(page):
+    """Remark 와 user 를 안 적으면 저장 단추가 안 켜진다."""
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("사유없이")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page)
+    assert not page.get_by_role("button", name="저장", exact=True).last.is_enabled()
+    page.get_by_label("Remark — 사유").fill("이유 있음")
+    page.keyboard.press("Tab")          # streamlit 은 칸을 떠나야 값을 받는다
+    page.wait_for_timeout(1200)
+    assert page.get_by_role("button", name="저장", exact=True).last.is_enabled()
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(600)
+
+
+def test_the_date_cannot_be_typed_over(page):
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("날짜확인")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page)
+    box = page.get_by_label("Date")
+    assert box.is_disabled(), "날짜 칸을 고칠 수 있으면 안 됩니다"
+    import datetime as _dt
+    today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=9))).strftime("%Y-%m-%d")
+    assert box.input_value() == today, box.input_value()
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(600)
+
+
+def test_the_reason_lands_in_the_rev_info_sheet(page):
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("기록남기기")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    confirm_save(page, remark="오탈자 고침", user="김검사")
+
+    reset(page)
+    page.wait_for_timeout(400)
+    grid(page).locator(".sheetbar .tab", has_text="REV_INFO").click()
+    page.wait_for_timeout(600)
+    last = table(page)["rows"][-1]
+    assert "오탈자 고침" in last, last
+    assert "김검사" in last, last
+    import datetime as _dt
+    today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=9))).strftime("%Y-%m-%d")
+    assert today in last, last

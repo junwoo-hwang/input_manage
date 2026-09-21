@@ -56,6 +56,12 @@ def seed():
             "EQP": pd.DataFrame([
                 {"eqp": "PRB01", "line": "L1", "사용": "Y"},
             ]),
+            # 저장할 때 사유를 받아 한 줄씩 쌓는 시트. 실제 파일에 있는 것과
+            # 칸 이름을 맞춰 둔다.
+            "REV_INFO": pd.DataFrame([
+                {"Date": "2026-09-01", "Remark": "최초 등록",
+                 "user": "홍길동", "관련": ""},
+            ]),
         },
         "FAB_INPUT_TTS_r0": {
             "STEP": pd.DataFrame([

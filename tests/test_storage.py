@@ -233,3 +233,150 @@ def test_a_column_added_with_content_is_not_counted_twice():
     before = pd.DataFrame([{"a": "1"}])
     after = pd.DataFrame([{"a": "1", "b": "2"}])
     assert im.changed_cells(before, after) == 1
+
+
+# -------------------------------------- 저장 전에 보여 줄 것 (무엇이 바뀌나)
+
+def frame(rows, cols=("a", "b")):
+    return pd.DataFrame(rows, columns=list(cols), dtype=object)
+
+
+def kinds(before, after):
+    rows, total = im.row_changes(before, after)
+    return [(r["kind"], r["row"]) for r in rows], total
+
+
+def test_an_edited_row_is_called_edited():
+    before = frame([["1", "x"], ["2", "y"]])
+    after = frame([["1", "x"], ["2", "바뀜"]])
+    assert kinds(before, after) == ([("수정", 2)], 1)
+
+
+def test_a_row_added_at_the_end_is_called_new():
+    before = frame([["1", "x"]])
+    after = frame([["1", "x"], ["2", "y"]])
+    assert kinds(before, after) == ([("신규", 2)], 1)
+
+
+def test_a_row_inserted_in_the_middle_does_not_mark_the_rest_as_edited():
+    """자리만 맞춰 비교하면 끼워 넣은 줄 아래가 전부 '수정' 으로 나온다.
+
+    8000줄짜리에서 줄 하나 넣고 저장하면 '7999줄 수정' 이라고 뜨는 셈이라,
+    사람이 그 창을 안 읽게 된다 -- 읽으라고 띄우는 창인데.
+    """
+    before = frame([["1", "x"], ["2", "y"], ["3", "z"]])
+    after = frame([["1", "x"], ["새", "줄"], ["2", "y"], ["3", "z"]])
+    assert kinds(before, after) == ([("신규", 2)], 1)
+
+
+def test_a_deleted_row_is_called_deleted():
+    before = frame([["1", "x"], ["2", "y"], ["3", "z"]])
+    after = frame([["1", "x"], ["3", "z"]])
+    assert kinds(before, after) == ([("삭제", 2)], 1)
+
+
+def test_nothing_changed_means_nothing_to_show():
+    before = frame([["1", "x"], ["2", "y"]])
+    assert kinds(before, before.copy()) == ([], 0)
+
+
+def test_a_blank_row_left_over_is_not_a_change():
+    """'행 아래' 를 눌렀다 안 채우고 저장하는 일이 흔하다."""
+    before = frame([["1", "x"]])
+    after = frame([["1", "x"], ["", ""]])
+    assert kinds(before, after) == ([], 0)
+
+
+def test_the_changed_row_carries_its_whole_row():
+    before = frame([["1", "x"]])
+    after = frame([["1", "바뀜"]])
+    rows, _ = im.row_changes(before, after)
+    assert rows[0]["values"] == {"a": "1", "b": "바뀜"}
+
+
+def test_too_many_changes_are_counted_but_not_all_listed():
+    before = frame([[str(i), "x"] for i in range(500)])
+    after = frame([[str(i), "y"] for i in range(500)])
+    rows, total = im.row_changes(before, after, limit=10)
+    assert total == 500 and len(rows) == 10
+
+
+def test_workbook_changes_leaves_out_untouched_sheets():
+    before = {"A": frame([["1", "x"]]), "B": frame([["1", "x"]])}
+    after = {"A": frame([["1", "바뀜"]]), "B": frame([["1", "x"]])}
+    got = im.workbook_changes(before, after)
+    assert list(got) == ["A"]
+    assert got["A"]["total"] == 1
+
+
+def test_workbook_changes_notices_a_new_column():
+    before = {"A": frame([["1", "x"]])}
+    after = {"A": frame([["1", "x", ""]], cols=("a", "b", "c"))}
+    assert "칸 추가: c" in im.workbook_changes(before, after)["A"]["note"]
+
+
+def test_workbook_changes_notices_a_dropped_sheet():
+    got = im.workbook_changes({"A": frame([["1", "x"]]), "B": frame([["1", "x"]])},
+                              {"A": frame([["1", "x"]])})
+    assert got["B"]["note"] == "시트 삭제"
+
+
+# ------------------------------------------------------------ REV_INFO
+
+def rev_book():
+    return {"STEP": frame([["1", "x"]]),
+            "REV_INFO": pd.DataFrame(
+                [{"Date": "2026-09-01", "Remark": "최초", "user": "hong", "관련": ""}],
+                dtype=object)}
+
+
+def test_rev_columns_are_found():
+    assert im.rev_columns(rev_book()) == ["Date", "Remark", "user", "관련"]
+
+
+def test_no_rev_sheet_means_no_reason_is_demanded():
+    assert im.rev_columns({"STEP": frame([["1", "x"]])}) is None
+
+
+def test_the_reason_is_appended_at_the_bottom():
+    """위에 끼워 넣으면 다음에 열었을 때 그 시트의 줄 번호가 전부 밀린다."""
+    book = rev_book()
+    out = im.append_rev_info(book, "2026-09-21", "오탈자", "김철수", "JIRA-1")
+    assert out["REV_INFO"].values.tolist() == [
+        ["2026-09-01", "최초", "hong", ""],
+        ["2026-09-21", "오탈자", "김철수", "JIRA-1"],
+    ]
+
+
+def test_appending_does_not_touch_what_was_passed_in():
+    book = rev_book()
+    im.append_rev_info(book, "2026-09-21", "사유", "나", "")
+    assert len(book["REV_INFO"]) == 1
+
+
+def test_the_optional_field_may_be_empty():
+    out = im.append_rev_info(rev_book(), "2026-09-21", "사유", "나", "")
+    assert out["REV_INFO"].iloc[-1]["관련"] == ""
+
+
+def test_columns_are_matched_ignoring_case_and_spaces():
+    book = {"REV_INFO": pd.DataFrame(columns=[" DATE ", "remark", "USER", "관련"],
+                                     dtype=object)}
+    out = im.append_rev_info(book, "2026-09-21", "사유", "나", "세부")
+    assert out["REV_INFO"].iloc[-1].tolist() == ["2026-09-21", "사유", "나", "세부"]
+
+
+def test_a_rev_sheet_with_other_columns_leaves_them_blank():
+    book = {"REV_INFO": pd.DataFrame(columns=["Date", "Remark", "user", "관련", "기타"],
+                                     dtype=object)}
+    out = im.append_rev_info(book, "2026-09-21", "사유", "나", "")
+    assert out["REV_INFO"].iloc[-1]["기타"] == ""
+
+
+def test_the_saved_file_carries_the_new_rev_row():
+    book = rev_book()
+    with_rev = im.append_rev_info(book, "2026-09-21", "오탈자", "김철수", "")
+    im.save_workbook("A", with_rev, "김철수")
+    back = im.load_workbook("A")[0]["REV_INFO"]
+    assert back.iloc[-1]["Remark"] == "오탈자"
+    assert back.iloc[-1]["Date"] == "2026-09-21"

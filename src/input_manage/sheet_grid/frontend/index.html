@@ -574,15 +574,34 @@ function cellEl(r, c) {
 //
 // 칸을 누를 때마다 올리면 streamlit 이 그때마다 스크립트를 처음부터 다시
 // 돌린다. 한 박자 모았다가 한 번만 올린다.
+//
+// 그리고 고칠 때마다 표를 통째로 올리지는 않는다. 15,000행이면 그게 한 번에
+// 0.7MB 이고, 칸 하나 고칠 때마다 그걸 올렸다 파이썬이 표로 되돌리느라 2.6초가
+// 걸렸다. 평소에는 '고친 게 있다' 만 올리고, 파이썬이 진짜로 값이 필요할 때
+// (저장 / 엑셀 만들기) 표를 달라고 하면 그때 통째로 올린다.
 // ===================================================================
 let publishTimer = null;
+let rev = 0;            // 몇 번째 올림인지. 파이썬이 같은 값을 두 번 처리하지
+                        // 않게 하는 표다 (streamlit 은 마지막 값을 되돌려준다).
+let dirty = false;      // 이 판을 받은 뒤로 사람이 뭔가 건드렸는가
+let answered = "";      // 마지막으로 응답한 '통째로 달라' 표
+
 function publish(immediate) {
   clearTimeout(publishTimer);
-  const go = () => setValue({
+  dirty = true;
+  const go = () => setValue({ rev: ++rev, dirty: true, full: false });
+  if (immediate) go(); else publishTimer = setTimeout(go, 350);
+}
+
+// 파이썬이 표를 달라고 했다. 통째로 올린다.
+function publishFull(token) {
+  clearTimeout(publishTimer);
+  answered = token;
+  setValue({
+    rev: ++rev, dirty: dirty, full: true, token: token,
     sheets: sheets.map(s => ({ name: s.name, cols: s.cols.slice(),
                                rows: s.rows.map(r => r.slice()) })),
   });
-  if (immediate) go(); else publishTimer = setTimeout(go, 350);
 }
 
 // ===================================================================
@@ -1150,7 +1169,13 @@ window.addEventListener("message", (event) => {
   // 판 번호가 그대로면 건드리지 않는다. 값을 올려보낼 때마다 streamlit 이
   // 스크립트를 다시 돌리면서 이 자리로 같은 데이터가 되돌아오는데, 그때마다
   // 갈아엎으면 방금 고친 칸과 고른 자리, 보고 있던 시트가 통째로 날아간다.
-  if (args.version === version) { syncHeight(); return; }
+  if (args.version === version) {
+    // 판은 그대로다. 파이썬이 '표를 통째로 달라' 고 했으면 그것만 해 준다.
+    const want = args.want_full || "";
+    if (want && want !== answered) publishFull(want);
+    syncHeight();
+    return;
+  }
 
   version = args.version;
   sheets = (args.sheets || []).map(s => {
@@ -1170,12 +1195,14 @@ window.addEventListener("message", (event) => {
   redoStack.length = 0;
   renderAll();
 
-  // 새 판을 곧바로 올려보낸다. streamlit 은 컴포넌트가 마지막에 올린 값을
-  // key 로 기억하고 있어서, 이걸 안 하면 '다시 불러오기' 를 눌러 표는 새로
-  // 그려졌는데 파이썬 쪽은 여전히 버린 수정을 들고 있다 -- 저장 버튼이 계속
-  // 켜져 있고, 그 상태로 저장하면 버린 값이 되살아난다.
+  // 새 판을 곧바로 '고친 것 없음' 으로 올려보낸다. streamlit 은 컴포넌트가
+  // 마지막에 올린 값을 key 로 기억하고 있어서, 이걸 안 하면 '다시 불러오기'
+  // 를 눌러 표는 새로 그려졌는데 파이썬 쪽은 여전히 버린 수정을 들고 있다 --
+  // 저장 버튼이 계속 켜져 있고, 그 상태로 저장하면 버린 값이 되살아난다.
+  dirty = false;
+  answered = "";
   clearTimeout(publishTimer);
-  publish(true);
+  setValue({ rev: ++rev, dirty: false, full: false });
 });
 
 send({ type: "streamlit:componentReady", apiVersion: 1 });
