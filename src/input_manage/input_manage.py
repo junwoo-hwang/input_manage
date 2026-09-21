@@ -25,9 +25,12 @@ import hashlib
 import inspect
 import io
 import os
+import re
 import threading
-from datetime import datetime, timedelta, timezone
+import zipfile
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import boto3
 import botocore.exceptions
@@ -133,7 +136,296 @@ s3 = _S3()
 
 
 # ======================================================================
-# 2. 엑셀 읽고 쓰기. 화면은 여기 안 들어온다.
+# 2. .xlsx 를 파이썬 기본 기능만으로 읽고 쓴다.
+#
+# openpyxl 을 안 쓰는 이유는 하나다: 사내 pypi 미러에 없다. 그것 하나 때문에
+# 화면 전체를 못 올리는 것보다, 우리가 쓰는 만큼만 직접 다루는 쪽이 낫다.
+# 여기서 필요한 것은 값뿐이고(서식은 안 다루기로 했다) xlsx 는 XML 몇 장을
+# zip 으로 묶은 것이라 그 정도는 기본 기능으로 된다.
+#
+# 읽을 때 감당하는 것: sharedStrings 에 모인 글자(엑셀이 저장한 파일), 칸
+# 안에 그대로 있는 글자(inlineStr), 수식 칸(마지막 계산값), 날짜(엑셀은
+# 날짜를 수로 저장하고 서식으로만 구분한다), 참/거짓, 빈 칸, 건너뛴 칸.
+# 쓸 때는 글자와 수만 쓴다.
+# ======================================================================
+NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+# 엑셀이 미리 정해 둔 날짜/시간 서식 번호. 사용자가 만든 서식은 아래에서
+# 서식 문자열을 보고 가린다.
+BUILTIN_DATE_FMTS = set(range(14, 23)) | {45, 46, 47}
+# 엑셀의 날짜 0 일. 1900 년 윤년 버그 때문에 1899-12-30 에서 센다.
+EPOCH = datetime(1899, 12, 30)
+MIDNIGHT = time(0, 0)
+
+
+class BadWorkbook(Exception):
+    """엑셀 파일로 읽을 수 없다."""
+
+
+def xlsx_read(data: bytes) -> dict[str, list[list]]:
+    """{시트이름: [[값, ...], ...]}. 첫 줄도 값으로 그대로 돌려준다."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as err:
+        raise BadWorkbook(f"엑셀 파일이 아닙니다: {err}") from err
+
+    with zf:
+        names = set(zf.namelist())
+        shared = _read_shared(zf) if "xl/sharedStrings.xml" in names else []
+        date_styles = _read_date_styles(zf) if "xl/styles.xml" in names else set()
+        out: dict[str, list[list]] = {}
+        for name, path in _sheet_paths(zf).items():
+            if path not in names:
+                continue
+            out[name] = _read_sheet(zf.read(path), shared, date_styles)
+        if not out:
+            raise BadWorkbook("시트를 하나도 찾지 못했습니다.")
+        return out
+
+
+def _read_shared(zf: zipfile.ZipFile) -> list[str]:
+    root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    # <si> 안에 <t> 가 여럿일 수 있다 (글자마다 서식이 다른 경우). 이어 붙인다.
+    return ["".join(t.text or "" for t in si.iter(NS + "t"))
+            for si in root.findall(NS + "si")]
+
+
+def _read_date_styles(zf: zipfile.ZipFile) -> set[int]:
+    """날짜로 보이는 서식을 쓰는 칸 스타일 번호들.
+
+    엑셀은 날짜를 그냥 수로 저장하고 '이 칸은 날짜 서식' 이라고만 적어 둔다.
+    그래서 서식을 안 보면 2026-09-20 이 46285 라는 수로 읽힌다.
+    """
+    root = ET.fromstring(zf.read("xl/styles.xml"))
+    custom = set()
+    for fmt in root.iter(NS + "numFmt"):
+        code = fmt.get("formatCode", "")
+        # 따옴표 안의 글자는 서식이 아니라 그대로 찍는 글자다
+        bare = re.sub(r'"[^"]*"', "", code)
+        if re.search(r"[yYmMdDhHsS]", bare):
+            custom.add(int(fmt.get("numFmtId")))
+
+    out = set()
+    xfs = root.find(NS + "cellXfs")
+    if xfs is None:
+        return out
+    for i, xf in enumerate(xfs.findall(NS + "xf")):
+        fid = int(xf.get("numFmtId", "0") or 0)
+        if fid in BUILTIN_DATE_FMTS or fid in custom:
+            out.add(i)
+    return out
+
+
+def _sheet_paths(zf: zipfile.ZipFile) -> dict[str, str]:
+    """{시트이름: zip 안의 경로}. 통합문서에 적힌 순서를 지킨다."""
+    rels = {}
+    if "xl/_rels/workbook.xml.rels" in zf.namelist():
+        for rel in ET.fromstring(zf.read("xl/_rels/workbook.xml.rels")):
+            target = rel.get("Target", "")
+            # 대부분은 workbook.xml 이 있는 xl/ 에서 센 길이지만(worksheets/
+            # sheet1.xml), 앞에 / 가 붙으면 꾸러미 뿌리에서 센 길이다
+            # (/xl/worksheets/sheet1.xml -- openpyxl 이 이렇게 쓴다).
+            rels[rel.get("Id")] = (target[1:] if target.startswith("/")
+                                   else "xl/" + target.removeprefix("./"))
+
+    out = {}
+    root = ET.fromstring(zf.read("xl/workbook.xml"))
+    for i, sheet in enumerate(root.iter(NS + "sheet"), start=1):
+        name = sheet.get("name") or f"Sheet{i}"
+        rid = sheet.get(NS_R + "id") or sheet.get("id")
+        out[name] = rels.get(rid) or f"xl/worksheets/sheet{i}.xml"
+    return out
+
+
+def col_index(ref: str) -> int:
+    """'A1' -> 0, 'E12' -> 4. 칸이 중간에 비어 건너뛰어도 자리를 맞추려고 쓴다."""
+    n = 0
+    for ch in ref:
+        if not ch.isalpha():
+            break
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n - 1
+
+
+def col_letter(index: int) -> str:
+    """0 -> 'A', 26 -> 'AA'."""
+    out = ""
+    n = index
+    while True:
+        out = chr(65 + n % 26) + out
+        n = n // 26 - 1
+        if n < 0:
+            return out
+
+
+def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int]) -> list[list]:
+    rows: list[list] = []
+    root = ET.fromstring(raw)
+    for row in root.iter(NS + "row"):
+        values: list = []
+        for cell in row.findall(NS + "c"):
+            at = col_index(cell.get("r") or col_letter(len(values)) + "1")
+            while len(values) < at:
+                values.append(None)          # 건너뛴 칸은 빈 칸이다
+            values.append(_cell_value(cell, shared, date_styles))
+        # 줄 번호가 건너뛰었으면 그만큼 빈 줄을 채운다
+        at_row = int(row.get("r") or len(rows) + 1) - 1
+        while len(rows) < at_row:
+            rows.append([])
+        rows.append(values)
+    return rows
+
+
+def _cell_value(cell, shared: list[str], date_styles: set[int]):
+    kind = cell.get("t", "n")
+    if kind == "inlineStr":
+        node = cell.find(NS + "is")
+        if node is None:
+            return None
+        return "".join(t.text or "" for t in node.iter(NS + "t"))
+    if kind == "s":                                   # sharedStrings 색인
+        v = cell.find(NS + "v")
+        if v is None or v.text is None:
+            return None
+        i = int(v.text)
+        return shared[i] if 0 <= i < len(shared) else None
+    if kind in ("str", "e"):                          # 수식 결과 / 오류
+        v = cell.find(NS + "v")
+        return v.text if v is not None else None
+
+    v = cell.find(NS + "v")
+    if v is None or not v.text:
+        return None
+    if kind == "b":
+        return v.text not in ("0", "false", "FALSE")
+    try:
+        number = float(v.text)
+    except ValueError:
+        return v.text
+    style = int(cell.get("s", "0") or 0)
+    if style in date_styles:
+        return _to_datetime(number)
+    return int(number) if number.is_integer() else number
+
+
+def _to_datetime(serial: float):
+    """엑셀의 날짜 수를 날짜로. 범위를 벗어나면 수 그대로 둔다.
+
+    시각이 0시 0분이면 date 로 돌려준다. 화면에는 글자로 찍히는데
+    '2026-09-20 00:00:00' 보다 '2026-09-20' 이 읽기 낫고, 기준 정보에
+    들어 있는 날짜는 죄다 날짜뿐이라 시각이 의미가 없다.
+    """
+    try:
+        at = EPOCH + timedelta(days=float(serial))
+    except (OverflowError, ValueError):
+        return serial
+    return at.date() if at.time() == MIDNIGHT else at
+
+
+def _esc(text) -> str:
+    out = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = out.replace('"', "&quot;")
+    # 엑셀이 못 읽는 제어문자는 뺀다. 붙여넣기로 섞여 들어오면 파일 자체가
+    # 안 열리는데, 그게 제일 알아채기 어려운 고장이다.
+    return "".join(c for c in out if c in "\t\n\r" or ord(c) >= 32)
+
+
+def _sheet_xml(rows: list[list]) -> bytes:
+    parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             '<worksheet xmlns="http://schemas.openxmlformats.org/'
+             'spreadsheetml/2006/main"><sheetData>']
+    for r, row in enumerate(rows, start=1):
+        if not any(v is not None and str(v) != "" for v in row):
+            continue                                  # 빈 줄은 안 쓴다
+        parts.append(f'<row r="{r}">')
+        for c, value in enumerate(row):
+            if value is None or str(value) == "":
+                continue
+            ref = f"{col_letter(c)}{r}"
+            if isinstance(value, bool):
+                parts.append(f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>')
+            elif isinstance(value, (int, float)):
+                parts.append(f'<c r="{ref}"><v>{value}</v></c>')
+            else:
+                # 글자는 칸 안에 그대로 넣는다(inlineStr). sharedStrings 를
+                # 쓰면 파일이 조금 작아지지만 표를 하나 더 만들어야 하고,
+                # 기준 정보는 같은 글자가 반복되는 표가 아니라 이득이 적다.
+                parts.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space='
+                             f'"preserve">{_esc(value)}</t></is></c>')
+        parts.append("</row>")
+    parts.append("</sheetData></worksheet>")
+    return "".join(parts).encode("utf-8")
+
+
+def xlsx_write(sheets: dict[str, list[list]]) -> bytes:
+    """{시트이름: [[값, ...], ...]} -> .xlsx 바이트."""
+    names = list(sheets) or ["Sheet1"]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-'
+            'package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.'
+            'openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            + "".join(
+                f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType='
+                f'"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                for i in range(1, len(names) + 1))
+            + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+
+        zf.writestr("_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats'
+            '.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>')
+
+        zf.writestr("xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            "<sheets>"
+            + "".join(f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"/>'
+                      for i, n in enumerate(names, start=1))
+            + "</sheets></workbook>")
+
+        zf.writestr("xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+            'relationships">'
+            + "".join(
+                f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/'
+                f'officeDocument/2006/relationships/worksheet" '
+                f'Target="worksheets/sheet{i}.xml"/>'
+                for i in range(1, len(names) + 1))
+            + f'<Relationship Id="rId{len(names) + 1}" Type="http://schemas.'
+              f'openxmlformats.org/officeDocument/2006/relationships/styles" '
+              f'Target="styles.xml"/></Relationships>')
+
+        # 서식은 안 쓰지만 styles.xml 자체는 있어야 엑셀이 연다
+        zf.writestr("xl/styles.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+            '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+            '<borders count="1"><border/></borders>'
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
+            '</cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" '
+            'borderId="0" xfId="0"/></cellXfs></styleSheet>')
+
+        for i, name in enumerate(names, start=1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml",
+                        _sheet_xml(sheets.get(name, [])))
+    return buf.getvalue()
+
+
+# ======================================================================
+# 3. 기준 정보를 읽고 쓴다. 화면은 여기 안 들어온다.
 #
 # 기준 정보는 여러 사람이 같이 고치는 값이라, 조용히 덮어써지거나 저장이
 # 반쯤 되다 마는 일이 생기면 무엇이 맞는 값인지 아무도 모르게 된다. 이
@@ -177,10 +469,35 @@ def load_workbook(book: str) -> tuple[dict[str, pd.DataFrame], str]:
     if got is None:
         return {}, ""
     data, etag = got
-    sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, dtype=object)
-    # 엑셀의 빈 칸은 NaN 으로 읽힌다. 그대로 두면 사람이 손도 안 댄 칸이
-    # 나중에 "nan" 이라는 글자로 저장된다.
-    return {name: df.where(pd.notna(df), None) for name, df in sheets.items()}, etag
+    return read_xlsx(data), etag
+
+
+def read_xlsx(data: bytes) -> dict[str, pd.DataFrame]:
+    """엑셀 바이트 -> {시트이름: DataFrame}. 첫 줄이 칸 이름이다."""
+    return {name: _frame(rows) for name, rows in xlsx_read(data).items()}
+
+
+def _frame(rows: list[list]) -> pd.DataFrame:
+    """[[값...]...] 의 첫 줄을 칸 이름으로 삼아 DataFrame 으로."""
+    if not rows:
+        return pd.DataFrame()
+    head, body = rows[0], rows[1:]
+    # 줄마다 칸 수가 다를 수 있다 (엑셀은 오른쪽 빈 칸을 아예 안 적는다).
+    width = max([len(head)] + [len(r) for r in body] or [0])
+    cols, seen = [], {}
+    for i in range(width):
+        name = head[i] if i < len(head) else None
+        name = f"Unnamed: {i}" if name is None or str(name) == "" else str(name)
+        # 칸 이름이 겹치면 pandas 에서 df[이름] 이 Series 가 아니라 DataFrame 이
+        # 되고, 그때부터 값 대신 표가 실려 나간다. 뒤엣것에 번호를 붙인다.
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        cols.append(name)
+    fixed = [(list(r) + [None] * width)[:width] for r in body]
+    return pd.DataFrame(fixed, columns=cols, dtype=object)
 
 
 def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
@@ -200,7 +517,7 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
     before = {}
     got = s3.get_object(key)
     if got is not None:
-        before = pd.read_excel(io.BytesIO(got[0]), sheet_name=None, dtype=object)
+        before = read_xlsx(got[0])
 
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
@@ -218,11 +535,46 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
 
 def to_xlsx(sheets: dict[str, pd.DataFrame]) -> bytes:
     """시트들을 엑셀 파일 한 벌로. 저장과 내려받기가 같은 것을 쓴다."""
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            _clean(df).to_excel(writer, sheet_name=_sheet_name(name), index=False)
-    return buf.getvalue()
+    out: dict[str, list[list]] = {}
+    for name, df in sheets.items():
+        key = _sheet_name(name)
+        while key in out:                    # 31자로 자르다 보면 겹칠 수 있다
+            key = key[:30] + "_"
+        clean = _clean(df)
+        out[key] = ([[str(c) for c in clean.columns]]
+                    + [[_cell(v) for v in row]
+                       for row in clean.itertuples(index=False, name=None)])
+    return xlsx_write(out)
+
+
+def _cell(value):
+    """엑셀 칸에 넣을 꼴로. 수는 수로, 나머지는 글자로 둔다."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        # 격자는 모든 값을 글자로 올려보낸다. 수로 적힌 것은 수로 되돌려야
+        # 엑셀에서 정렬과 합계가 되고, 다시 읽었을 때 값이 그대로다.
+        return _number(value)
+    return str(value)
+
+
+def _number(text: str):
+    """'12' -> 12, '1.5' -> 1.5, 아니면 글자 그대로.
+
+    수로 바꿨다 되돌렸을 때 글자가 한 자도 다르지 않을 때만 바꾼다. 그래서
+    '0010' 은 10 이 되지 않고(앞의 0 은 품번에서 뜻이 있다) '1.50' 도 1.5 가
+    되지 않는다(사람이 적은 자릿수다). 사람이 친 글자를 조용히 고치는 것은
+    저장이 할 일이 아니다.
+    """
+    if not text or text[0] not in "-0123456789":
+        return text
+    try:
+        number = int(text) if "." not in text else float(text)
+    except ValueError:
+        return text
+    return number if str(number) == text else text
 
 
 def _history_name(now: datetime, user_id: str, body: bytes) -> str:
@@ -361,7 +713,7 @@ def read_audit(book: str | None = None, limit: int = 200) -> pd.DataFrame:
 
 
 # ======================================================================
-# 3. 격자 (streamlit 컴포넌트).
+# 4. 격자 (streamlit 컴포넌트).
 #
 # st.data_editor 를 안 쓰는 이유는 하나다: 열을 못 넣고 못 뺀다. 칸 구성이
 # DataFrame 스키마로 고정돼서, 칸 하나 추가하려면 엑셀을 내려받아 고쳐 다시
@@ -431,7 +783,7 @@ def _to_frame(sheet: dict) -> pd.DataFrame:
 
 
 # ======================================================================
-# 4. 화면. 포털이 부르는 것은 show_input_manage() 하나다.
+# 5. 화면. 포털이 부르는 것은 show_input_manage() 하나다.
 # ======================================================================
 S_BOOK = "_im_book"        # 지금 고르고 있는 엑셀 파일
 S_SHEETS = "_im_sheets"    # 그 파일을 띄웠을 때의 원본

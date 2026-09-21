@@ -70,6 +70,22 @@ INPUT_S3_ENDPOINT   기본 http://s3.dataplatform.samsungds.net:9020
 테스트는 그것만 가짜로 갈아끼워서 S3 없이 돌고, 사내 헬퍼로 바꿔 끼울 때도
 거기만 손대면 된다.
 
+## 필요한 것: streamlit, pandas, boto3. 끝.
+
+**openpyxl 은 안 쓴다.** 사내 pypi 미러에 없어서(`No matching distribution
+found for openpyxl`) 그것 하나 때문에 화면 전체를 못 올릴 판이었다. .xlsx 는
+XML 몇 장을 zip 으로 묶은 것이고 우리가 다루는 것은 값뿐이라(서식은 애초에
+안 다룬다) `zipfile` 과 `xml.etree` 로 직접 읽고 쓴다 — `input_manage.py`
+2번 구역이다.
+
+읽을 때 감당하는 것: 엑셀 본프로그램이 쓰는 sharedStrings, openpyxl 이 쓰는
+inlineStr, 수식 칸(마지막 계산값), 날짜(엑셀은 날짜를 수로 저장하고 서식으로만
+구분한다), 참/거짓, 중간이 비어 건너뛴 칸과 줄.
+
+직접 만든 것이라 '엑셀이 진짜로 읽고 쓰는 꼴' 과 맞는지는 남이 봐 줘야 한다.
+`tests/test_xlsx.py` 가 그걸 openpyxl 에 맡긴다 — 개발 환경에만 깔고
+(`requirements-dev.txt`) 양쪽으로 맞춰 본다. 돌아가는 코드는 안 쓴다.
+
 ## 8000행에서
 
 `FAB_INPUT_ULY_r0.xlsx` 가 8000행이 넘는다. 실측(8500행 x 7칸 = 5만 9천 칸):
@@ -101,10 +117,11 @@ render / setComponentValue)만 직접 지킨다.
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 playwright install chromium
-pytest -q            # 47개
+pytest -q            # 115개
 ```
 
 - `tests/test_storage.py` — 저장이 조용히 덮어써지거나 반쯤 되다 말지 않는가
+- `tests/test_xlsx.py` — .xlsx 를 직접 읽고 쓰는 부분 (openpyxl 을 자로)
 - `tests/test_sheet_grid.py` — 격자가 올려준 것을 표로 되돌리는 부분
 - `tests/test_browser.py` — 끌어서 선택 / 복사 / 붙여넣기 / 행·열 넣고 빼기를
   진짜 브라우저로 (playwright 가 없으면 통째로 건너뛴다)

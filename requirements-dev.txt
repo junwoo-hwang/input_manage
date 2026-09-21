@@ -1,2 +1,5 @@
 pytest>=8.0
 playwright>=1.40
+# .xlsx 를 직접 읽고 쓰는 부분이 맞는지 재는 자로만 쓴다. 돌아가는 코드는
+# openpyxl 을 안 쓴다 (사내 pypi 미러에 없다).
+openpyxl>=3.1

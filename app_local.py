@@ -5,7 +5,6 @@
 포털에 붙는 것은 src/input_manage/input_manage.py 의 show_input_manage()
 하나뿐이고, 이 파일은 저장소에만 있다 (포털은 이 파일을 안 읽는다).
 """
-import io
 import sys
 from pathlib import Path
 
@@ -66,11 +65,7 @@ def seed():
         },
     }
     for name, sheets in books.items():
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            for sheet, df in sheets.items():
-                df.to_excel(writer, sheet_name=sheet, index=False)
-        fake_s3.put_object(f"2GAPU/input/{name}.xlsx", buf.getvalue())
+        fake_s3.put_object(f"2GAPU/input/{name}.xlsx", im.to_xlsx(sheets))
 
 
 if not fake_s3.STORE:

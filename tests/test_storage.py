@@ -101,7 +101,7 @@ def test_a_failed_save_leaves_the_stored_file_intact():
         raise RuntimeError("S3 가 응답하지 않는다")
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(pd.DataFrame, "to_excel", explode)
+        mp.setattr(im, "xlsx_write", explode)
         with pytest.raises(Exception):
             im.save_workbook("A", sheets(S=[{"a": 2}]), "hong")
     assert fake_s3.STORE["2GAPU/input/A.xlsx"] == before
