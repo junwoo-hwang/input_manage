@@ -68,35 +68,51 @@
   .find button { height: 24px; padding: 0 8px; cursor: pointer; font-size: 12px;
                  border: 1px solid var(--line); border-radius: 3px; background: #fff; }
   .find button:hover { border-color: var(--accent); }
-  td.hit { background: #fff3c4; }
-  td.hit-now { background: #ffd54f; outline: 2px solid #f9a825; outline-offset: -2px; }
+  .cell.hit { background: #fff3c4; }
+  .cell.hit-now { background: #ffd54f; outline: 2px solid #f9a825; outline-offset: -2px; }
 
-  /* ---- 표 ---- */
+  /* ---- 표 ----
+     <table> 이 아니라 <div> 로 그린다. 보기에는 같지만 이유가 있다: CSS 의
+     크기 가둠(containment)이 표의 행에는 적용되지 않게 정해져 있어서,
+     <tr> 에는 아래 content-visibility 를 줘도 브라우저가 배치를 건너뛰지
+     못한다. 15,000줄에서 재 보면 그 차이가 4,794ms 대 83ms 다. */
   .scroll { border: 1px solid var(--head-line); overflow: auto; background: #fff; }
   .scroll:focus, .scroll.armed { outline: none; }
-  table { border-collapse: separate; border-spacing: 0; table-layout: fixed; }
-  th, td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
-           padding: 2px 6px; height: 24px; overflow: hidden; white-space: pre;
-           text-overflow: ellipsis; background: #fff; }
+  .tbl { width: max-content; min-width: 100%; }
+  .row, .hrow { display: flex; }
+  .cell { flex: 0 0 auto; width: 90px;
+          border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
+          padding: 2px 6px; height: 25px; line-height: 20px;
+          overflow: hidden; white-space: pre; text-overflow: ellipsis;
+          background: #fff; cursor: cell; }
+
+  /* 화면 밖 줄은 배치를 미룬다. 줄 자체는 전부 그대로 있어서 스크롤 막대
+     길이도, 줄 번호도, 브라우저 자체 찾기도 달라지지 않는다. 미리 알려 주는
+     높이(25px)가 .cell 의 실제 높이와 같아야 막대가 안 튄다 -- 검사에서
+     그려진 높이를 재서 확인한다. */
+  .row { content-visibility: auto; contain-intrinsic-size: 0 25px; }
+  /* 고치는 중인 줄은 칸이 밖으로 넘쳐 보여야 해서 가둬 두면 안 된다 */
+  .row:has(.cell.editing) { content-visibility: visible; }
 
   /* 머리글은 스크롤해도 붙어 있는다. 아래로 수백 줄인데 칸 이름이 사라지면
      지금 보는 값이 무슨 값인지 알 수가 없다. */
-  thead th { position: sticky; top: 0; z-index: 3; background: var(--head);
-             border-bottom: 1px solid var(--head-line); font-weight: 600;
-             text-align: left; color: #3c4043; }
+  .hrow { position: sticky; top: 0; z-index: 3; }
+  .hrow .cell { background: var(--head); border-bottom: 1px solid var(--head-line);
+                font-weight: 600; color: #3c4043; cursor: pointer;
+                user-select: none; }
   .rowhead { position: sticky; left: 0; z-index: 2; background: var(--head);
              border-right: 1px solid var(--head-line); color: #5f6368;
              text-align: center; font-variant-numeric: tabular-nums;
-             width: 44px; min-width: 44px; cursor: pointer; user-select: none; }
-  thead .rowhead { z-index: 4; }
-  th.colhead { cursor: pointer; user-select: none; }
-  th.colhead.picked, td.picked { background: #e8eeeb; color: var(--accent); }
+             width: 44px; flex: 0 0 44px; cursor: pointer; user-select: none;
+             font-weight: 400; }
+  .hrow .rowhead { z-index: 4; }
+  .cell.picked { background: #e8eeeb; color: var(--accent); }
 
-  td { cursor: cell; }
-  td.sel { background: var(--sel); }
-  td.anchor { outline: 2px solid var(--accent); outline-offset: -2px; }
-  td.editing { outline: 2px solid var(--accent); outline-offset: -2px;
-               white-space: pre; overflow: visible; z-index: 5; position: relative; }
+  .cell.sel { background: var(--sel); }
+  .cell.anchor { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .cell.editing { outline: 2px solid var(--accent); outline-offset: -2px;
+                  white-space: pre; overflow: visible; z-index: 5;
+                  position: relative; }
 
   /* ---- 아래 시트 탭 (엑셀과 같은 자리) ---- */
   .sheetbar { display: flex; align-items: stretch; gap: 2px; padding: 3px 0 0;
@@ -404,11 +420,11 @@ function paintRange(range, on) {
   if (!range) return;
   const { r0, r1, c0, c1 } = range;
   for (let c = c0; c <= c1; c++) {
-    const th = scroll.querySelector(`th.colhead[data-c="${c}"]`);
+    const th = scroll.querySelector(`.colhead[data-c="${c}"]`);
     if (th) th.classList.toggle("picked", on);
   }
   for (let r = r0; r <= r1; r++) {
-    const head = scroll.querySelector(`td.rowhead[data-r="${r}"]`);
+    const head = scroll.querySelector(`.row > .rowhead[data-r="${r}"]`);
     if (head) head.classList.toggle("picked", on);
     for (let c = c0; c <= c1; c++) {
       const td = cellEl(r, c);
@@ -436,27 +452,40 @@ function renderGrid() {
   scroll.style.maxHeight = maxHeight + "px";
   const { r0, r1, c0, c1 } = selRange();
   const cs = cols(), rs = rows();
-  const parts = ['<table><thead><tr><th class="rowhead"></th>'];
+
+  // 칸 너비는 칸마다 style 로 붙이지 않고 열마다 규칙 하나로 준다. 15,000줄
+  // 이면 칸이 9만 개라, 칸마다 style="width:..." 를 달면 그것만으로 글자가
+  // 1MB 넘게 늘어난다.
+  const widths = ['<style>'];
+  for (let c = 0; c < cs.length; c++) {
+    widths.push(`.tbl .cell[data-c="${c}"]{width:${colWidth(c)}px}`);
+  }
+  widths.push("</style>");
+
+  const parts = [widths.join(""), '<div class="tbl"><div class="hrow">',
+                 '<div class="cell rowhead"></div>'];
   for (let c = 0; c < cs.length; c++) {
     const picked = c >= c0 && c <= c1 ? " picked" : "";
-    parts.push(`<th class="colhead${picked}" data-c="${c}" title="${esc(cs[c])}"`
-               + ` style="width:${colWidth(c)}px">${esc(cs[c])}</th>`);
+    parts.push(`<div class="cell colhead${picked}" data-c="${c}"`
+               + ` title="${esc(cs[c])}">${esc(cs[c])}</div>`);
   }
-  parts.push("</tr></thead><tbody>");
-  // 줄을 전부 그린다. 8000행이면 칸이 8만 개라 첫 그림이 몇 초 걸리지만,
-  // 보이는 만큼만 그리면 브라우저 Ctrl+F 로 못 찾고 스크롤 막대가 실제
-  // 줄과 어긋나 보인다 -- 기준 정보는 눈으로 훑어 찾는 일이 많은 표다.
+  parts.push("</div>");
+  // 줄을 전부 그린다. 보이는 만큼만 그리면 브라우저 Ctrl+F 로 못 찾고 스크롤
+  // 막대가 실제 줄과 어긋나 보인다 -- 기준 정보는 눈으로 훑어 찾는 일이 많은
+  // 표다. 대신 화면 밖 줄은 브라우저가 배치를 미루게 해 둔다(위 CSS 의 .row).
   for (let r = 0; r < rs.length; r++) {
     const picked = r >= r0 && r <= r1 ? " picked" : "";
-    parts.push(`<tr><td class="rowhead${picked}" data-r="${r}">${r + 1}</td>`);
+    parts.push(`<div class="row"><div class="cell rowhead${picked}"`
+               + ` data-r="${r}">${r + 1}</div>`);
     for (let c = 0; c < cs.length; c++) {
       const inSel = r >= r0 && r <= r1 && c >= c0 && c <= c1;
-      const cls = (inSel ? "sel" : "") + (r === anchor.r && c === anchor.c ? " anchor" : "");
-      parts.push(`<td class="${cls}" data-r="${r}" data-c="${c}">${esc(cell(r, c))}</td>`);
+      const cls = (inSel ? " sel" : "") + (r === anchor.r && c === anchor.c ? " anchor" : "");
+      parts.push(`<div class="cell${cls}" data-r="${r}" data-c="${c}">`
+                 + `${esc(cell(r, c))}</div>`);
     }
-    parts.push("</tr>");
+    parts.push("</div>");
   }
-  parts.push("</tbody></table>");
+  parts.push("</div>");
   scroll.innerHTML = parts.join("");
   painted = { r0, r1, c0, c1 };
 }
@@ -537,7 +566,7 @@ function esc(text) {
 }
 
 function cellEl(r, c) {
-  return scroll.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
+  return scroll.querySelector(`.cell[data-r="${r}"][data-c="${c}"]`);
 }
 
 // ===================================================================
@@ -629,7 +658,7 @@ scroll.addEventListener("mousedown", (e) => {
   // 선택을 옮길지는 contextmenu 쪽에서 판단한다.
   if (e.button !== 0) return;
 
-  const th = e.target.closest("th.colhead");
+  const th = e.target.closest(".colhead");
   if (th) {                                    // 열 머리글: 그 열 전체
     endEdit(true);
     const c = Number(th.dataset.c);
@@ -638,7 +667,7 @@ scroll.addEventListener("mousedown", (e) => {
     repaintSelection();
     return;
   }
-  const rowHead = e.target.closest("tbody td.rowhead");
+  const rowHead = e.target.closest(".row > .rowhead");
   if (rowHead) {                               // 줄 번호: 그 줄 전체
     endEdit(true);
     const r = Number(rowHead.dataset.r);
@@ -647,7 +676,7 @@ scroll.addEventListener("mousedown", (e) => {
     repaintSelection();
     return;
   }
-  const td = e.target.closest("td[data-c]");
+  const td = e.target.closest(".cell[data-c][data-r]");
   if (!td) return;
   const r = Number(td.dataset.r), c = Number(td.dataset.c);
   if (editingCell && editingCell.r === r && editingCell.c === c) return;
@@ -665,7 +694,7 @@ scroll.addEventListener("mousedown", (e) => {
 
 scroll.addEventListener("mouseover", (e) => {
   if (!dragging) return;
-  const td = e.target.closest("td[data-c]");
+  const td = e.target.closest(".cell[data-c][data-r]");
   if (!td) return;
   const r = Number(td.dataset.r), c = Number(td.dataset.c);
   if (r === focus.r && c === focus.c) return;
@@ -676,9 +705,9 @@ scroll.addEventListener("mouseover", (e) => {
 document.addEventListener("mouseup", () => { dragging = false; });
 
 scroll.addEventListener("dblclick", (e) => {
-  const th = e.target.closest("th.colhead");
+  const th = e.target.closest(".colhead");
   if (th) { renameCol(Number(th.dataset.c)); return; }
-  const td = e.target.closest("td[data-c]");
+  const td = e.target.closest(".cell[data-c][data-r]");
   if (td) startEdit(Number(td.dataset.r), Number(td.dataset.c));
 });
 
@@ -916,7 +945,7 @@ function closeFind() {
 }
 
 function clearHits() {
-  for (const el of scroll.querySelectorAll("td.hit, td.hit-now")) {
+  for (const el of scroll.querySelectorAll(".cell.hit, .cell.hit-now")) {
     el.classList.remove("hit", "hit-now");
   }
 }
@@ -1062,7 +1091,7 @@ function closeMenu() {
 }
 
 scroll.addEventListener("contextmenu", (e) => {
-  const td = e.target.closest("td[data-c], th.colhead, td.rowhead");
+  const td = e.target.closest(".cell[data-c], .colhead, .rowhead");
   if (!td) return;
   e.preventDefault();
   endEdit(true);

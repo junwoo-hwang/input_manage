@@ -79,21 +79,21 @@ def grid(page):
 
 
 def cells(page):
-    return grid(page).locator("tbody td:not(.rowhead)")
+    return grid(page).locator(".tbl .row .cell:not(.rowhead)")
 
 
 def table(page):
     """격자의 지금 내용 (헤더, 줄들)."""
-    return grid(page).locator("table").first.evaluate("""(t) => ({
-      cols: [...t.querySelectorAll('thead th.colhead')].map(e => e.textContent),
-      rows: [...t.querySelectorAll('tbody tr')].map(
-              tr => [...tr.querySelectorAll('td:not(.rowhead)')].map(e => e.textContent)),
+    return grid(page).locator(".tbl").first.evaluate("""(t) => ({
+      cols: [...t.querySelectorAll('.hrow .colhead')].map(e => e.textContent),
+      rows: [...t.querySelectorAll('.row')].map(
+              tr => [...tr.querySelectorAll('.cell:not(.rowhead)')].map(e => e.textContent)),
     })""")
 
 
 def click_cell(page, r, c):
     """칸을 누른다. 겸사겸사 iframe 에 초점이 가서 자판/클립보드가 거기로 간다."""
-    grid(page).locator(f"td[data-r='{r}'][data-c='{c}']").click()
+    grid(page).locator(f".cell[data-r='{r}'][data-c='{c}']").click()
     page.wait_for_timeout(250)
 
 
@@ -125,7 +125,7 @@ def settle(page):
     """격자가 다 그려지고 '고친 것 없음' 이 뜰 때까지 기다린다."""
     page.wait_for_function(
         "() => document.body.innerText.includes('고친 것 없음')", timeout=30000)
-    grid(page).locator("td[data-r='0'][data-c='0']").wait_for(timeout=30000)
+    grid(page).locator(".cell[data-r='0'][data-c='0']").wait_for(timeout=30000)
     page.wait_for_timeout(300)
 
 
@@ -171,21 +171,21 @@ def test_ids_keep_their_leading_zeros(page):
 
 def test_dragging_selects_a_rectangle(page):
     reset(page)
-    a = grid(page).locator("td[data-r='0'][data-c='0']")
-    b = grid(page).locator("td[data-r='0'][data-c='2']")
+    a = grid(page).locator(".cell[data-r='0'][data-c='0']")
+    b = grid(page).locator(".cell[data-r='0'][data-c='2']")
     a.hover(); page.mouse.down()
     b.hover(); page.mouse.up()
     page.wait_for_timeout(400)
-    assert grid(page).locator("td.sel").count() == 3
+    assert grid(page).locator(".cell.sel").count() == 3
     assert "선택 1x3" in grid(page).locator(".sheetbar .count").inner_text()
 
 
 def test_clicking_a_column_header_selects_the_whole_column(page):
     reset(page)
-    grid(page).locator("th.colhead[data-c='1']").click()
+    grid(page).locator(".colhead[data-c='1']").click()
     page.wait_for_timeout(400)
     rows = len(table(page)["rows"])
-    assert grid(page).locator("td.sel").count() == rows
+    assert grid(page).locator(".cell.sel").count() == rows
 
 
 # -------------------------------------------------- 복사 / 붙여넣기
@@ -212,8 +212,8 @@ def test_pasting_more_columns_than_exist_grows_the_table(page):
 
 def test_copying_a_range_puts_tab_separated_text_on_the_clipboard(page):
     reset(page)
-    a = grid(page).locator("td[data-r='0'][data-c='0']")
-    b = grid(page).locator("td[data-r='0'][data-c='1']")
+    a = grid(page).locator(".cell[data-r='0'][data-c='0']")
+    b = grid(page).locator(".cell[data-r='0'][data-c='1']")
     a.hover(); page.mouse.down(); b.hover(); page.mouse.up()
     want = table(page)["rows"][0][:2]
     page.keyboard.press("Control+c")
@@ -224,8 +224,8 @@ def test_copying_a_range_puts_tab_separated_text_on_the_clipboard(page):
 
 def test_delete_clears_the_selected_range(page):
     reset(page)
-    a = grid(page).locator("td[data-r='0'][data-c='0']")
-    b = grid(page).locator("td[data-r='0'][data-c='1']")
+    a = grid(page).locator(".cell[data-r='0'][data-c='0']")
+    b = grid(page).locator(".cell[data-r='0'][data-c='1']")
     a.hover(); page.mouse.down(); b.hover(); page.mouse.up()
     page.keyboard.press("Delete")
     page.wait_for_timeout(900)
@@ -395,7 +395,7 @@ def test_find_counts_and_jumps(page):
     grid(page).locator("#findInput").fill("AA94")
     page.wait_for_timeout(700)
     assert grid(page).locator("#findHits").inner_text() == "1 / 3"
-    assert grid(page).locator("td.hit-now").count() == 1
+    assert grid(page).locator(".cell.hit-now").count() == 1
     grid(page).locator("#findNext").click()
     page.wait_for_timeout(400)
     assert grid(page).locator("#findHits").inner_text() == "2 / 3"
@@ -439,7 +439,7 @@ def test_the_download_is_dropped_when_you_switch_files(page):
 # ------------------------------------------------- 오른쪽 클릭 차림표
 
 def open_menu(page, r, c):
-    grid(page).locator(f"td[data-r='{r}'][data-c='{c}']").click(button="right")
+    grid(page).locator(f".cell[data-r='{r}'][data-c='{c}']").click(button="right")
     page.wait_for_timeout(500)
     return grid(page).locator("#menu")
 
@@ -457,7 +457,7 @@ def test_right_click_opens_the_menu_not_the_browser_one(page):
 def test_the_menu_closes_when_you_click_away(page):
     reset(page)
     open_menu(page, 1, 1)
-    grid(page).locator("td[data-r='0'][data-c='0']").click()
+    grid(page).locator(".cell[data-r='0'][data-c='0']").click()
     page.wait_for_timeout(400)
     assert "on" not in (grid(page).locator("#menu").get_attribute("class") or "")
 
@@ -465,7 +465,7 @@ def test_the_menu_closes_when_you_click_away(page):
 def test_right_clicking_outside_the_selection_moves_it(page):
     """엑셀과 같게. 안 그러면 엉뚱한 자리에 행이 들어간다."""
     reset(page)
-    grid(page).locator("td[data-r='0'][data-c='0']").click()
+    grid(page).locator(".cell[data-r='0'][data-c='0']").click()
     page.wait_for_timeout(300)
     open_menu(page, 2, 3)
     assert grid(page).locator("#addr").inner_text() == "D4"
@@ -473,12 +473,12 @@ def test_right_clicking_outside_the_selection_moves_it(page):
 
 def test_right_clicking_inside_the_selection_keeps_it(page):
     reset(page)
-    a = grid(page).locator("td[data-r='0'][data-c='0']")
-    b = grid(page).locator("td[data-r='2'][data-c='2']")
+    a = grid(page).locator(".cell[data-r='0'][data-c='0']")
+    b = grid(page).locator(".cell[data-r='2'][data-c='2']")
     a.hover(); page.mouse.down(); b.hover(); page.mouse.up()
     page.wait_for_timeout(400)
     open_menu(page, 1, 1)
-    assert grid(page).locator("td.sel").count() == 9, "범위 선택이 풀렸습니다"
+    assert grid(page).locator(".cell.sel").count() == 9, "범위 선택이 풀렸습니다"
 
 
 def test_inserting_a_row_from_the_menu(page):
@@ -524,3 +524,34 @@ def test_cutting_from_the_menu_copies_and_clears(page):
     wait_dirty(page)
     assert page.evaluate("navigator.clipboard.readText()") == want
     assert table(page)["rows"][1][3] == ""
+
+
+# ------------------------------------------------------- 많은 줄 버티기
+
+def test_row_height_matches_what_the_css_promises(page):
+    """줄 높이가 contain-intrinsic-size 와 같은가.
+
+    화면 밖 줄은 배치를 미루고 '25px 쯤 될 것' 이라고만 알려 둔다. 그 값이
+    실제와 다르면 스크롤 막대 길이가 틀어져서, 끝까지 내렸는데 줄이 더
+    남아 있거나 빈 자리가 생긴다. CSS 의 padding 하나만 건드려도 어긋난다.
+    """
+    reset(page)
+    got = grid(page).locator(".tbl .row").first.evaluate("""(el) => ({
+      height: el.getBoundingClientRect().height,
+      promised: getComputedStyle(el).containIntrinsicSize,
+      skipping: getComputedStyle(el).contentVisibility,
+    })""")
+    assert got["height"] == 25, got
+    assert "25px" in got["promised"], got
+    assert got["skipping"] == "auto", got
+
+
+def test_the_grid_is_not_a_table_element(page):
+    """<div> 로 그려야 화면 밖 줄의 배치를 건너뛸 수 있다.
+
+    CSS 의 크기 가둠은 표의 행에는 적용되지 않게 정해져 있다. <table> 로
+    되돌리면 content-visibility 가 있어도 소용이 없어지고, 15,000줄에서
+    여는 데 걸리는 시간이 1.8초에서 8초대로 돌아간다.
+    """
+    assert grid(page).locator("table").count() == 0
+    assert grid(page).locator(".tbl .row .cell").count() > 0
