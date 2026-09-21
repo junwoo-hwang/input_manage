@@ -6,12 +6,11 @@ S3 drive 에 있는 기준 정보 엑셀을 브라우저에서 엑셀처럼 고�
     G-DVC / 2GAPU/input /
         FAB_INPUT_ULY_r0.xlsx   <- 이 폴더의 .xlsx 가 곧 편집 대상 목록
         FAB_INPUT_TTS_r0.xlsx
-        _history/FAB_INPUT_ULY_r0/20260918_1041_a3f1_hong.xlsx
-        _audit.csv
 
-_history 와 _audit.csv 는 우리가 만드는 것이라 이름 앞에 _ 를 붙였다.
-목록에서 빼는 기준도 그거다 -- 엑셀이 늘어나도 코드를 안 고치고, 우리
-파일은 편집 대상으로 잡히지 않는다.
+옆에 남기는 파일은 없다. 누가 언제 무엇을 바꿨는지는 그 엑셀 안의
+REV_INFO 시트에 한 줄씩 쌓인다 -- 기준 정보를 받아 보는 사람이 파일
+하나만 열면 이력까지 같이 보는 것이 맞다. 이름이 _ 로 시작하는 파일은
+목록에서 뺀다 (누군가 임시로 올려 둔 것을 편집 대상으로 잡지 않게).
 
 포털에서는 show_input_manage() 하나만 부르면 된다.
 
@@ -20,9 +19,7 @@ streamlit 컴포넌트가 iframe 에 띄우는 방식이라 파일이 나뉠 수
 """
 from __future__ import annotations
 
-import csv
 import difflib
-import hashlib
 import inspect
 import io
 import os
@@ -164,8 +161,14 @@ class BadWorkbook(Exception):
     """엑셀 파일로 읽을 수 없다."""
 
 
-def xlsx_read(data: bytes) -> dict[str, list[list]]:
-    """{시트이름: [[값, ...], ...]}. 첫 줄도 값으로 그대로 돌려준다."""
+def xlsx_read(data: bytes, formulas: dict | None = None) -> dict[str, list[list]]:
+    """{시트이름: [[값, ...], ...]}. 첫 줄도 값으로 그대로 돌려준다.
+
+    formulas 를 주면 거기에 {시트이름: {(줄, 칸): '수식'}} 을 채운다. 줄과
+    칸은 0 부터 세는 자리이고 첫 줄(머리글)도 0 번이다. 값만 읽고 수식을
+    버리면, 저장할 때 VLOOKUP 이 걸려 있던 칸이 마지막으로 계산된 값으로
+    굳어 버린다.
+    """
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as err:
@@ -179,7 +182,10 @@ def xlsx_read(data: bytes) -> dict[str, list[list]]:
         for name, path in _sheet_paths(zf).items():
             if path not in names:
                 continue
-            out[name] = _read_sheet(zf.read(path), shared, date_styles)
+            found: dict[tuple[int, int], str] = {}
+            out[name] = _read_sheet(zf.read(path), shared, date_styles, found)
+            if formulas is not None and found:
+                formulas[name] = found
         if not out:
             raise BadWorkbook("시트를 하나도 찾지 못했습니다.")
         return out
@@ -260,20 +266,27 @@ def col_letter(index: int) -> str:
             return out
 
 
-def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int]) -> list[list]:
+def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
+                formulas: dict[tuple[int, int], str] | None = None) -> list[list]:
     rows: list[list] = []
     root = ET.fromstring(raw)
     for row in root.iter(NS + "row"):
+        # 줄 번호가 건너뛰었으면 그만큼 빈 줄을 채운다
+        at_row = int(row.get("r") or len(rows) + 1) - 1
+        while len(rows) < at_row:
+            rows.append([])
         values: list = []
         for cell in row.findall(NS + "c"):
             at = col_index(cell.get("r") or col_letter(len(values)) + "1")
             while len(values) < at:
                 values.append(None)          # 건너뛴 칸은 빈 칸이다
             values.append(_cell_value(cell, shared, date_styles))
-        # 줄 번호가 건너뛰었으면 그만큼 빈 줄을 채운다
-        at_row = int(row.get("r") or len(rows) + 1) - 1
-        while len(rows) < at_row:
-            rows.append([])
+            if formulas is not None:
+                f = cell.find(NS + "f")
+                # 배열 수식의 나머지 칸(t="shared" 이면서 내용이 빈 것)은
+                # 본체가 따로 있어서 여기 적을 것이 없다
+                if f is not None and (f.text or "").strip():
+                    formulas[(len(rows), at)] = f.text
         rows.append(values)
     return rows
 
@@ -332,18 +345,39 @@ def _esc(text) -> str:
     return "".join(c for c in out if c in "\t\n\r" or ord(c) >= 32)
 
 
-def _sheet_xml(rows: list[list]) -> bytes:
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _sheet_xml(rows: list[list],
+               formulas: dict[tuple[int, int], str] | None = None) -> bytes:
+    formulas = formulas or {}
     parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
              '<worksheet xmlns="http://schemas.openxmlformats.org/'
              'spreadsheetml/2006/main"><sheetData>']
     for r, row in enumerate(rows, start=1):
-        if not any(v is not None and str(v) != "" for v in row):
+        has_f = any((r - 1, c) in formulas for c in range(len(row)))
+        if not has_f and not any(v is not None and str(v) != "" for v in row):
             continue                                  # 빈 줄은 안 쓴다
         parts.append(f'<row r="{r}">')
         for c, value in enumerate(row):
+            ref = f"{col_letter(c)}{r}"
+            formula = formulas.get((r - 1, c))
+            if formula is not None:
+                # 수식은 수식으로 쓴다. 마지막으로 계산된 값도 같이 적어 둬야
+                # 엑셀로 열기 전에(우리 화면에서) 빈 칸으로 보이지 않는다.
+                # 진짜 값은 엑셀이 열 때 다시 계산한다(아래 fullCalcOnLoad).
+                cached = ("" if value is None else str(value))
+                kind = "" if _looks_numeric(cached) else ' t="str"'
+                body = f"<v>{_esc(cached)}</v>" if cached else ""
+                parts.append(f'<c r="{ref}"{kind}><f>{_esc(formula)}</f>{body}</c>')
+                continue
             if value is None or str(value) == "":
                 continue
-            ref = f"{col_letter(c)}{r}"
             if isinstance(value, bool):
                 parts.append(f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>')
             elif isinstance(value, (int, float)):
@@ -359,8 +393,14 @@ def _sheet_xml(rows: list[list]) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
-def xlsx_write(sheets: dict[str, list[list]]) -> bytes:
-    """{시트이름: [[값, ...], ...]} -> .xlsx 바이트."""
+def xlsx_write(sheets: dict[str, list[list]],
+               formulas: dict[str, dict] | None = None) -> bytes:
+    """{시트이름: [[값, ...], ...]} -> .xlsx 바이트.
+
+    formulas 는 {시트이름: {(줄, 칸): '수식'}}. 그 칸은 값 대신 수식으로
+    쓰고, 마지막으로 계산된 값을 함께 적어 둔다.
+    """
+    formulas = formulas or {}
     names = list(sheets) or ["Sheet1"]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -393,7 +433,11 @@ def xlsx_write(sheets: dict[str, list[list]]) -> bytes:
             "<sheets>"
             + "".join(f'<sheet name="{_esc(n)}" sheetId="{i}" r:id="rId{i}"/>'
                       for i, n in enumerate(names, start=1))
-            + "</sheets></workbook>")
+            + "</sheets>"
+            # 우리는 VLOOKUP 을 계산하지 못한다. 적어 둔 값은 마지막으로
+            # 엑셀이 계산한 것이라 낡았을 수 있으므로, 열 때 다시 계산하라고
+            # 적어 둔다.
+            '<calcPr calcId="0" fullCalcOnLoad="1"/></workbook>')
 
         zf.writestr("xl/_rels/workbook.xml.rels",
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -421,7 +465,7 @@ def xlsx_write(sheets: dict[str, list[list]]) -> bytes:
 
         for i, name in enumerate(names, start=1):
             zf.writestr(f"xl/worksheets/sheet{i}.xml",
-                        _sheet_xml(sheets.get(name, [])))
+                        _sheet_xml(sheets.get(name, []), formulas.get(name)))
     return buf.getvalue()
 
 
@@ -432,11 +476,6 @@ def xlsx_write(sheets: dict[str, list[list]]) -> bytes:
 # 반쯤 되다 마는 일이 생기면 무엇이 맞는 값인지 아무도 모르게 된다. 이
 # 구역은 브라우저 없이 검사할 수 있게 화면과 떼어 두었다.
 # ======================================================================
-HISTORY_KEEP = 100          # 파일 하나당 남길 이력 개수
-AUDIT_COLS = ["saved_at", "user_id", "workbook", "sheet",
-              "changed_cells", "rows_before", "rows_after"]
-
-
 class ConcurrentEdit(Exception):
     """내가 화면에 띄운 뒤 다른 사람이 먼저 저장했다.
 
@@ -447,10 +486,6 @@ class ConcurrentEdit(Exception):
 
 def _key(*parts: str) -> str:
     return "/".join([FOLDER_PATH, *parts])
-
-
-def audit_key() -> str:
-    return _key("_audit.csv")
 
 
 def list_workbooks() -> list[str]:
@@ -464,18 +499,39 @@ def list_workbooks() -> list[str]:
     return names
 
 
-def load_workbook(book: str) -> tuple[dict[str, pd.DataFrame], str]:
-    """{시트이름: DataFrame} 과 그 시점의 버전표."""
+def load_workbook(book: str,
+                  formulas: dict | None = None) -> tuple[dict[str, pd.DataFrame], str]:
+    """{시트이름: DataFrame} 과 그 시점의 버전표.
+
+    formulas 를 주면 {시트이름: {(줄, 칸이름): '수식'}} 을 거기 채운다.
+    줄은 머리글을 뺀 0 부터다 (DataFrame 의 줄 번호와 같다).
+    """
     got = s3.get_object(_key(f"{book}.xlsx"))
     if got is None:
         return {}, ""
     data, etag = got
-    return read_xlsx(data), etag
+    return read_xlsx(data, formulas), etag
 
 
-def read_xlsx(data: bytes) -> dict[str, pd.DataFrame]:
+def read_xlsx(data: bytes, formulas: dict | None = None) -> dict[str, pd.DataFrame]:
     """엑셀 바이트 -> {시트이름: DataFrame}. 첫 줄이 칸 이름이다."""
-    return {name: _frame(rows) for name, rows in xlsx_read(data).items()}
+    raw: dict[str, dict] = {}
+    out = {name: _frame(rows)
+           for name, rows in xlsx_read(data, raw).items()}
+    if formulas is None:
+        return out
+    for name, found in raw.items():
+        df = out.get(name)
+        if df is None:
+            continue
+        cols = [str(c) for c in df.columns]
+        # 칸을 번호가 아니라 이름으로 붙들어 둔다. 왼쪽에 칸을 하나
+        # 끼워 넣어도 수식이 엉뚱한 칸으로 옮겨가지 않게.
+        got_f = {(r - 1, cols[c]): f
+                 for (r, c), f in found.items() if r >= 1 and c < len(cols)}
+        if got_f:
+            formulas[name] = got_f
+    return out
 
 
 def _frame(rows: list[list]) -> pd.DataFrame:
@@ -502,7 +558,8 @@ def _frame(rows: list[list]) -> pd.DataFrame:
 
 
 def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
-                  base_stamp: str | None = None) -> str:
+                  base_stamp: str | None = None,
+                  formulas: dict | None = None) -> str:
     """고친 값을 올리고 새 버전표를 돌려준다.
 
     base_stamp 를 주면 그 사이에 다른 사람이 올렸는지 보고, 그랬으면
@@ -515,37 +572,49 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
             f"덮어쓰지 않았습니다 -- 다시 불러와서 고친 내용을 옮겨 주세요."
         )
 
-    before = {}
-    got = s3.get_object(key)
-    if got is not None:
-        before = read_xlsx(got[0])
-
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
-    body = to_xlsx(sheets)
-
-    now = datetime.now(KST)
-    # 이력을 먼저 올린다. 순서가 반대면, 본 파일은 바뀌었는데 이력이 없는
-    # 순간이 생긴다 -- 되돌릴 것을 찾을 때 하필 그 판이 없는 쪽이 더 아프다.
-    s3.put_object(_key("_history", book, _history_name(now, user_id, body)), body)
-    etag = s3.put_object(key, body)
-    _trim_history(book)
-    _append_audit(now, user_id, book, before, sheets)
-    return etag
+    #
+    # 옆에 남기는 파일은 없다. 누가 언제 무엇을 바꿨는지는 이 엑셀 안의
+    # REV_INFO 시트에 한 줄로 쌓인다 -- 기준 정보를 받아 보는 사람이
+    # 파일 하나만 열면 이력까지 같이 보는 것이 맞다.
+    return s3.put_object(key, to_xlsx(sheets, formulas))
 
 
-def to_xlsx(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """시트들을 엑셀 파일 한 벌로. 저장과 내려받기가 같은 것을 쓴다."""
+def to_xlsx(sheets: dict[str, pd.DataFrame],
+            formulas: dict | None = None) -> bytes:
+    """시트들을 엑셀 파일 한 벌로. 저장과 내려받기가 같은 것을 쓴다.
+
+    formulas 는 {시트이름: {(줄, 칸이름): '수식'}}. 그 칸은 값 대신 수식으로
+    나간다 -- 안 그러면 VLOOKUP 이 걸려 있던 칸이 마지막으로 계산된 값으로
+    굳어 버린다.
+    """
+    formulas = formulas or {}
     out: dict[str, list[list]] = {}
+    out_f: dict[str, dict] = {}
     for name, df in sheets.items():
         key = _sheet_name(name)
         while key in out:                    # 31자로 자르다 보면 겹칠 수 있다
             key = key[:30] + "_"
         clean = _clean(df)
-        out[key] = ([[str(c) for c in clean.columns]]
-                    + [[_cell(v) for v in row]
-                       for row in clean.itertuples(index=False, name=None)])
-    return xlsx_write(out)
+        cols = [str(c) for c in clean.columns]
+        out[key] = ([cols] + [[_cell(v) for v in row]
+                              for row in clean.itertuples(index=False, name=None)])
+
+        want = formulas.get(name)
+        if not want:
+            continue
+        # _clean 이 빈 줄을 빼면 그 아래 줄이 위로 당겨진다. 수식의 자리도
+        # 같이 당겨 줘야 엉뚱한 줄에 붙지 않는다.
+        moved = {old: new for new, old in enumerate(clean.index)}
+        at = {col: i for i, col in enumerate(cols)}
+        placed = {}
+        for (row, col), text in want.items():
+            if row in moved and col in at:
+                placed[(moved[row] + 1, at[col])] = text   # +1 은 머리글 줄
+        if placed:
+            out_f[key] = placed
+    return xlsx_write(out, out_f)
 
 
 def _cell(value):
@@ -578,18 +647,6 @@ def _number(text: str):
     return number if str(number) == text else text
 
 
-def _history_name(now: datetime, user_id: str, body: bytes) -> str:
-    """이력 파일 이름. 시각 + 내용 네 글자 + 누가.
-
-    내용 네 글자를 끼우는 이유는, 같은 초에 두 번 저장되면(두 사람이 거의
-    동시에 눌렀을 때) 이름이 같아져 앞 이력이 덮어써지기 때문이다. 되돌릴
-    판이 하나 사라지는 셈이라 조용히 넘길 일이 아니다. 내용이 정말 같으면
-    이름도 같은데, 그때는 덮어써도 잃는 것이 없다.
-    """
-    short = hashlib.md5(body).hexdigest()[:4]
-    return f"{now:%Y%m%d_%H%M%S}_{short}_{_safe(user_id)}.xlsx"
-
-
 def _sheet_name(name: str) -> str:
     """엑셀 시트 이름 규칙에 맞춘다 (31자, : \\ / ? * [ ] 못 씀)."""
     clean = "".join(" " if c in ':\\/?*[]' else c for c in str(name))
@@ -609,22 +666,6 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     blank = out.apply(lambda row: all(
         v is None or str(v).strip() == "" for v in row), axis=1)
     return out[~blank]
-
-
-def _safe(text: str) -> str:
-    """S3 키에 넣어도 되는 꼴로. 빈 값이면 'unknown'."""
-    kept = "".join(c for c in str(text or "") if c.isalnum() or c in "-_.")
-    return kept[:40] or "unknown"
-
-
-def history_keys(book: str, limit: int = 50) -> list[str]:
-    return sorted(s3.list_keys(_key("_history", book) + "/"), reverse=True)[:limit]
-
-
-def _trim_history(book: str) -> None:
-    keys = sorted(s3.list_keys(_key("_history", book) + "/"))
-    for old in keys[:-HISTORY_KEEP]:
-        s3.delete_object(old)
 
 
 def _as_text(df: pd.DataFrame, cols: list[str], rows: int) -> pd.DataFrame:
@@ -724,6 +765,66 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
     return out, total
 
 
+def surviving_formulas(before: dict[str, pd.DataFrame],
+                       after: dict[str, pd.DataFrame],
+                       formulas: dict) -> tuple[dict, dict[str, int]]:
+    """아직 믿을 수 있는 수식만 남긴다. (남은 것, {시트: 버린 개수})
+
+    수식은 제가 앉은 자리를 기준으로 옆 칸을 가리킨다 -- 5번 줄의
+    =VLOOKUP(B5,...) 는 6번 줄로 밀리면 B6 을 봐야 맞다. 엑셀은 줄을
+    끼워 넣을 때 그걸 알아서 고쳐 주지만 우리는 못 한다. 그래서 줄이
+    제자리에 그대로 있을 때만 수식을 남기고, 밀린 것은 버린다.
+
+    틀린 수식을 남겨 두는 것보다 버리는 쪽이 낫다: 남기면 조용히 엉뚱한
+    값을 끌어오지만, 버리면 마지막으로 계산된 값이 그대로 보이고 저장
+    전에 몇 개를 버리는지 알려 줄 수 있다.
+    """
+    kept: dict[str, dict] = {}
+    lost: dict[str, int] = {}
+    for name, want in formulas.items():
+        old, new = before.get(name), after.get(name)
+        if old is None or new is None:
+            lost[name] = len(want)
+            continue
+        cols = list(dict.fromkeys([*map(str, old.columns), *map(str, new.columns)]))
+        old_text = _as_text(old, cols, len(old))
+        new_text = _as_text(new, cols, len(new))
+        same = _rows_in_place(
+            [tuple(r) for r in old_text.itertuples(index=False, name=None)],
+            [tuple(r) for r in new_text.itertuples(index=False, name=None)])
+        live = {}
+        for (row, col), text in want.items():
+            if row not in same or col not in map(str, new.columns):
+                continue
+            # 그 칸을 사람이 직접 고쳤으면 사람이 적은 값이 이긴다
+            if (row < len(old_text) and row < len(new_text)
+                    and col in cols
+                    and old_text.iloc[row][col] != new_text.iloc[row][col]):
+                continue
+            live[(row, col)] = text
+        if live:
+            kept[name] = live
+        if len(live) < len(want):
+            lost[name] = len(want) - len(live)
+    return kept, lost
+
+
+def _rows_in_place(old: list, new: list) -> set[int]:
+    """줄 번호가 그대로인 줄들.
+
+    '내용이 같은 줄' 이 아니라 '자리가 그대로인 줄' 이다. 같은 줄의 다른
+    칸을 고친 것은 자리를 옮긴 것이 아니므로 그 줄의 수식은 멀쩡하다.
+    위에 줄이 끼거나 빠져서 번호가 밀린 줄만 걸러낸다.
+    """
+    out = set()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, old, new, autojunk=False).get_opcodes():
+        if tag not in ("equal", "replace") or i1 != j1:
+            continue
+        out.update(range(i1, min(i2, i1 + (j2 - j1))))
+    return out
+
+
 def workbook_changes(before: dict[str, pd.DataFrame],
                      after: dict[str, pd.DataFrame]) -> dict:
     """{시트이름: {"rows": [...], "total": n, "note": "..."}}. 안 바뀐 시트는 뺀다."""
@@ -749,6 +850,37 @@ def workbook_changes(before: dict[str, pd.DataFrame],
     return out
 
 
+# 엑셀 칸 하나에 들어가는 글자 수 한계. 넘기면 엑셀이 파일을 못 연다.
+CELL_MAX = 32767
+
+
+def changes_text(changes: dict, limit: int = CELL_MAX) -> str:
+    """'변경내용' 창에 뜬 것을 REV_INFO 칸 하나에 담을 글로.
+
+    창에서 본 것과 같은 것이 파일에 남아야 한다 -- 나중에 '이때 뭘 바꿨지'
+    를 되짚는 사람은 그 창을 못 보고 이 칸만 보기 때문이다.
+    """
+    out: list[str] = []
+    for name, info in changes.items():
+        head = f"[{name}]"
+        if info["rows"]:
+            head += " " + " | ".join(info["rows"][0]["values"])
+        if info["note"]:
+            head += f"  ({info['note']})"
+        out.append(head)
+        for row in info["rows"]:
+            out.append(f"{row['kind']} {row['row']}행: "
+                       + " | ".join(str(v) for v in row["values"].values()))
+        if info["total"] > len(info["rows"]):
+            out.append(f"…외 {info['total'] - len(info['rows'])}줄")
+    text = "\n".join(out)
+    if len(text) > limit:
+        # 잘렸다는 것을 안 적으면, 뒤가 없는 것인지 잘린 것인지 알 수 없다
+        tail = "\n…(너무 길어 잘림)"
+        text = text[:limit - len(tail)] + tail
+    return text
+
+
 def rev_columns(sheets: dict[str, pd.DataFrame]) -> list[str] | None:
     """REV_INFO 시트의 칸 이름들. 그 시트가 없으면 None."""
     df = sheets.get(REV_SHEET)
@@ -756,7 +888,8 @@ def rev_columns(sheets: dict[str, pd.DataFrame]) -> list[str] | None:
 
 
 def append_rev_info(sheets: dict[str, pd.DataFrame], when: str, remark: str,
-                    user: str, link: str) -> dict[str, pd.DataFrame]:
+                    user: str, link: str,
+                    detail: str = "") -> dict[str, pd.DataFrame]:
     """REV_INFO 시트 맨 아래에 이번 변경 한 줄을 붙인 사본을 돌려준다.
 
     맨 아래에 붙이는 이유는 그래야 위의 줄 번호가 그대로이기 때문이다.
@@ -766,7 +899,9 @@ def append_rev_info(sheets: dict[str, pd.DataFrame], when: str, remark: str,
     df = sheets.get(REV_SHEET)
     if df is None:
         return sheets
-    want = {REV_DATE: when, REV_REMARK: remark, REV_USER: user, REV_LINK: link}
+    # 사람이 적은 것 먼저, 그 아래에 무엇이 바뀌었는지를 붙인다
+    related = "\n\n".join(x for x in (link, detail) if x)
+    want = {REV_DATE: when, REV_REMARK: remark, REV_USER: user, REV_LINK: related}
     row = {}
     for col in df.columns:
         key = str(col).strip().lower()
@@ -775,49 +910,6 @@ def append_rev_info(sheets: dict[str, pd.DataFrame], when: str, remark: str,
     out[REV_SHEET] = pd.concat(
         [df, pd.DataFrame([row], columns=df.columns)], ignore_index=True)
     return out
-
-
-def _append_audit(now: datetime, user_id: str, book: str,
-                  before: dict[str, pd.DataFrame],
-                  after: dict[str, pd.DataFrame]) -> None:
-    """누가 언제 어느 시트를 몇 칸 고쳤는지 한 줄씩 덧붙인다.
-
-    기준 정보는 '언제부터 이 값이었나' 를 되짚을 일이 반드시 생긴다.
-    엑셀 파일만 남기면 그 답을 못 한다.
-    """
-    rows = []
-    for name, df in after.items():
-        old = before.get(name)
-        n = changed_cells(old, df)
-        if n == 0 and old is not None:
-            continue                          # 안 바뀐 시트는 적지 않는다
-        rows.append([f"{now:%Y-%m-%d %H:%M:%S}", user_id or "unknown", book, name,
-                     n, 0 if old is None else len(old), len(_clean(df))])
-    if not rows:
-        return
-
-    got = s3.get_object(audit_key())
-    buf = io.StringIO()
-    if got is None:
-        csv.writer(buf).writerow(AUDIT_COLS)
-    else:
-        buf.write(got[0].decode("utf-8-sig"))
-        if not buf.getvalue().endswith("\n"):
-            buf.write("\n")
-    writer = csv.writer(buf, lineterminator="\n")
-    for row in rows:
-        writer.writerow(row)
-    s3.put_object(audit_key(), buf.getvalue().encode("utf-8-sig"))
-
-
-def read_audit(book: str | None = None, limit: int = 200) -> pd.DataFrame:
-    got = s3.get_object(audit_key())
-    if got is None:
-        return pd.DataFrame(columns=AUDIT_COLS)
-    df = pd.read_csv(io.BytesIO(got[0]), dtype=str, encoding="utf-8-sig")
-    if book is not None and "workbook" in df.columns:
-        df = df[df["workbook"] == book]
-    return df.tail(limit).iloc[::-1].reset_index(drop=True)      # 최근 것이 위
 
 
 # ======================================================================
@@ -927,6 +1019,9 @@ S_WANT = "_im_want"
 S_PENDING = "_im_pending"    # 표를 받으면 할 일: "save" | "download"
 S_EDITED = "_im_edited"      # 격자가 올려준 지금 값
 S_REVIEW = "_im_review"      # 저장 팝업에 띄울 변경 내역
+# 파일을 띄웠을 때 그 안에 있던 수식들. 격자는 값만 다루므로, 이걸 안 들고
+# 있으면 저장할 때 VLOOKUP 이 걸려 있던 칸이 마지막 계산값으로 굳어 버린다.
+S_FORMULAS = "_im_formulas"
 
 
 # 칸 너비를 꽉 채우라고 말하는 법이 streamlit 버전마다 다르다. 새 버전은
@@ -942,7 +1037,9 @@ _HAS_DIALOG = hasattr(st, "dialog")
 
 
 def _load(book: str) -> None:
-    sheets, stamp = load_workbook(book)
+    formulas: dict = {}
+    sheets, stamp = load_workbook(book, formulas)
+    st.session_state[S_FORMULAS] = formulas
     st.session_state[S_BOOK] = book
     st.session_state[S_SHEETS] = sheets
     st.session_state[S_STAMP] = stamp
@@ -1072,7 +1169,10 @@ def _take_full(got: dict, book: str) -> None:
     st.session_state[S_EDITED] = edited
     what = st.session_state.pop(S_PENDING, None)
     if what == "download":
-        st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited))
+        kept, _lost = surviving_formulas(
+            st.session_state[S_SHEETS], edited,
+            st.session_state.get(S_FORMULAS, {}))
+        st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited, kept))
     elif what == "save":
         st.session_state[S_REVIEW] = workbook_changes(
             st.session_state[S_SHEETS], edited)
@@ -1117,6 +1217,19 @@ def _review_body(book: str, user_id: str) -> None:
             st.caption(f"…외 {info['total'] - len(info['rows'])}줄은 접었습니다. "
                        f"전부 보려면 '엑셀 만들기' 로 받아서 비교하세요.")
 
+    kept, lost = surviving_formulas(
+        st.session_state[S_SHEETS], edited, st.session_state.get(S_FORMULAS, {}))
+    if lost:
+        st.warning(
+            "**수식이 사라집니다** — "
+            + ", ".join(f"{n} {c}개" for n, c in lost.items())
+            + "\n\n수식은 제가 앉은 자리를 기준으로 옆 칸을 가리킵니다"
+              " (5번 줄의 `=VLOOKUP(B5,...)`). 줄을 넣거나 빼서 자리가"
+              " 밀리면 그 수식은 더 이상 맞지 않는데, 엑셀처럼 자리를 따라"
+              " 고쳐 주지는 못합니다. 그래서 틀린 수식을 남기는 대신"
+              " 마지막으로 계산된 값으로 굳힙니다."
+              " 수식을 지키려면 취소하고, 줄을 넣고 빼는 것은 엑셀에서 하세요.")
+
     st.divider()
 
     cols = rev_columns(st.session_state[S_SHEETS])
@@ -1150,20 +1263,24 @@ def _review_body(book: str, user_id: str) -> None:
         if st.button("저장", type="primary", disabled=not ok, **_WIDE):
             body = edited
             if cols is not None:
-                body = append_rev_info(edited, f"{datetime.now(KST):%Y-%m-%d}",
-                                       remark.strip(), who.strip(), link.strip())
+                body = append_rev_info(
+                    edited, f"{datetime.now(KST):%Y-%m-%d}",
+                    remark.strip(), who.strip(), link.strip(),
+                    changes_text(changes))
             st.session_state.pop(S_REVIEW, None)
-            _save(book, body, who.strip() or user_id)
+            _save(book, body, who.strip() or user_id, kept)
     with cancel:
         if st.button("취소", **_WIDE):
             st.session_state.pop(S_REVIEW, None)
             st.rerun()
 
 
-def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
+def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
+          formulas: dict | None = None) -> None:
     try:
         stamp = save_workbook(book, edited, user_id,
-                              base_stamp=st.session_state[S_STAMP])
+                              base_stamp=st.session_state[S_STAMP],
+                              formulas=formulas)
     except ConcurrentEdit as err:
         # 덮어쓰지 않는다. 누구 값이 맞는지는 코드가 못 정한다.
         st.error(str(err))
@@ -1175,6 +1292,7 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
     # 새 판을 원본으로 삼는다. 판 번호가 바뀌므로 격자도 이 값으로 다시
     # 그려지고, '고친 칸' 은 0 으로 돌아간다.
     st.session_state[S_SHEETS] = {k: v.copy() for k, v in edited.items()}
+    st.session_state[S_FORMULAS] = formulas or {}
     st.session_state[S_STAMP] = stamp
     st.session_state.pop(S_DOWNLOAD, None)
     st.session_state.pop(S_EDITED, None)
@@ -1187,13 +1305,13 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str) -> None:
 
 
 def _show_history(book: str) -> None:
-    with st.expander("변경 이력"):
-        try:
-            log = read_audit(book)
-        except Exception as err:
-            st.caption(f"이력을 읽지 못했습니다: {err}")
-            return
+    """변경 이력. 따로 모아 둔 것이 아니라 이 파일의 REV_INFO 시트다."""
+    log = st.session_state.get(S_SHEETS, {}).get(REV_SHEET)
+    if log is None:
+        return                       # 그 시트가 없는 파일은 이력도 없다
+    with st.expander(f"변경 이력 ({REV_SHEET} · {len(log)}줄)"):
         if log.empty:
             st.caption("아직 저장된 적이 없습니다.")
         else:
-            st.dataframe(log, hide_index=True, **_WIDE)
+            # 최근 것이 위로. 맨 아래에 쌓으니 뒤집어서 보여 준다.
+            st.dataframe(log.iloc[::-1], hide_index=True, **_WIDE)

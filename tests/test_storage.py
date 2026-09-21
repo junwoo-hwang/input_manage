@@ -1,8 +1,10 @@
 """기준 정보가 조용히 사라지거나 덮어써지지 않는가 (S3 는 가짜로 대신한다)."""
 import io
 import sys
+import zipfile
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -108,80 +110,31 @@ def test_a_failed_save_leaves_the_stored_file_intact():
     assert im.load_workbook("A")[0]["S"]["a"].tolist() == [1]
 
 
-# ------------------------------------------------------------- 이력
+# ------------------------------------- 이력은 REV_INFO 시트 한 곳에만
 
-def test_every_save_keeps_a_copy_named_by_who_saved_it():
+def test_saving_leaves_no_files_beside_the_workbook():
+    """옆에 _history/ 나 _audit.csv 를 만들지 않는다.
+
+    기준 정보를 받아 보는 사람이 파일 하나만 열면 이력까지 같이 보게
+    하려고 그렇게 정했다. 옆 파일이 생기면 그 둘이 갈리기 시작한다.
+    """
     im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
-    im.save_workbook("A", sheets(S=[{"a": 2}]), "kim.lee")
-    keys = im.history_keys("A")
-    assert len(keys) == 2
-    assert any("hong" in k for k in keys) and any("kim.lee" in k for k in keys)
-    assert all(k.startswith("2GAPU/input/_history/A/") for k in keys), keys
+    im.save_workbook("A", sheets(S=[{"a": 2}]), "kim")
+    assert list(fake_s3.STORE) == ["2GAPU/input/A.xlsx"], list(fake_s3.STORE)
 
 
-def test_history_is_trimmed_so_it_cannot_grow_forever(monkeypatch):
-    monkeypatch.setattr(im, "HISTORY_KEEP", 3)
-    for i in range(6):
-        im.save_workbook("A", sheets(S=[{"a": i}]), f"u{i}")
-    assert len(im.history_keys("A")) == 3
+def test_the_change_log_lands_in_the_workbook_itself():
+    book = rev_book()
+    after = {k: v.copy() for k, v in book.items()}
+    after["STEP"].loc[0, "b"] = "바뀜"
+    changes = im.workbook_changes(book, after)
+    body = im.append_rev_info(after, "2026-09-21", "사유", "나", "",
+                              im.changes_text(changes))
+    im.save_workbook("A", body, "나")
 
-
-def test_a_weird_user_id_cannot_escape_the_history_folder():
-    im.save_workbook("A", sheets(S=[{"a": 1}]), "../../etc/passwd")
-    keys = im.history_keys("A")
-    assert len(keys) == 1 and keys[0].startswith("2GAPU/input/_history/A/"), keys
-
-
-def test_the_history_copy_exists_even_if_the_main_put_fails():
-    """되돌릴 판이 없는 순간이 생기면 안 된다."""
-    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
-    calls = {"n": 0}
-    real = fake_s3.put_object
-
-    def flaky(key, data):
-        calls["n"] += 1
-        if key.endswith("/A.xlsx") and calls["n"] > 1:
-            raise RuntimeError("본 파일 올리기 실패")
-        return real(key, data)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(fake_s3, "put_object", flaky)
-        with pytest.raises(RuntimeError):
-            im.save_workbook("A", sheets(S=[{"a": 2}]), "hong")
-    assert len(im.history_keys("A")) == 2, "이력이 안 남았습니다"
-
-
-# -------------------------------------------------------------- 감사
-
-def test_the_audit_says_who_changed_what_in_which_file():
-    im.save_workbook("OCAP기준", sheets(코드표=[{"a": 1, "b": 2}]), "hong")
-    im.save_workbook("OCAP기준", sheets(코드표=[{"a": 1, "b": 9}]), "kim")
-    log = im.read_audit("OCAP기준")
-    assert log.iloc[0]["user_id"] == "kim"
-    assert log.iloc[0]["workbook"] == "OCAP기준"
-    assert log.iloc[0]["sheet"] == "코드표"
-    assert log.iloc[0]["changed_cells"] == "1", log.to_dict("records")
-
-
-def test_the_audit_of_one_file_does_not_show_another():
-    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
-    im.save_workbook("B", sheets(S=[{"b": 1}]), "kim")
-    assert set(im.read_audit("A")["workbook"]) == {"A"}
-
-
-def test_the_audit_survives_many_saves_without_losing_earlier_lines():
-    for i in range(5):
-        im.save_workbook("A", sheets(S=[{"a": i}]), f"u{i}")
-    log = im.read_audit("A")
-    assert len(log) == 5, log.to_dict("records")
-    assert list(log["user_id"]) == ["u4", "u3", "u2", "u1", "u0"]
-
-
-def test_a_save_that_changed_nothing_is_not_logged():
-    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
-    n = len(im.read_audit("A"))
-    im.save_workbook("A", sheets(S=[{"a": 1}]), "kim")
-    assert len(im.read_audit("A")) == n
+    back = im.load_workbook("A")[0]["REV_INFO"]
+    assert back.iloc[-1]["Remark"] == "사유"
+    assert "수정 1행" in back.iloc[-1]["관련"], back.iloc[-1]["관련"]
 
 
 # ------------------------------------------------------------ 값 다듬기
@@ -380,3 +333,171 @@ def test_the_saved_file_carries_the_new_rev_row():
     back = im.load_workbook("A")[0]["REV_INFO"]
     assert back.iloc[-1]["Remark"] == "오탈자"
     assert back.iloc[-1]["Date"] == "2026-09-21"
+
+
+# ------------------------------------------------------------ 수식 지키기
+
+def book_with_formula():
+    """C 칸에 VLOOKUP 이 걸린 시트."""
+    sheets = {"STEP": pd.DataFrame(
+        [{"step": "0010", "ppid": "P-01", "찾은값": "가"},
+         {"step": "0020", "ppid": "P-02", "찾은값": "나"}], dtype=object)}
+    formulas = {"STEP": {(0, "찾은값"): "VLOOKUP(B2,MAP!$A$1:$B$99,2,0)",
+                         (1, "찾은값"): "VLOOKUP(B3,MAP!$A$1:$B$99,2,0)"}}
+    return sheets, formulas
+
+
+def test_a_formula_survives_a_round_trip():
+    """이게 안 되면 VLOOKUP 이 마지막 계산값으로 굳어 버린다."""
+    sheets, formulas = book_with_formula()
+    im.save_workbook("A", sheets, "hong", formulas=formulas)
+    got: dict = {}
+    im.load_workbook("A", got)
+    assert got["STEP"][(0, "찾은값")] == "VLOOKUP(B2,MAP!$A$1:$B$99,2,0)"
+
+
+def test_the_saved_file_really_holds_a_formula_not_a_value():
+    sheets, formulas = book_with_formula()
+    im.save_workbook("A", sheets, "hong", formulas=formulas)
+    raw = fake_s3.STORE["2GAPU/input/A.xlsx"]
+    book = openpyxl.load_workbook(io.BytesIO(raw))
+    assert book["STEP"]["C2"].value == "=VLOOKUP(B2,MAP!$A$1:$B$99,2,0)"
+
+
+def test_editing_another_column_keeps_the_formula():
+    sheets, formulas = book_with_formula()
+    after = {"STEP": sheets["STEP"].copy()}
+    after["STEP"].loc[0, "ppid"] = "P-99"
+    kept, lost = im.surviving_formulas(sheets, after, formulas)
+    assert len(kept["STEP"]) == 2 and not lost
+
+
+def test_typing_over_a_formula_cell_wins():
+    """사람이 그 칸에 직접 값을 적었으면 그 값이 이긴다."""
+    sheets, formulas = book_with_formula()
+    after = {"STEP": sheets["STEP"].copy()}
+    after["STEP"].loc[0, "찾은값"] = "손으로 적음"
+    kept, lost = im.surviving_formulas(sheets, after, formulas)
+    assert (0, "찾은값") not in kept.get("STEP", {})
+    assert (1, "찾은값") in kept["STEP"]
+    assert lost == {"STEP": 1}
+
+
+def test_a_row_inserted_above_drops_the_formulas_below():
+    """5번 줄의 =VLOOKUP(B5,..) 는 6번 줄로 밀리면 B6 을 봐야 맞다.
+
+    자리를 따라 고쳐 주지는 못하므로, 틀린 수식을 남기는 대신 버린다.
+    """
+    sheets, formulas = book_with_formula()
+    grown = pd.concat([
+        pd.DataFrame([{"step": "0005", "ppid": "P-00", "찾은값": ""}], dtype=object),
+        sheets["STEP"]], ignore_index=True)
+    kept, lost = im.surviving_formulas(sheets, {"STEP": grown}, formulas)
+    assert not kept
+    assert lost == {"STEP": 2}
+
+
+def test_a_row_added_at_the_end_keeps_the_formulas_above():
+    sheets, formulas = book_with_formula()
+    grown = pd.concat([
+        sheets["STEP"],
+        pd.DataFrame([{"step": "0030", "ppid": "P-03", "찾은값": ""}], dtype=object)],
+        ignore_index=True)
+    kept, lost = im.surviving_formulas(sheets, {"STEP": grown}, formulas)
+    assert len(kept["STEP"]) == 2 and not lost
+
+
+def test_a_dropped_sheet_drops_its_formulas():
+    sheets, formulas = book_with_formula()
+    kept, lost = im.surviving_formulas(sheets, {}, formulas)
+    assert not kept and lost == {"STEP": 2}
+
+
+def test_a_column_inserted_to_the_left_does_not_move_the_formula():
+    """칸을 번호가 아니라 이름으로 붙들어 두는 자리다."""
+    sheets, formulas = book_with_formula()
+    after = sheets["STEP"].copy()
+    after.insert(0, "새칸", ["", ""])
+    kept, _lost = im.surviving_formulas(sheets, {"STEP": after}, formulas)
+    im.save_workbook("A", {"STEP": after}, "hong", formulas=kept)
+    raw = fake_s3.STORE["2GAPU/input/A.xlsx"]
+    book = openpyxl.load_workbook(io.BytesIO(raw))
+    assert book["STEP"]["A1"].value == "새칸"
+    assert str(book["STEP"]["D2"].value).startswith("=VLOOKUP")
+
+
+def test_a_blank_row_removed_on_save_pulls_the_formula_up():
+    """_clean 이 빈 줄을 빼면 아래 줄이 당겨진다. 수식도 같이 당겨야 한다."""
+    sheets = {"STEP": pd.DataFrame(
+        [{"a": "", "f": ""}, {"a": "x", "f": "1"}], dtype=object)}
+    formulas = {"STEP": {(1, "f"): "SUM(A3:A3)"}}
+    im.save_workbook("A", sheets, "hong", formulas=formulas)
+    raw = fake_s3.STORE["2GAPU/input/A.xlsx"]
+    book = openpyxl.load_workbook(io.BytesIO(raw))
+    assert book["STEP"]["B2"].value == "=SUM(A3:A3)", \
+        [c.value for c in book["STEP"]["B"]]
+
+
+def test_excel_is_told_to_recompute_on_open():
+    """적어 둔 값은 낡았을 수 있다. 엑셀이 열 때 다시 계산해야 한다."""
+    sheets, formulas = book_with_formula()
+    im.save_workbook("A", sheets, "hong", formulas=formulas)
+    raw = fake_s3.STORE["2GAPU/input/A.xlsx"]
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        assert b'fullCalcOnLoad="1"' in zf.read("xl/workbook.xml")
+
+
+# ------------------------------------------------------------- 이력 내용
+
+
+
+def test_the_change_text_reads_like_the_popup():
+    """창에서 본 것과 같은 것이 파일에 남아야 한다 -- 나중에 되짚는 사람은
+    그 창을 못 보고 이 칸만 본다."""
+    before = {"STEP": frame([["1", "x"], ["2", "y"]])}
+    after = {"STEP": frame([["1", "바뀜"], ["2", "y"], ["3", "새"]])}
+    text = im.changes_text(im.workbook_changes(before, after))
+    assert "[STEP]" in text
+    assert "수정 1행: 1 | 바뀜" in text, text
+    assert "신규 3행: 3 | 새" in text, text
+
+
+def test_the_change_text_names_added_columns():
+    before = {"STEP": frame([["1", "x"]])}
+    after = {"STEP": frame([["1", "x", ""]], cols=("a", "b", "c"))}
+    assert "칸 추가: c" in im.changes_text(im.workbook_changes(before, after))
+
+
+def test_the_change_text_cannot_overflow_an_excel_cell():
+    """엑셀 칸 하나는 32,767자까지다. 넘기면 파일이 안 열린다.
+
+    줄 수는 300개로 막아 두지만 칸이 넓고 값이 길면 그것만으로 넘길 수 있다.
+    """
+    wide = [[("가" * 200) for _ in range(20)] for _ in range(300)]
+    before = {"STEP": frame(wide, cols=[f"c{i}" for i in range(20)])}
+    after = {"STEP": frame([[v + "!" for v in row] for row in wide],
+                           cols=[f"c{i}" for i in range(20)])}
+    text = im.changes_text(im.workbook_changes(before, after))
+    assert len(text) <= im.CELL_MAX
+    assert "잘림" in text, "잘렸다는 말이 없으면 뒤가 없는 건지 알 수 없다"
+
+
+def test_a_truncated_change_text_says_so():
+    before = {"STEP": frame([["1", "x"], ["2", "y"]])}
+    after = {"STEP": frame([["1", "바뀜"], ["2", "또바뀜"]])}
+    text = im.changes_text(im.workbook_changes(before, after), limit=40)
+    assert len(text) <= 40 and text.endswith("잘림)"), repr(text)
+
+
+def test_what_the_person_typed_comes_before_the_auto_part():
+    out = im.append_rev_info(rev_book(), "2026-09-21", "사유", "나",
+                             "JIRA-1", "[STEP] ...\n수정 1행: x")
+    related = out["REV_INFO"].iloc[-1]["관련"]
+    assert related.startswith("JIRA-1"), related
+    assert "수정 1행" in related
+
+
+def test_the_auto_part_alone_is_fine_when_nothing_was_typed():
+    out = im.append_rev_info(rev_book(), "2026-09-21", "사유", "나", "",
+                             "[STEP] ...")
+    assert out["REV_INFO"].iloc[-1]["관련"] == "[STEP] ..."
