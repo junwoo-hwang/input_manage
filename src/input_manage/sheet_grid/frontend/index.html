@@ -587,9 +587,17 @@ let dirty = false;      // 이 판을 받은 뒤로 사람이 뭔가 건드렸�
 let answered = "";      // 마지막으로 응답한 '통째로 달라' 표
 
 function publish(immediate) {
-  clearTimeout(publishTimer);
+  // 한 번만 알린다. 파이썬이 편집 중에 알아야 하는 것은 '고친 게 있다' 하나
+  // 뿐인데, 그건 한 번 참이 되면 저장하거나 초기화할 때까지 계속 참이다.
+  // 칸마다 알리면 그때마다 streamlit 이 스크립트를 다시 돌려서, 칸 하나
+  // 고칠 때마다 화면에 로딩이 번쩍인다. 정작 알려 줄 새 소식은 없이.
+  if (dirty) return;
   dirty = true;
-  const go = () => setValue({ rev: ++rev, dirty: true, full: false });
+  clearTimeout(publishTimer);
+  const go = () => {
+    window.__sent = (window.__sent || 0) + 1;   // 검사에서 세어 본다
+    setValue({ rev: ++rev, dirty: true, full: false });
+  };
   if (immediate) go(); else publishTimer = setTimeout(go, 350);
 }
 

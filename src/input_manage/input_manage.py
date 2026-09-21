@@ -903,7 +903,7 @@ S_SHEETS = "_im_sheets"    # 그 파일을 띄웠을 때의 원본
 S_STAMP = "_im_stamp"      # 그 원본이 어느 판이었는지 (S3 ETag)
 # 몇 번째로 불러온 것인지. 격자에 넘기는 판 번호에 섞는다.
 #
-# ETag 만으로는 모자란다: '다시 불러오기' 는 아무도 저장하지 않았으면 같은
+# ETag 만으로는 모자란다: '초기화' 는 아무도 저장하지 않았으면 같은
 # 파일을 다시 읽으므로 ETag 가 그대로고, 그러면 격자가 '갈린 게 없다' 며
 # 제 상태를 그대로 둔다 -- 버리려고 누른 수정이 화면에 그대로 남는다.
 S_NONCE = "_im_nonce"
@@ -973,12 +973,18 @@ def show_input_manage() -> None:
 
     # 고르개는 파일 이름만 들어가면 되므로 좁게 둔다. 화면 폭을 다 쓰면
     # 정작 넓어야 할 표가 그만큼 아래로 밀린다.
-    top, refresh, _rest = st.columns([2, 1.2, 5.8])
-    with top:
+    #
+    # 칸은 여기서 한꺼번에 만들지만 저장 쪽은 아래에서 채운다. 저장을 켜고
+    # 끄려면 격자가 '고친 게 있다' 를 알려 줘야 하는데 그건 격자를 그린
+    # 뒤에야 안다 -- 그렇다고 단추를 표 아래에 두면 15,000행짜리 표에 밀려
+    # 화면 밖으로 나가서, 저장하려고 스크롤을 해야 한다.
+    c_book, c_reset, c_save, c_make, c_get, _gap = st.columns(
+        [2, 1, 1, 1.3, 1.7, 2])
+    with c_book:
         book = st.selectbox("관리할 파일", books, key="im_book_pick")
-    with refresh:
+    with c_reset:
         st.write("")
-        reload_now = st.button("다시 불러오기", **_WIDE,
+        reload_now = st.button("초기화", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다. 이전 파일의 미저장 수정은
@@ -996,6 +1002,8 @@ def show_input_manage() -> None:
         st.warning(f"'{book}' 에 시트가 없습니다.")
         return
 
+    status = st.container()
+
     user_id = st.session_state.get("user_id") or "unknown"
     got = sheet_grid(
         sheets,
@@ -1006,29 +1014,35 @@ def show_input_manage() -> None:
     dirty = bool(got.get("dirty"))
     _take_full(got, book)
 
-    save_col, make_col, get_col, _gap = st.columns([1, 1.2, 1.6, 3])
-    with save_col:
-        if st.button("저장", type="primary", disabled=not dirty, **_WIDE):
+    with c_save:
+        st.write("")
+        if st.button("저장", type="primary", disabled=not dirty, **_WIDE,
+                     help=("S3 의 이 엑셀을 지금 화면의 값으로 바꿉니다"
+                           if dirty else "고친 것이 있어야 켜집니다")):
             _ask_full("save")
-    with make_col:
+    with c_make:
+        st.write("")
         if st.button("엑셀 만들기", **_WIDE,
-                     help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 만듭니다"):
+                     help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 "
+                          "만들어 내려받습니다. S3 는 안 바뀝니다"):
             _ask_full("download")
-    with get_col:
+    with c_get:
         ready = st.session_state.get(S_DOWNLOAD)
         if ready:
+            st.write("")
             st.download_button(f"⬇ {ready[0]}", ready[1], file_name=ready[0],
                                **_WIDE,
                                mime="application/vnd.openxmlformats-officedocument."
                                     "spreadsheetml.sheet")
 
-    if st.session_state.get(S_WANT):
-        st.caption("표를 받아오는 중입니다...")
-    elif dirty:
-        st.info("저장하지 않은 수정이 있습니다. "
-                "저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
-    else:
-        st.caption("고친 것 없음")
+    with status:
+        if st.session_state.get(S_WANT):
+            st.caption("표를 받아오는 중입니다...")
+        elif dirty:
+            st.info("저장하지 않은 수정이 있습니다. "
+                    "저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
+        else:
+            st.caption("고친 것 없음 — 칸을 고치면 저장 단추가 켜집니다")
 
     if st.session_state.get(S_REVIEW):
         _review(book, user_id)
@@ -1070,7 +1084,7 @@ def _review(book: str, user_id: str) -> None:
     if _HAS_DIALOG:
         kw = ({"width": "large"}
               if "width" in inspect.signature(st.dialog).parameters else {})
-        st.dialog("저장하기 전에 — 무엇이 바뀌나", **kw)(_review_body)(book, user_id)
+        st.dialog("변경내용", **kw)(_review_body)(book, user_id)
     else:
         with st.container(border=True):
             _review_body(book, user_id)
@@ -1088,7 +1102,7 @@ def _review_body(book: str, user_id: str) -> None:
         return
 
     for name, info in changes.items():
-        head = f"**{name}** — {info['total']}줄"
+        head = f"**sheet : {name}** — {info['total']}줄"
         if info["note"]:
             head += f" · {info['note']}"
         st.markdown(head)
@@ -1114,19 +1128,22 @@ def _review_body(book: str, user_id: str) -> None:
     else:
         st.markdown(f"**{REV_SHEET} 에 남길 기록**")
         today = f"{datetime.now(KST):%Y-%m-%d}"
-        c1, c2 = st.columns([1, 2])
+        # 날짜와 사람은 사람이 못 바꾼다. 언제 누가 바꿨는지는 기록이지
+        # 입력이 아니다 -- 고칠 수 있으면 남의 이름으로 적을 수도 있다.
+        c1, c2 = st.columns(2)
         with c1:
-            # 날짜는 사람이 못 바꾼다. 언제 바꿨는지는 기록이지 입력이 아니다.
-            st.text_input(REV_DATE, value=today, disabled=True,
-                          key="im_rev_date")
+            st.text_input(REV_DATE, value=today, disabled=True, key="im_rev_date")
         with c2:
-            who = st.text_input(f"{REV_USER} — 바꾼 사람", value=user_id,
-                                key="im_rev_user")
+            st.text_input(REV_USER, value=user_id, disabled=True, key="im_rev_user")
+        who = user_id
         remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark")
         link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link")
-        ok = bool(remark.strip() and who.strip())
+        ok = bool(remark.strip())
         if not ok:
-            st.caption(f"{REV_REMARK} 와 {REV_USER} 를 적어야 저장할 수 있습니다.")
+            st.caption(f"{REV_REMARK} 를 적어야 저장할 수 있습니다.")
+        if user_id == "unknown":
+            st.caption("로그인한 사람을 못 읽어 'unknown' 으로 남습니다. "
+                       "포털이 st.session_state['user_id'] 를 채우는지 봐 주세요.")
 
     go, cancel, _gap = st.columns([1, 1, 3])
     with go:

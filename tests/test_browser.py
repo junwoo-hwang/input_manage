@@ -108,30 +108,34 @@ def wait_dirty(page):
 
 
 def open_review(page, table=True):
-    """저장을 눌러 '무엇이 바뀌나' 창을 띄운다.
+    """저장을 눌러 '변경내용' 창을 띄운다.
 
     바뀐 줄을 담은 표는 창보다 한 박자 늦게 도착한다 (streamlit 이 화면을
     조각내어 보낸다). 표를 볼 검사는 그것까지 기다려야 한다.
     """
     page.get_by_role("button", name="저장", exact=True).first.click()
     page.wait_for_function(
-        "() => document.body.innerText.includes('무엇이 바뀌나')", timeout=60000)
+        "() => document.body.innerText.includes('변경내용')", timeout=60000)
     if table:
         page.wait_for_selector("[role='dialog'] [data-testid='stTable'], "
                                "[data-testid='stTable']", timeout=60000)
 
 
 def review_text(page):
-    """'무엇이 바뀌나' 창 안의 글자만. 뒤에 깔린 화면 글자와 안 섞이게."""
+    """'변경내용' 창 안의 글자만. 뒤에 깔린 화면 글자와 안 섞이게."""
     box = page.locator("[role='dialog']")
     return box.inner_text() if box.count() else page.inner_text("body")
 
 
-def confirm_save(page, remark="사유", user="검사자"):
-    """저장 -> 사유 적기 -> 진짜 저장. '저장했습니다' 가 뜰 때까지 기다린다."""
+def confirm_save(page, remark="사유"):
+    """저장 -> 사유 적기 -> 진짜 저장. '저장했습니다' 가 뜰 때까지 기다린다.
+
+    user 는 로그인한 사람으로 고정이라 못 고친다.
+    """
     open_review(page, table=False)
     page.get_by_label("Remark — 사유").fill(remark)
-    page.get_by_label("user — 바꾼 사람").fill(user)
+    page.keyboard.press("Tab")          # streamlit 은 칸을 떠나야 값을 받는다
+    page.wait_for_timeout(900)
     page.get_by_role("button", name="저장", exact=True).last.click()
     page.wait_for_function(
         "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
@@ -595,7 +599,7 @@ def test_the_review_says_which_rows_changed_and_how(page):
     wait_dirty(page)
     open_review(page)
     body = review_text(page)
-    assert "STEP" in body
+    assert "sheet : STEP" in body, body[:300]
     assert "수정" in body, body[:600]
     assert "고침" in body, f"바뀐 줄의 값이 안 보입니다: {body[:600]}"
     page.get_by_role("button", name="취소").click()
@@ -620,7 +624,7 @@ def test_a_new_row_is_marked_new_not_edited(page):
 
 
 def test_saving_needs_a_reason(page):
-    """Remark 와 user 를 안 적으면 저장 단추가 안 켜진다."""
+    """Remark 를 안 적으면 저장 단추가 안 켜진다."""
     reset(page)
     click_cell(page, 0, 2)
     page.keyboard.type("사유없이")
@@ -658,7 +662,7 @@ def test_the_reason_lands_in_the_rev_info_sheet(page):
     page.keyboard.type("기록남기기")
     page.keyboard.press("Enter")
     wait_dirty(page)
-    confirm_save(page, remark="오탈자 고침", user="김검사")
+    confirm_save(page, remark="오탈자 고침")
 
     reset(page)
     page.wait_for_timeout(400)
@@ -666,7 +670,49 @@ def test_the_reason_lands_in_the_rev_info_sheet(page):
     page.wait_for_timeout(600)
     last = table(page)["rows"][-1]
     assert "오탈자 고침" in last, last
-    assert "김검사" in last, last
     import datetime as _dt
     today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=9))).strftime("%Y-%m-%d")
     assert today in last, last
+
+
+def test_the_save_button_sits_above_the_grid(page):
+    """단추가 표 아래에 있으면 15,000행짜리 표에 밀려 화면 밖으로 나간다.
+
+    실제로 배포하고 나서 '저장 버튼이 어디 있냐' 는 말을 들은 자리다.
+    """
+    reset(page)
+    save = page.get_by_role("button", name="저장", exact=True).first
+    frame = page.locator("iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+    assert save.bounding_box()["y"] < frame.bounding_box()["y"], \
+        "저장 단추가 표보다 아래에 있습니다"
+
+
+def test_the_save_button_is_visible_without_scrolling(page):
+    reset(page)
+    save = page.get_by_role("button", name="저장", exact=True).first
+    assert save.is_visible()
+    box, view = save.bounding_box(), page.viewport_size
+    assert box["y"] + box["height"] <= view["height"], \
+        f"저장 단추가 첫 화면 밖입니다: y={box['y']}, 화면높이={view['height']}"
+
+
+def test_editing_many_cells_reruns_python_only_once(page):
+    """칸마다 파이썬을 깨우면 고칠 때마다 화면에 로딩이 번쩍인다.
+
+    편집 중에 파이썬이 알아야 하는 것은 '고친 게 있다' 하나뿐이고, 그건
+    한 번 참이 되면 저장하거나 초기화할 때까지 계속 참이다.
+    """
+    reset(page)
+    for r, c in ((0, 2), (1, 2), (2, 2), (0, 3)):
+        click_cell(page, r, c)
+        page.keyboard.type(f"값{r}{c}")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(700)
+    wait_dirty(page)
+    sent = grid(page).locator("body").evaluate("() => window.__sent || 0")
+    assert sent == 1, f"칸 4개 고치는데 {sent}번 올렸습니다"
+
+
+def test_the_reset_button_is_called_초기화(page):
+    reset(page)
+    assert page.get_by_role("button", name="초기화").count() == 1
