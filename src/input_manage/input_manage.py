@@ -272,19 +272,33 @@ def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
                 formulas: dict[tuple[int, int], str] | None = None) -> list[list]:
     rows: list[list] = []
     root = ET.fromstring(raw)
+    cell_tag, f_tag = NS + "c", NS + "f"
+    # 칸 이름에서 자리를 따는 것은 칸마다 한 번씩 일어난다. 15,000행 x 10칸
+    # 이면 15만 번이라, 같은 칸 이름('A','B',...)의 답을 적어 두고 쓴다.
+    seen: dict[str, int] = {}
     for row in root.iter(NS + "row"):
         # 줄 번호가 건너뛰었으면 그만큼 빈 줄을 채운다
         at_row = int(row.get("r") or len(rows) + 1) - 1
         while len(rows) < at_row:
             rows.append([])
         values: list = []
-        for cell in row.findall(NS + "c"):
-            at = col_index(cell.get("r") or col_letter(len(values)) + "1")
+        add = values.append
+        for cell in row:
+            if cell.tag != cell_tag:
+                continue
+            ref = cell.get("r")
+            if ref is None:
+                at = len(values)
+            else:
+                letters = ref.rstrip("0123456789")
+                at = seen.get(letters)
+                if at is None:
+                    at = seen[letters] = col_index(letters)
             while len(values) < at:
-                values.append(None)          # 건너뛴 칸은 빈 칸이다
-            values.append(_cell_value(cell, shared, date_styles))
+                add(None)                    # 건너뛴 칸은 빈 칸이다
+            add(_cell_value(cell, shared, date_styles))
             if formulas is not None:
-                f = cell.find(NS + "f")
+                f = cell.find(f_tag)
                 # 배열 수식의 나머지 칸(t="shared" 이면서 내용이 빈 것)은
                 # 본체가 따로 있어서 여기 적을 것이 없다
                 if f is not None and (f.text or "").strip():
@@ -293,24 +307,31 @@ def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
     return rows
 
 
+_V, _IS, _T = NS + "v", NS + "is", NS + "t"
+
+
 def _cell_value(cell, shared: list[str], date_styles: set[int]):
     kind = cell.get("t", "n")
     if kind == "inlineStr":
-        node = cell.find(NS + "is")
+        node = cell.find(_IS)
         if node is None:
             return None
-        return "".join(t.text or "" for t in node.iter(NS + "t"))
+        # 글자 하나짜리가 거의 전부다 (칸 안에서 서식이 갈리지 않는 한).
+        # 그 경우를 먼저 쳐내면 15만 번의 join 과 generator 를 아낀다.
+        if len(node) == 1 and node[0].tag == _T:
+            return node[0].text or ""
+        return "".join(t.text or "" for t in node.iter(_T))
     if kind == "s":                                   # sharedStrings 색인
-        v = cell.find(NS + "v")
+        v = cell.find(_V)
         if v is None or v.text is None:
             return None
         i = int(v.text)
         return shared[i] if 0 <= i < len(shared) else None
     if kind in ("str", "e"):                          # 수식 결과 / 오류
-        v = cell.find(NS + "v")
+        v = cell.find(_V)
         return v.text if v is not None else None
 
-    v = cell.find(NS + "v")
+    v = cell.find(_V)
     if v is None or not v.text:
         return None
     if kind == "b":

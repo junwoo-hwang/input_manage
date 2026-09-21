@@ -716,3 +716,64 @@ def test_editing_many_cells_reruns_python_only_once(page):
 def test_the_reset_button_is_called_초기화(page):
     reset(page)
     assert page.get_by_role("button", name="초기화").count() == 1
+
+
+# --------------------------------------------- 줄이 많을 때 나눠 그리기
+
+@pytest.fixture(scope="module")
+def big_server():
+    """줄이 3000개인 시트로 따로 띄운다 (기본 씨앗은 3줄이라 안 걸린다)."""
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
+         "--server.port", str(port), "--server.headless", "true",
+         "--browser.gatherUsageStats", "false"],
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_ROWS="3000"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(120):
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        proc.terminate()
+        pytest.fail("streamlit 이 안 떴습니다")
+    time.sleep(3)
+    yield f"http://localhost:{port}/"
+    proc.terminate()
+    proc.wait(timeout=20)
+
+
+@pytest.fixture(scope="module")
+def big_page(big_server, page):
+    pg = page.context.new_page()
+    pg.goto(big_server)
+    pg.wait_for_timeout(6000)
+    pg.get_by_role("combobox").click()
+    pg.wait_for_timeout(600)
+    pg.get_by_text(BOOK, exact=True).click()
+    pg.wait_for_timeout(9000)
+    yield pg
+    pg.close()
+
+
+def test_every_row_ends_up_drawn(big_page):
+    """나눠 그리더라도 결국 한 줄도 빠지지 않아야 한다.
+
+    보이는 만큼만 그리고 마는 것이 아니다 -- 그러면 브라우저 Ctrl+F 가
+    값을 못 찾는다. 첫 화면을 먼저 내놓고 나머지를 이어 붙일 뿐이다.
+    """
+    g = big_page.frame_locator(
+        "iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+    assert g.locator(".tbl .row").count() == 3000
+    assert g.locator(".tbl .filler").count() == 0, "다 그리고 나면 빈 자리는 없어야 한다"
+
+
+def test_the_scrollbar_is_right_while_it_is_still_filling(big_page):
+    """아직 안 그린 만큼을 자리로 잡아 두지 않으면, 줄이 붙을 때마다 막대가
+    자라서 잡고 있던 자리가 밀린다."""
+    g = big_page.frame_locator(
+        "iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+    got = g.locator(".tbl").evaluate("t => t.getBoundingClientRect().height")
+    assert abs(got - 3001 * 25) <= 2, got      # 줄 3000 + 머리글 1
