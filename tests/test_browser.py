@@ -444,30 +444,31 @@ def test_find_says_so_when_there_is_nothing(page):
     assert grid(page).locator("#findHits").inner_text() == "없음"
 
 
-def test_the_excel_download_appears_only_after_you_make_it(page):
-    """8000행 엑셀을 만드는 데 1초가 넘어서, 화면 그릴 때마다 만들 수는 없다."""
+def test_downloading_gives_the_saved_file_not_the_screen(page):
+    """'저장 안 한 수정 미포함' 이다. 그래서 우리가 다시 만들지 않고 S3 에서
+    받아 온 바이트를 그대로 내준다 -- 다시 만들면 저장된 판과 한 글자라도
+    다를 수 있고, 내려받아 고쳐 올릴 사람에게는 그게 곧 사고다.
+    """
     reset(page)
-    assert page.get_by_role("button", name="엑셀 만들기").is_visible()
-    assert not page.locator("text=⬇").count()
-    page.get_by_role("button", name="엑셀 만들기").click()
-    page.wait_for_timeout(2500)
-    assert page.locator("text=⬇").count() == 1
+    with page.expect_download() as got:
+        page.get_by_role("button", name="엑셀 다운로드", exact=True).click()
+    assert got.value.suggested_filename == f"{BOOK}.xlsx"
 
 
-def test_the_download_is_dropped_when_you_switch_files(page):
-    """안 버리면 파일을 바꿔 골랐는데 이전 파일 내용이 담긴 버튼이 남는다."""
+def test_the_four_buttons_are_the_same_size_and_line_up(page):
+    """고르개에만 이름이 붙으면 그 칸만 내려앉아 밑줄이 안 맞는다."""
     reset(page)
-    page.get_by_role("button", name="엑셀 만들기").click()
-    page.wait_for_timeout(2000)
-    assert page.locator("text=⬇").count() == 1
-    page.get_by_role("combobox").click()
-    page.wait_for_timeout(600)
-    page.get_by_text("FAB_INPUT_TTS_r0", exact=True).click()
-    page.wait_for_timeout(3000)
-    assert page.locator("text=⬇").count() == 0
+    boxes = [page.locator("div[data-testid='stSelectbox']").first.bounding_box()]
+    for name in ("초기화", "엑셀 다운로드", "엑셀 업로드", "저장"):
+        boxes.append(page.get_by_role("button", name=name, exact=True)
+                     .first.bounding_box())
+    ys = {round(b["y"]) for b in boxes}
+    hs = {round(b["height"]) for b in boxes}
+    ws = {round(b["width"]) for b in boxes}
+    assert len(ys) == 1, f"높이가 안 맞습니다: {ys}"
+    assert len(hs) == 1, f"키가 안 맞습니다: {hs}"
+    assert len(ws) == 1, f"너비가 안 맞습니다: {ws}"
 
-
-# ------------------------------------------------- 오른쪽 클릭 차림표
 
 def open_menu(page, r, c):
     grid(page).locator(f".cell[data-r='{r}'][data-c='{c}']").click(button="right")
@@ -777,3 +778,79 @@ def test_the_scrollbar_is_right_while_it_is_still_filling(big_page):
         "iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
     got = g.locator(".tbl").evaluate("t => t.getBoundingClientRect().height")
     assert abs(got - 3001 * 25) <= 2, got      # 줄 3000 + 머리글 1
+
+
+# ------------------------------------------------------- 엑셀 업로드
+
+def make_xlsx(tmp_path, rows):
+    import openpyxl
+    b = openpyxl.Workbook(); ws = b.active; ws.title = "STEP"
+    for i, v in enumerate(["step_seq", "step_id", "step_desc", "ppid", "사용"],
+                          start=1):
+        ws.cell(1, i, v)
+    for r in rows:
+        ws.append(r)
+    path = tmp_path / "올릴것.xlsx"
+    b.save(path)
+    return str(path)
+
+
+def upload(page, path):
+    """엑셀 업로드 -> 파일 고르기 -> 화면에 넣기."""
+    page.get_by_role("button", name="엑셀 업로드", exact=True).click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('올릴 엑셀 파일')", timeout=30000)
+    page.locator("input[type='file']").set_input_files(path)
+    page.wait_for_function(
+        "() => document.body.innerText.includes('화면에 넣기')", timeout=30000)
+    page.get_by_role("button", name="화면에 넣기").click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('올린 엑셀의 내용')", timeout=30000)
+    page.wait_for_timeout(1500)
+
+
+def test_an_uploaded_file_shows_up_in_the_grid(tmp_path, page):
+    reset(page)
+    upload(page, make_xlsx(tmp_path, [
+        ["0010", "BB100001TR01", "올린값", "P-TTS-01", "Y"],
+        ["0020", "BB100002TR01", "새줄", "P-TTS-02", "N"]]))
+    got = table(page)
+    assert len(got["rows"]) == 2, got
+    assert "올린값" in got["rows"][0], got["rows"][0]
+
+
+def test_uploading_does_not_save_by_itself(tmp_path, page):
+    """올린다고 S3 가 바뀌면 안 된다. 저장을 눌러야 들어간다."""
+    reset(page)
+    upload(page, make_xlsx(tmp_path, [["0010", "x", "안저장됨", "p", "Y"]]))
+    assert page.get_by_role("button", name="저장", exact=True).first.is_enabled()
+    reset(page)                                   # 저장 안 하고 다시 불러오면
+    assert "안저장됨" not in str(table(page)["rows"])
+
+
+def test_saving_an_upload_records_what_changed_like_any_other_edit(tmp_path, page):
+    reset(page)
+    upload(page, make_xlsx(tmp_path, [
+        ["0010", "BB100001TR01", "업로드로바꿈", "P-TTS-01", "Y"]]))
+    open_review(page)
+    body = review_text(page)
+    assert "sheet : STEP" in body, body[:400]
+    assert "업로드로바꿈" in body, body[:400]
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(800)
+
+
+def test_a_file_that_is_not_an_excel_is_refused(tmp_path, page):
+    reset(page)
+    bad = tmp_path / "아님.xlsx"
+    bad.write_bytes(b"this is not a zip")
+    page.get_by_role("button", name="엑셀 업로드", exact=True).click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('올릴 엑셀 파일')", timeout=30000)
+    page.locator("input[type='file']").set_input_files(str(bad))
+    page.wait_for_function(
+        "() => document.body.innerText.includes('엑셀로 읽지 못했습니다')",
+        timeout=30000)
+    assert not page.get_by_role("button", name="화면에 넣기").count()
+    page.get_by_role("button", name="닫기").click()
+    page.wait_for_timeout(800)

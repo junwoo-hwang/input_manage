@@ -1125,7 +1125,7 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
 
     want_full 은 '지금 표를 통째로 올려달라' 는 표다. 평소에는 빈 글자다 --
     칸 하나 고칠 때마다 15,000행을 통째로 주고받으면 한 번에 2.6초가 걸린다.
-    저장이나 엑셀 만들기처럼 진짜로 값이 필요할 때만 표를 하나 들려 보낸다.
+    저장할 때처럼 진짜로 값이 필요할 때만 표를 하나 들려 보낸다.
     """
     payload = [{
         "name": str(name),
@@ -1187,20 +1187,24 @@ S_NONCE = "_im_nonce"
 # 스크립트를 처음부터 다시 돌리므로 그 전에 그린 st.success 는 화면에 남지
 # 않는다. 그래서 문구를 여기 맡겨 두고 다음 판에서 그린다.
 S_TOAST = "_im_toast"
-# 내려받을 엑셀. 만들어 둔 뒤에야 st.download_button 을 그릴 수 있다.
-#
-# 버튼에 바로 못 붙이는 이유: st.download_button 은 파일 내용을 미리 받아야
-# 하는데, 8000행짜리 엑셀을 만드는 데 1초 넘게 걸린다. 그걸 화면 그릴 때마다
-# 하면 칸 하나 고칠 때마다 그 값을 치르게 된다. 그래서 누를 때만 만든다.
-S_DOWNLOAD = "_im_download"
+# S3 에서 받아 온 파일 그대로의 바이트. '엑셀 다운로드' 가 이걸 그대로
+# 내준다 -- 저장된 판을 그대로 주는 것이라 우리가 다시 만들 필요가 없고,
+# 서식이든 뭐든 저장돼 있는 그대로 나간다.
+S_RAW = "_im_raw"
+# 격자에 띄울 값. 보통은 S_SHEETS 와 같지만, 엑셀을 업로드하면 그 내용이
+# 여기 들어온다. S_SHEETS 는 S3 에 저장돼 있는 판 그대로 두어야 '무엇이
+# 바뀌나' 를 견줄 기준이 남는다.
+S_SHOWN = "_im_shown"
+S_UPLOAD = "_im_upload"      # 업로드 창이 열려 있는가
+S_UPLOADED = "_im_uploaded"  # 업로드한 내용이 아직 저장 안 됐는가
 # 격자에 '표를 통째로 올려달라' 고 하면서 들려 보낸 표. 격자가 그 표를 달고
 # 올려주면 그때가 우리가 요청한 그 값이다.
 #
 # 이 왕복이 필요한 이유: 평소에 격자는 '고친 게 있다' 만 올린다. 칸 하나
 # 고칠 때마다 15,000행을 통째로 주고받으면 한 번에 2.6초가 걸리기 때문이다.
-# 그래서 저장이나 엑셀 만들기처럼 값이 진짜 필요한 순간에만 달라고 한다.
+# 그래서 저장처럼 값이 진짜 필요한 순간에만 달라고 한다.
 S_WANT = "_im_want"
-S_PENDING = "_im_pending"    # 표를 받으면 할 일: "save" | "download"
+S_PENDING = "_im_pending"    # 표를 받으면 할 일: 지금은 "save" 뿐
 S_EDITED = "_im_edited"      # 격자가 올려준 지금 값
 S_REVIEW = "_im_review"      # 저장 팝업에 띄울 변경 내역
 # 파일을 띄웠을 때 그 안에 있던 수식들. 격자는 값만 다루므로, 이걸 안 들고
@@ -1215,21 +1219,37 @@ _WIDE = ({"width": "stretch"}
          if "width" in inspect.signature(st.button).parameters
          else {"use_container_width": True})
 
+# 이름을 우리가 직접 그리므로 위젯이 제 이름을 또 그리지 않게 한다.
+# label_visibility 는 예전 streamlit 에 없어서, 없으면 그냥 두 번 나온다.
+_NO_LABEL = ({"label_visibility": "collapsed"}
+             if "label_visibility" in inspect.signature(st.selectbox).parameters
+             else {})
+
 # st.dialog 는 예전 streamlit 에 없다. 없으면 팝업 대신 화면 안에 펼쳐서
 # 보여준다 -- 보기는 덜 좋아도 저장 전에 확인하는 절차는 그대로 지킨다.
 _HAS_DIALOG = hasattr(st, "dialog")
 
 
 def _load(book: str) -> None:
+    """S3 에서 그 파일을 다시 읽어 화면 상태를 처음으로 되돌린다.
+
+    받아 온 바이트를 그대로 들고 있는다 -- '엑셀 다운로드' 가 그걸 그대로
+    내주기 때문이다. 우리가 다시 만들어 주면 저장된 판과 한 글자라도 다를
+    수 있는데, 내려받아 고쳐서 다시 올릴 사람에게는 그게 곧 사고다.
+    """
+    got = s3.get_object(_key(f"{book}.xlsx"))
+    raw, stamp = got if got is not None else (b"", "")
     formulas: dict = {}
-    sheets, stamp = load_workbook(book, formulas)
+    sheets = read_xlsx(raw, formulas) if raw else {}
+    st.session_state[S_RAW] = raw
     st.session_state[S_FORMULAS] = formulas
     st.session_state[S_BOOK] = book
     st.session_state[S_SHEETS] = sheets
+    st.session_state[S_SHOWN] = {k: v.copy() for k, v in sheets.items()}
     st.session_state[S_STAMP] = stamp
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
-    # 다른 파일의 값과 진행 중이던 저장은 들고 가지 않는다
-    for key in (S_EDITED, S_REVIEW, S_WANT, S_PENDING):
+    # 다른 파일의 값과 진행 중이던 저장·업로드는 들고 가지 않는다
+    for key in (S_EDITED, S_REVIEW, S_WANT, S_PENDING, S_UPLOAD, S_UPLOADED):
         st.session_state.pop(key, None)
 
 
@@ -1252,34 +1272,33 @@ def show_input_manage() -> None:
         st.warning(f"`{BUCKET_NAME}/{FOLDER_PATH}/` 아래에 .xlsx 가 없습니다.")
         return
 
-    # 고르개는 파일 이름만 들어가면 되므로 좁게 둔다. 화면 폭을 다 쓰면
-    # 정작 넓어야 할 표가 그만큼 아래로 밀린다.
+    # 고르개와 단추 넷을 같은 크기, 같은 높이로 한 줄에 둔다. 칸마다 이름
+    # 줄을 하나씩 두어야 높이가 맞는다 -- 고르개만 이름이 붙으면 그만큼
+    # 혼자 내려앉는다. 그래서 단추 쪽에는 빈 이름 줄을 같은 꼴로 넣는다.
     #
     # 칸은 여기서 한꺼번에 만들지만 저장 쪽은 아래에서 채운다. 저장을 켜고
     # 끄려면 격자가 '고친 게 있다' 를 알려 줘야 하는데 그건 격자를 그린
     # 뒤에야 안다 -- 그렇다고 단추를 표 아래에 두면 15,000행짜리 표에 밀려
     # 화면 밖으로 나가서, 저장하려고 스크롤을 해야 한다.
-    c_book, c_reset, c_save, c_make, c_get, _gap = st.columns(
-        [2, 1, 1, 1.3, 1.7, 2])
+    c_book, c_reset, c_down, c_up, c_save, _gap = st.columns(
+        [1, 1, 1, 1, 1, 1.6])
     with c_book:
-        book = st.selectbox("관리할 파일", books, key="im_book_pick")
+        _row_label("관리 파일")
+        book = st.selectbox("관리 파일", books, key="im_book_pick", **_NO_LABEL)
     with c_reset:
-        st.write("")
+        _row_label()
         reload_now = st.button("초기화", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다. 이전 파일의 미저장 수정은
     # 들고 가지 않는다 -- 시트 이름이 겹칠 때 엉뚱한 표에 얹히기 때문이다.
     if reload_now or st.session_state.get(S_BOOK) != book:
-        # 만들어 둔 내려받기 파일은 버린다. 안 그러면 파일을 바꿔 골랐는데
-        # 이전 파일 내용이 담긴 버튼이 그대로 남는다.
-        st.session_state.pop(S_DOWNLOAD, None)
         _load(book)
         if reload_now:
             st.rerun()
 
-    sheets: dict[str, pd.DataFrame] = st.session_state[S_SHEETS]
-    if not sheets:
+    shown: dict[str, pd.DataFrame] = st.session_state[S_SHOWN]
+    if not shown:
         st.warning(f"'{book}' 에 시트가 없습니다.")
         return
 
@@ -1287,48 +1306,67 @@ def show_input_manage() -> None:
 
     user_id = st.session_state.get("user_id") or "unknown"
     got = sheet_grid(
-        sheets,
+        shown,
         version=f"{book}|{st.session_state[S_STAMP]}|{st.session_state[S_NONCE]}",
         key="im_grid",
         want_full=st.session_state.get(S_WANT, ""),
     )
-    dirty = bool(got.get("dirty"))
+    # 업로드한 내용도 '아직 저장 안 한 수정' 이다. 격자는 새로 받은 판을
+    # 깨끗한 것으로 치므로 그것만 보면 저장 단추가 안 켜진다.
+    uploaded = bool(st.session_state.get(S_UPLOADED))
+    dirty = bool(got.get("dirty")) or uploaded
     _take_full(got, book)
 
+    with c_down:
+        _row_label()
+        st.download_button(
+            "엑셀 다운로드", st.session_state.get(S_RAW) or b"",
+            file_name=f"{book}.xlsx", **_WIDE,
+            help="엑셀 파일을 내려받습니다.(저장 하지 않은 수정 내용 미포함)",
+            mime="application/vnd.openxmlformats-officedocument."
+                 "spreadsheetml.sheet")
+    with c_up:
+        _row_label()
+        if st.button("엑셀 업로드", **_WIDE,
+                     help="많은 내용을 한 번에 바꿀 때. 내려받아 고친 엑셀을 "
+                          "올리면 화면이 그 내용으로 바뀝니다. 저장을 눌러야 "
+                          "S3 에 들어갑니다"):
+            st.session_state[S_UPLOAD] = True
+            st.rerun()
     with c_save:
-        st.write("")
+        _row_label()
         if st.button("저장", type="primary", disabled=not dirty, **_WIDE,
                      help=("S3 의 이 엑셀을 지금 화면의 값으로 바꿉니다"
                            if dirty else "고친 것이 있어야 켜집니다")):
             _ask_full("save")
-    with c_make:
-        st.write("")
-        if st.button("엑셀 만들기", **_WIDE,
-                     help="지금 화면의 값(저장 안 한 수정 포함)으로 엑셀 파일을 "
-                          "만들어 내려받습니다. S3 는 안 바뀝니다"):
-            _ask_full("download")
-    with c_get:
-        ready = st.session_state.get(S_DOWNLOAD)
-        if ready:
-            st.write("")
-            st.download_button(f"⬇ {ready[0]}", ready[1], file_name=ready[0],
-                               **_WIDE,
-                               mime="application/vnd.openxmlformats-officedocument."
-                                    "spreadsheetml.sheet")
 
     with status:
         if st.session_state.get(S_WANT):
             st.caption("표를 받아오는 중입니다...")
+        elif uploaded:
+            st.info("올린 엑셀의 내용이 화면에 들어왔습니다. 아직 저장 전입니다 "
+                    "— 저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
         elif dirty:
             st.info("저장하지 않은 수정이 있습니다. "
                     "저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
         else:
             st.caption("고친 것 없음 — 칸을 고치면 저장 단추가 켜집니다")
 
+    if st.session_state.get(S_UPLOAD):
+        _upload(book)
     if st.session_state.get(S_REVIEW):
         _review(book, user_id)
 
     _show_history(book)
+
+
+def _row_label(text: str = "") -> None:
+    """한 줄에 놓인 칸들의 높이를 맞추는 이름 줄.
+
+    글자가 없어도 자리는 차지해야 한다 -- 고르개에만 이름이 붙으면 그 칸만
+    이름 높이만큼 내려앉아 단추들과 밑줄이 안 맞는다.
+    """
+    st.markdown(f"**{text}**" if text else "&nbsp;", unsafe_allow_html=True)
 
 
 def _ask_full(what: str) -> None:
@@ -1351,16 +1389,80 @@ def _take_full(got: dict, book: str) -> None:
     st.session_state.pop(S_WANT, None)
     edited = to_frames(got)
     st.session_state[S_EDITED] = edited
-    what = st.session_state.pop(S_PENDING, None)
-    if what == "download":
-        kept, _lost = surviving_formulas(
-            st.session_state[S_SHEETS], edited,
-            st.session_state.get(S_FORMULAS, {}))
-        st.session_state[S_DOWNLOAD] = (f"{book}.xlsx", to_xlsx(edited, kept))
-    elif what == "save":
+    if st.session_state.pop(S_PENDING, None) == "save":
         st.session_state[S_REVIEW] = workbook_changes(
             st.session_state[S_SHEETS], edited)
     st.rerun()
+
+
+def _upload(book: str) -> None:
+    """내려받아 고친 엑셀을 올려 화면 값으로 삼는다."""
+    if _HAS_DIALOG:
+        kw = ({"width": "large"}
+              if "width" in inspect.signature(st.dialog).parameters else {})
+        st.dialog("엑셀 업로드", **kw)(_upload_body)(book)
+    else:
+        with st.container(border=True):
+            _upload_body(book)
+
+
+def _upload_body(book: str) -> None:
+    st.markdown(
+        "많은 내용을 한 번에 바꿀 때 씁니다. **엑셀 다운로드**로 받아 엑셀에서"
+        " 고친 뒤 여기에 올리면, 그 내용이 화면에 그대로 들어옵니다.\n\n"
+        "올린다고 저장되는 것은 아닙니다. **저장**을 눌러야 S3 에 들어가고,"
+        " 그때 무엇이 바뀌는지 여느 때처럼 먼저 보여 드립니다.")
+
+    got = st.file_uploader("올릴 엑셀 파일", type=["xlsx"], key="im_upload_file")
+    if got is not None:
+        formulas: dict = {}
+        try:
+            sheets = read_xlsx(got.getvalue(), formulas)
+        except BadWorkbook as err:
+            st.error(f"엑셀로 읽지 못했습니다: {err}")
+            sheets = None
+        except Exception as err:
+            st.error(f"읽는 중에 문제가 생겼습니다: {err}")
+            sheets = None
+
+        if sheets:
+            st.caption(" · ".join(f"{n} {len(df)}행 x {len(df.columns)}열"
+                                  for n, df in sheets.items()))
+            here = set(st.session_state[S_SHEETS])
+            there = set(sheets)
+            # 시트 구성이 다르면 통째로 갈아엎는 셈이다. 막지는 않는다 --
+            # 일부러 시트를 더하거나 뺄 수도 있다 -- 대신 눈에 띄게 알린다.
+            if here != there:
+                gone, fresh = sorted(here - there), sorted(there - here)
+                said = []
+                if gone:
+                    said.append("없어지는 시트: " + ", ".join(gone))
+                if fresh:
+                    said.append("새로 생기는 시트: " + ", ".join(fresh))
+                st.warning("지금 파일과 시트 구성이 다릅니다 — " + " / ".join(said))
+
+            ok, cancel, _gap = st.columns([1, 1, 3])
+            with ok:
+                if st.button("화면에 넣기", type="primary", **_WIDE):
+                    st.session_state[S_SHOWN] = sheets
+                    st.session_state[S_FORMULAS] = formulas
+                    st.session_state[S_UPLOADED] = True
+                    # 판 번호를 올려야 격자가 새 값으로 다시 그려진다
+                    st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
+                    for key in (S_UPLOAD, S_EDITED, "im_upload_file"):
+                        st.session_state.pop(key, None)
+                    st.rerun()
+            with cancel:
+                if st.button("취소", **_WIDE):
+                    for key in (S_UPLOAD, "im_upload_file"):
+                        st.session_state.pop(key, None)
+                    st.rerun()
+            return
+
+    if st.button("닫기", **_WIDE):
+        for key in (S_UPLOAD, "im_upload_file"):
+            st.session_state.pop(key, None)
+        st.rerun()
 
 
 def _review(book: str, user_id: str) -> None:
@@ -1398,11 +1500,12 @@ def _review_body(book: str, user_id: str) -> None:
                 [{"": r["kind"], "행": r["row"], **r["values"]}
                  for r in info["rows"]]).set_index(""))
         if info["total"] > len(info["rows"]):
-            st.caption(f"…외 {info['total'] - len(info['rows'])}줄은 접었습니다. "
-                       f"전부 보려면 '엑셀 만들기' 로 받아서 비교하세요.")
+            st.caption(f"…외 {info['total'] - len(info['rows'])}줄은 접었습니다.")
 
+    # 수식의 자리는 '화면에 띄운 판' 기준이다 (엑셀을 올렸으면 그 판).
+    # 무엇이 바뀌었나는 'S3 에 있는 판' 기준이고, 둘은 다를 수 있다.
     kept, lost = surviving_formulas(
-        st.session_state[S_SHEETS], edited, st.session_state.get(S_FORMULAS, {}))
+        st.session_state[S_SHOWN], edited, st.session_state.get(S_FORMULAS, {}))
     if lost:
         st.warning(
             "**수식이 사라집니다** — "
@@ -1416,7 +1519,7 @@ def _review_body(book: str, user_id: str) -> None:
 
     st.divider()
 
-    cols = rev_columns(st.session_state[S_SHEETS])
+    cols = rev_columns(st.session_state[S_SHOWN])
     if cols is None:
         st.caption(f"이 파일에는 `{REV_SHEET}` 시트가 없어 변경 사유는 안 받습니다.")
         remark = link = ""
@@ -1473,13 +1576,11 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
         st.error(f"저장하지 못했습니다: {err}\n\n"
                  f"S3 의 값은 그대로입니다. 고친 내용은 화면에 남아 있습니다.")
         return
-    # 새 판을 원본으로 삼는다. 판 번호가 바뀌므로 격자도 이 값으로 다시
-    # 그려지고, '고친 칸' 은 0 으로 돌아간다.
-    st.session_state[S_SHEETS] = {k: v.copy() for k, v in edited.items()}
-    st.session_state[S_FORMULAS] = formulas or {}
-    st.session_state[S_STAMP] = stamp
-    st.session_state.pop(S_DOWNLOAD, None)
-    st.session_state.pop(S_EDITED, None)
+    # 저장한 판을 S3 에서 다시 읽어 화면을 맞춘다. 방금 올린 것을 그대로
+    # 화면 값으로 삼을 수도 있지만, 그러면 '엑셀 다운로드' 가 내줄 바이트를
+    # 우리가 또 만들어야 하고 그게 저장된 것과 한 글자라도 다를 수 있다.
+    # S3 에 있는 것이 진짜이므로 그것을 읽는다.
+    _load(book)
     # 다음 저장 때 지난번 사유가 그대로 남아 있으면, 그걸 못 보고 그대로
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):
