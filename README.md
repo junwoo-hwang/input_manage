@@ -208,7 +208,7 @@ render / setComponentValue)만 직접 지킨다.
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 playwright install chromium
-pytest -q            # 174개
+pytest -q            # 176개
 ```
 
 - `tests/test_storage.py` — 저장이 조용히 덮어써지거나 반쯤 되다 말지 않는가

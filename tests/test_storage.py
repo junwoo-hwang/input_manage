@@ -672,3 +672,46 @@ def test_looking_up_in_a_sheet_that_does_not_exist_is_left_alone():
     formulas["B"] = {(0, "c0"): "VLOOKUP(E2,없는시트!$A:$C,3,0)"}
     got = im.refresh_formula_cache(sheets, formulas)
     assert got["B"].loc[0, "c0"] == sheets["B"].loc[0, "c0"] == ""
+
+
+def test_the_users_actual_formula_shapes_all_recompute():
+    """실제로 받은 네 수식 -- 같은 시트, 같은 범위, 자기 줄의 E열을 키로
+    쓰고 열번호(2 또는 3)와 적힌 자리(A 또는 C)만 다르다."""
+    et = pd.DataFrame([
+        {"코드": "P-01", "b값": "b2", "이름": "이름2"},
+        {"코드": "P-02", "b값": "b3", "이름": "이름3"},
+    ], dtype=object)
+    main = pd.DataFrame({"A": ["", ""], "B": ["x", "y"], "C": ["", ""],
+                         "D": ["p", "q"], "E": ["P-01", "P-02"]}, dtype=object)
+    formulas = {"Main": {
+        (0, "C"): "VLOOKUP(E2,ET추출여부!$A:$C,3,0)",
+        (0, "A"): "VLOOKUP(E2,ET추출여부!$A:$C,2,0)",
+        (1, "A"): "VLOOKUP(E3,ET추출여부!$A:$C,2,0)",
+        (1, "C"): "VLOOKUP(E3,ET추출여부!$A:$C,3,0)",
+    }}
+    et2 = et.copy()
+    et2.loc[0, "이름"] = "새이름2"
+    et2.loc[1, "b값"] = "새b3"
+    got = im.refresh_formula_cache({"ET추출여부": et2, "Main": main}, formulas)
+    assert got["Main"].loc[0, "C"] == "새이름2"
+    assert got["Main"].loc[0, "A"] == "b2"          # 안 바뀐 값은 그대로
+    assert got["Main"].loc[1, "A"] == "새b3"
+    assert got["Main"].loc[1, "C"] == "이름3"
+
+
+def test_a_blank_gap_above_the_formula_does_not_confuse_the_cached_value():
+    """빈 줄이 위에서 빠지면 그 아래 줄들이 저장 파일에서 자리가 당겨진다
+    (_clean 이 늘 그래 왔다). 캐시 값은 그래도 맞아야 한다 -- 자리가
+    당겨지기 전의 원래 자리를 기준으로 계산하기 때문이다.
+    """
+    # DataFrame 의 칸은 실제 엑셀 열(A,B,C,D,E...) 과 자리가 그대로
+    # 맞아야 한다 -- 읽을 때 건너뛴 열은 'Unnamed: N' 으로 자리를 채워 두는
+    # 것이 그래서다.
+    et = pd.DataFrame([{"코드": "P-01", "b값": "b", "이름": "이름1"}], dtype=object)
+    main = pd.DataFrame({
+        "A": ["", "", ""], "B": ["", "", "y"], "C": ["", "", ""], "D": ["", "", ""],
+        "E": ["", "", "P-01"],                   # 첫 두 줄은 통째로 빈 줄
+    }, dtype=object)
+    formulas = {"Main": {(2, "A"): "VLOOKUP(E4,ET추출여부!$A:$C,3,0)"}}
+    got = im.refresh_formula_cache({"ET추출여부": et, "Main": main}, formulas)
+    assert got["Main"].loc[2, "A"] == "이름1"
