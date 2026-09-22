@@ -643,8 +643,13 @@ def to_xlsx(sheets: dict[str, pd.DataFrame],
     formulas 는 {시트이름: {(줄, 칸이름): '수식'}}. 그 칸은 값 대신 수식으로
     나간다 -- 안 그러면 VLOOKUP 이 걸려 있던 칸이 마지막으로 계산된 값으로
     굳어 버린다.
+
+    같이 적어 두는 캐시 값(=엑셀이 열 때까지 화면에 보여줄 값이자, 이 파일을
+    pandas 등으로 직접 읽는 쪽이 곧이곧대로 가져가는 값)은 정확매칭 VLOOKUP
+    에 한해 지금 값으로 다시 계산한다 -- refresh_formula_cache 참고.
     """
     formulas = formulas or {}
+    sheets = refresh_formula_cache(sheets, formulas)
     out: dict[str, list[list]] = {}
     out_f: dict[str, dict] = {}
     for name, df in sheets.items():
@@ -818,6 +823,130 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
                     continue            # 같은 자리의 '수정' 으로 이미 셌다
                 add("삭제", i + 1, old_rows[i])
     return out, total
+
+
+# ----------------------------------------------------------------------
+# 정확매칭 VLOOKUP 을 우리가 대신 계산한다
+#
+# 우리는 엑셀이 아니라서 수식을 계산하지 않는다. 그래서 저장할 때 같이
+# 적어 두는 캐시 값은 '마지막으로 엑셀이 계산했을 때' 값 그대로인데, 같은
+# 파일 안의 다른 시트를 고친 뒤에도 그 값이 그대로면 엑셀로 열지 않고
+# pandas 등으로 직접 읽는 쪽은 낡은 값을 그대로 가져간다.
+#
+# VLOOKUP(키, 시트!범위, 열번호, 0) 꼴의 정확매칭만 계산한다. 그 이유:
+#   - 마지막 인자가 0/FALSE 인 정확매칭은 '이 값과 완전히 같은 줄을 찾는다'
+#     는 뜻이라 계산이 명확하다. 근사매칭(정렬돼 있다고 가정하는 것)은
+#     엑셀의 이분 탐색을 그대로 흉내 내야 해서 잘못 계산할 위험이 크다 --
+#     안 하느니만 못하다.
+#   - 다른 함수가 섞였거나 이 꼴에 안 맞으면 계산하지 않는다. 그 칸은
+#     여전히 낡은 채로 남는다 (지금까지와 같다 -- 더 나빠지지 않는다).
+# ----------------------------------------------------------------------
+_NOT_EVALUATED = object()
+
+_VLOOKUP_RE = re.compile(
+    r'^VLOOKUP\(\s*([^,]+?)\s*,\s*([^!,]+)!\$?([A-Za-z]{1,3})\$?\d*'
+    r':\$?([A-Za-z]{1,3})\$?\d*\s*,\s*(\d+)\s*,\s*(?:0|FALSE)\s*\)$',
+    re.IGNORECASE)
+# 첫 인자가 같은 시트의 칸 자리를 가리키는 경우 (E10220 처럼). $ 는 있어도
+# 없어도 된다 -- 엑셀에서 상대/절대 참조 표기 차이일 뿐 우리에겐 같다.
+_CELL_REF_RE = re.compile(r'^\$?([A-Za-z]{1,3})\$?(\d+)$')
+
+
+def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
+                          formulas: dict) -> dict[str, pd.DataFrame]:
+    """VLOOKUP 정확매칭이 걸린 칸의 값을 지금 시트 값으로 다시 계산한다.
+
+    formulas 는 {시트이름: {(줄, 칸이름): '수식'}} (surviving_formulas 가
+    돌려준 것과 같은 꼴). 계산에 성공한 칸만 그 시트의 사본에서 값을
+    바꾸고, 나머지 시트는 원래 것을 그대로 돌려준다 -- 계산 못 한 칸은
+    그대로 낡은 값이 남는다.
+    """
+    if not formulas:
+        return sheets
+    out = dict(sheets)
+    for name, cells in formulas.items():
+        df = out.get(name)
+        if df is None or not cells:
+            continue
+        cols = list(df.columns)
+        touched = None
+        for (row, col), text in cells.items():
+            if col not in cols or row not in df.index:
+                continue
+            got = _eval_vlookup(text, own=df, sheets=out)
+            if got is _NOT_EVALUATED:
+                continue
+            if touched is None:
+                touched = df.copy()
+            touched.at[row, col] = got
+        if touched is not None:
+            out[name] = touched
+    return out
+
+
+def _eval_vlookup(formula: str, own: pd.DataFrame, sheets: dict[str, pd.DataFrame]):
+    """수식 하나를 지금 값으로. 못 하면 _NOT_EVALUATED.
+
+    own 은 이 수식이 들어 있는 시트다 -- 첫 인자(찾을 값)가 칸 자리를
+    가리키면 그 시트에서 값을 가져와야 하므로, 수식을 어느 시트가 들고
+    있는지가 따로 필요하다. sheets 는 VLOOKUP 이 찾아볼 대상 시트를 이름으로
+    꺼내려고 쓴다.
+    """
+    m = _VLOOKUP_RE.match(formula.strip())
+    if not m:
+        return _NOT_EVALUATED
+    lookup_expr, sheet_name, c1, c2, idx = m.groups()
+    target = sheets.get(sheet_name.strip())
+    if target is None:
+        return _NOT_EVALUATED
+    key = _resolve_ref(lookup_expr, own)
+    if key is _NOT_EVALUATED:
+        return _NOT_EVALUATED
+
+    t_cols = list(target.columns)
+    start, end = col_index(c1.upper()), col_index(c2.upper())
+    idx = int(idx)
+    if idx < 1 or idx - 1 > end - start or start >= len(t_cols):
+        return _NOT_EVALUATED
+    pos = start + idx - 1
+    if pos >= len(t_cols):
+        return _NOT_EVALUATED
+    key_col, val_col = t_cols[start], t_cols[pos]
+
+    key_text = str(key).strip()
+    key_series = target[key_col].apply(
+        lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v))
+        else str(v).strip())
+    matches = target.index[key_series == key_text]
+    if len(matches) == 0:
+        return "#N/A"                        # 엑셀도 못 찾으면 이렇게 보여준다
+    found = target.loc[matches[0], val_col]
+    return "" if found is None or (isinstance(found, float) and pd.isna(found)) else found
+
+
+def _resolve_ref(expr: str, own: pd.DataFrame):
+    """VLOOKUP 의 첫 인자를 값으로. 같은 시트의 칸 자리(E10220)면 own 에서
+    그 값을 가져오고, 아니면 글자/수로 적은 값 그대로다.
+
+    참조에 시트 이름이 안 붙어 있으므로(그냥 'E10220') 수식이 든 시트
+    자신을 본다 -- VLOOKUP 의 찾을 값은 대개 자기 줄의 다른 칸이다.
+    """
+    expr = expr.strip()
+    m = _CELL_REF_RE.match(expr)
+    if not m:
+        if expr.startswith('"') and expr.endswith('"') and len(expr) >= 2:
+            return expr[1:-1]
+        return expr
+    letters, excel_row = m.groups()
+    at_row = int(excel_row) - 2          # 머리글이 엑셀 1행이므로 -2
+    cols = list(own.columns)
+    c = col_index(letters.upper())
+    if at_row < 0 or at_row >= len(own) or c >= len(cols):
+        return _NOT_EVALUATED
+    try:
+        return own.iloc[at_row, c]
+    except Exception:
+        return _NOT_EVALUATED
 
 
 def surviving_formulas(before: dict[str, pd.DataFrame],

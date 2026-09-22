@@ -589,3 +589,86 @@ def test_no_copy_no_overwrite():
 def test_downloading_does_not_touch_the_history_folder():
     im.to_xlsx(sheets(S=[{"a": 1}]))
     assert not [k for k in fake_s3.STORE if "/이력/" in k]
+
+
+# --------------------------------------------- VLOOKUP 을 대신 계산한다
+
+def two_sheets():
+    """B 가 ET추출여부 를 정확매칭 VLOOKUP 으로 끌어다 쓴다."""
+    et = pd.DataFrame([
+        {"코드": "P-01", "b": "x", "이름": "가"},
+        {"코드": "P-02", "b": "y", "이름": "나"},
+    ], dtype=object)
+    b = pd.DataFrame({f"c{i}": [""] * 2 for i in range(5)}, dtype=object)
+    b.loc[0, "c4"] = "P-01"
+    b.loc[1, "c4"] = "P-02"
+    formulas = {"B": {(0, "c0"): "VLOOKUP(E2,ET추출여부!$A:$C,3,0)",
+                      (1, "c0"): "VLOOKUP(E3,ET추출여부!$A:$C,3,0)"}}
+    return {"ET추출여부": et, "B": b}, formulas
+
+
+def test_a_lookup_sheet_edit_updates_the_other_sheets_cached_value():
+    """A 를 고쳐 저장하면, pandas 로 그 파일을 직접 읽는 쪽도 새 값을
+    받아야 한다 -- 엑셀로 열어야만 맞는 값을 준다면 파이프라인이 못 쓴다."""
+    sheets, formulas = two_sheets()
+    sheets["ET추출여부"].loc[0, "이름"] = "새이름"
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == "새이름"
+    assert got["B"].loc[1, "c0"] == "나"          # 안 건드린 줄은 그대로
+
+
+def test_no_match_gives_the_excel_error_not_a_stale_value():
+    sheets, formulas = two_sheets()
+    sheets["B"].loc[0, "c4"] = "없는코드"
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == "#N/A"
+
+
+def test_approximate_match_is_left_alone():
+    """근사매칭(정렬을 가정하는 이분 탐색)은 계산을 흉내 내다 잘못 계산할
+    위험이 크다 -- 안 하느니만 못하다. 손대지 않는다."""
+    sheets, formulas = two_sheets()
+    formulas["B"] = {(0, "c0"): "VLOOKUP(E2,ET추출여부!$A:$C,3,TRUE)"}
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == ""      # '가' 로 계산돼 있으면 안 된다
+
+
+def test_other_functions_are_left_alone():
+    sheets, formulas = two_sheets()
+    formulas["B"] = {(0, "c0"): "SUMIF(A:A,\"x\",B:B)"}
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == sheets["B"].loc[0, "c0"] == ""
+
+
+def test_the_recalculated_value_is_what_gets_saved():
+    """실제 저장 경로로: A 를 고쳐 저장하면 파일에 남는 캐시가 새 값이다."""
+    sheets, formulas = two_sheets()
+    sheets["ET추출여부"].loc[0, "이름"] = "새이름"
+    im.save_workbook("T", sheets, "hong", formulas=formulas)
+    raw = fake_s3.STORE["2GAPU/input/T.xlsx"]
+    cached = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)["B"]["A2"].value
+    formula = openpyxl.load_workbook(io.BytesIO(raw))["B"]["A2"].value
+    assert cached == "새이름"
+    assert formula == "=VLOOKUP(E2,ET추출여부!$A:$C,3,0)"
+
+
+def test_the_portal_itself_shows_the_fresh_value_after_saving():
+    sheets, formulas = two_sheets()
+    sheets["ET추출여부"].loc[0, "이름"] = "새이름"
+    im.save_workbook("T", sheets, "hong", formulas=formulas)
+    back = im.load_workbook("T")[0]
+    assert back["B"]["c0"].tolist() == ["새이름", "나"]
+
+
+def test_a_whole_column_range_and_a_bounded_range_both_work():
+    sheets, formulas = two_sheets()
+    formulas["B"][(0, "c0")] = "VLOOKUP(E2,ET추출여부!$A$1:$C$99,3,0)"
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == "가"
+
+
+def test_looking_up_in_a_sheet_that_does_not_exist_is_left_alone():
+    sheets, formulas = two_sheets()
+    formulas["B"] = {(0, "c0"): "VLOOKUP(E2,없는시트!$A:$C,3,0)"}
+    got = im.refresh_formula_cache(sheets, formulas)
+    assert got["B"].loc[0, "c0"] == sheets["B"].loc[0, "c0"] == ""
