@@ -27,9 +27,6 @@ import json
 import io
 import os
 import re
-import subprocess
-import sys
-import tempfile
 import threading
 import zipfile
 from datetime import datetime, time, timedelta, timezone
@@ -61,13 +58,6 @@ FOLDER_PATH = os.getenv("INPUT_S3_PREFIX", "2GAPU/input").strip("/")
 S3_ENDPOINT = os.getenv("INPUT_S3_ENDPOINT", "http://s3.dataplatform.samsungds.net:9020")
 # 저장할 때마다 사본을 쌓아 두는 폴더 (기준 정보 폴더 바로 아래)
 HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
-# 저장이 끝날 때마다 뒤에서 돌리는 코드와, 그게 print 한 것을 쌓는 곳.
-AFTER_SAVE_SCRIPT = Path(os.getenv("INPUT_AFTER_SAVE_SCRIPT")
-                         or Path(__file__).with_name("after_save.py"))
-AFTER_SAVE_LOG = Path(os.getenv("INPUT_AFTER_SAVE_LOG")
-                      or Path(tempfile.gettempdir()) / "input_manage_after_save.log")
-# 저장 완료 창에 적는 말. 위 코드가 도는 데 걸리는 시간이다.
-AFTER_SAVE_NOTE = os.getenv("INPUT_AFTER_SAVE_NOTE", "raw data 반영까지 20분 정도 소요")
 
 _client_lock = threading.Lock()
 _client = None
@@ -813,74 +803,6 @@ def _safe(text: str) -> str:
     """
     kept = "".join(c for c in str(text or "") if c.isalnum() or c in "-_.")
     return kept.strip(".")[:40] or "unknown"
-
-
-# ----------------------------------------------------------------------
-# 저장이 끝난 뒤 after_save.py 를 뒤에서 돌린다.
-#
-# 그 코드는 20분쯤 걸린다. 화면에서 기다리면 그동안 아무것도 못 하므로 따로
-# 띄우고(subprocess) 곧바로 돌아온다.
-#
-# 같은 파일을 연달아 저장하면 두 개가 겹쳐 돌면서 같은 raw data 를 동시에 쓸
-# 수 있다. 그래서 파일마다 하나씩만 돌리고, 도는 중에 또 저장하면 '끝나면 한
-# 번 더' 만 적어 둔다. 그 사이 몇 번을 저장했든 한 번이고, 가장 최근 저장한
-# 판으로 돈다 -- 그 한 번이 가장 최근 값을 반영하므로 중간 판들은 돌 필요가 없다.
-#
-# 이 셈은 서버 안에만 있다. 서버가 다시 뜨면 돌던 것과 '한 번 더' 는 잊는다.
-# ----------------------------------------------------------------------
-_after_lock = threading.Lock()
-_after: dict[str, dict] = {}     # 파일 -> {"proc": 도는 것, "next": 다음에 돌 인자}
-
-
-def run_after_save(book: str, user: str, stamp: str) -> None:
-    """저장이 끝났다고 알린다. after_save.py 를 뒤에서 돌리고 기다리지 않는다.
-
-    못 띄우면 OSError 를 던진다 (저장 자체는 이미 끝났다).
-    """
-    args = (book, _key(f"{book}.xlsx"), user, stamp)
-    with _after_lock:
-        slot = _after.setdefault(book, {"proc": None, "next": None})
-        if slot["proc"] is not None:
-            slot["next"] = args          # 도는 중이다. 끝나면 이걸로 한 번 더.
-            return
-        slot["proc"] = _spawn_after(args)
-    threading.Thread(target=_watch_after, args=(book,), daemon=True).start()
-
-
-def _spawn_after(args: tuple) -> subprocess.Popen:
-    log = open(AFTER_SAVE_LOG, "a", encoding="utf-8")
-    log.write(f"\n===== {datetime.now(KST):%Y-%m-%d %H:%M:%S} "
-              f"{' '.join(map(str, args))}\n")
-    log.flush()
-    extra = {}
-    if os.name == "nt":                  # 윈도우에서 까만 창이 뜨지 않게
-        extra["creationflags"] = subprocess.CREATE_NO_WINDOW
-    try:
-        return subprocess.Popen(
-            [sys.executable, str(AFTER_SAVE_SCRIPT), *map(str, args)],
-            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **extra)
-    finally:
-        log.close()                      # 자식이 제 것을 들고 있다
-
-
-def _watch_after(book: str) -> None:
-    """돌던 것이 끝나기를 기다렸다가, 그 사이 저장이 또 있었으면 한 번 더."""
-    while True:
-        with _after_lock:
-            proc = _after[book]["proc"]
-        proc.wait()
-        with _after_lock:
-            slot = _after[book]
-            args, slot["next"] = slot["next"], None
-            if args is None:
-                slot["proc"] = None
-                return
-            try:
-                slot["proc"] = _spawn_after(args)
-            except OSError:
-                slot["proc"] = None
-                return
 
 
 def to_xlsx(sheets: dict[str, pd.DataFrame],
@@ -2112,15 +2034,7 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):
         st.session_state.pop(key, None)
-    # raw data 반영 코드를 뒤에서 돌린다. 못 띄워도 저장은 이미 끝났으므로
-    # 저장 완료는 그대로 알리고, 못 띄운 것을 같이 적는다.
-    try:
-        run_after_save(book, user_id, done.stamp)
-        after_err = ""
-    except Exception as err:
-        after_err = str(err)
-    st.session_state[S_TOAST] = {"book": book, "user": user_id,
-                                 "after_err": after_err}
+    st.session_state[S_TOAST] = {"book": book, "user": user_id}
     st.rerun()
 
 
@@ -2145,11 +2059,6 @@ def _forget_saved() -> None:
 
 
 def _saved_body(done: dict) -> None:
-    if done.get("after_err"):
-        st.warning("raw data 반영 코드를 띄우지 못했습니다 -- 반영되지 않습니다.\n\n"
-                   f"{done['after_err']}")
-    else:
-        st.markdown(f"**{AFTER_SAVE_NOTE}**")
     st.caption(f"{done['book']} · {done['user']}")
     if _HAS_DIALOG and st.button("확인", type="primary", **_WIDE):
         _forget_saved()

@@ -24,11 +24,6 @@ sync_playwright = pytest.importorskip(
 ).sync_playwright
 
 
-# 저장 뒤 raw data 반영 코드(after_save.py)가 돈 기록. 검사용 서버가 여기에 쓴다.
-import tempfile
-AFTER_LOG = Path(tempfile.mkdtemp()) / "after_save.log"
-
-
 def _free_port():
     with socket.socket() as sock:
         sock.bind(("", 0))
@@ -42,8 +37,7 @@ def server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env=dict(os.environ, INPUT_AFTER_SAVE_LOG=str(AFTER_LOG)))
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     url = f"http://localhost:{port}/"
     for _ in range(120):
         try:
@@ -1124,34 +1118,23 @@ def test_pressing_save_twice_quickly_saves_once(slow_server, page):
         pg.close()
 
 
-# --------------------------------------------- 저장 완료 창, raw data 반영
+# ------------------------------------------------------- 저장 완료 창
 
-def test_saving_says_so_and_starts_the_raw_data_job(page):
-    """저장이 끝나면 '저장 완료!' 창에 반영까지 걸리는 시간을 알리고,
-    뒤에서 after_save.py 를 그 파일/사람/판으로 돌린다."""
+def test_saving_says_save_complete(page):
+    """저장이 끝나면 '저장 완료!' 창이 뜬다."""
     reset(page)
-    had = AFTER_LOG.read_text(encoding="utf-8") if AFTER_LOG.exists() else ""
     click_cell(page, 0, 2)
-    page.keyboard.type("반영시험")
+    page.keyboard.type("완료창")
     page.keyboard.press("Enter")
     wait_dirty(page)
     open_review(page, table=False)
-    page.get_by_label("Remark — 사유").fill("raw data")
+    page.get_by_label("Remark — 사유").fill("완료")
     page.get_by_role("button", name="저장", exact=True).last.click()
     page.wait_for_function(
         "() => document.body.innerText.includes('저장 완료!')", timeout=60000)
     box = page.locator("[role='dialog']").inner_text()
-    assert "raw data 반영까지 20분 정도 소요" in box, box
-
-    now = had
-    for _ in range(40):                      # 뒤에서 돌므로 조금 늦게 적힌다
-        now = AFTER_LOG.read_text(encoding="utf-8") if AFTER_LOG.exists() else ""
-        if len(now) > len(had):
-            break
-        page.wait_for_timeout(250)
-    new = now[len(had):]
-    assert f"{BOOK} 2GAPU/input/{BOOK}.xlsx hong " in new, new
-
+    assert "저장 완료!" in box and BOOK in box, box
+    assert "raw data" not in box, "반영 안내는 뺐다"
     page.get_by_role("button", name="확인").click()
     page.wait_for_function(
         "() => !document.body.innerText.includes('저장 완료!')", timeout=30000)
