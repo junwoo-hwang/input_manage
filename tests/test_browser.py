@@ -24,6 +24,11 @@ sync_playwright = pytest.importorskip(
 ).sync_playwright
 
 
+# 저장 뒤 raw data 반영 코드(after_save.py)가 돈 기록. 검사용 서버가 여기에 쓴다.
+import tempfile
+AFTER_LOG = Path(tempfile.mkdtemp()) / "after_save.log"
+
+
 def _free_port():
     with socket.socket() as sock:
         sock.bind(("", 0))
@@ -37,7 +42,8 @@ def server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, INPUT_AFTER_SAVE_LOG=str(AFTER_LOG)))
     url = f"http://localhost:{port}/"
     for _ in range(120):
         try:
@@ -128,7 +134,7 @@ def review_text(page):
 
 
 def confirm_save(page, remark="사유"):
-    """저장 -> 사유 적기 -> 진짜 저장. '저장했습니다' 가 뜰 때까지 기다린다.
+    """저장 -> 사유 적기 -> 진짜 저장. '저장 완료!' 창이 뜨면 닫는다.
 
     적자마자 바로 누른다. 사람이 그렇게 하기 때문이다 -- 칸을 떠나라고
     Tab 을 눌러 주거나 한 박자 기다려 주지 않는다.
@@ -138,8 +144,19 @@ def confirm_save(page, remark="사유"):
     open_review(page, table=False)
     page.get_by_label("Remark — 사유").fill(remark)
     page.get_by_role("button", name="저장", exact=True).last.click()
+    wait_saved(page)
+
+
+def wait_saved(page):
+    """'저장 완료!' 창이 뜰 때까지 기다렸다가 확인을 눌러 닫는다.
+
+    창을 닫아 두어야 뒤이은 검사가 격자를 누를 수 있다 (창이 가린다).
+    """
     page.wait_for_function(
-        "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+        "() => document.body.innerText.includes('저장 완료!')", timeout=60000)
+    page.get_by_role("button", name="확인").click()
+    page.wait_for_function(
+        "() => !document.body.innerText.includes('저장 완료!')", timeout=30000)
 
 
 def paste(page, text):
@@ -663,7 +680,7 @@ def test_saving_needs_a_reason(page):
     page.get_by_role("button", name="저장", exact=True).last.click()
     page.wait_for_timeout(2000)
     assert "Remark 를 적어야" in review_text(page), review_text(page)
-    assert "저장했습니다" not in page.inner_text("body"), "사유 없이 저장됐습니다"
+    assert "저장 완료!" not in page.inner_text("body"), "사유 없이 저장됐습니다"
     page.get_by_role("button", name="취소").click()
     page.wait_for_timeout(600)
 
@@ -683,8 +700,7 @@ def test_one_click_saves_right_after_typing_the_reason(page):
     open_review(page, table=False)
     page.get_by_label("Remark — 사유").fill("한 번에")
     page.get_by_role("button", name="저장", exact=True).last.click()   # 한 번만
-    page.wait_for_function(
-        "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+    wait_saved(page)
     settle(page)
     assert "한번에저장" in [v for row in table(page)["rows"] for v in row]
 
@@ -1090,8 +1106,7 @@ def test_the_save_button_greys_out_the_moment_you_press_it(slow_server, page):
         assert busy.is_disabled(), "저장하는 동안 단추가 켜져 있습니다"
         assert pg.get_by_role("button", name="취소").is_disabled()
         assert pg.get_by_label("Remark — 사유").is_disabled()
-        pg.wait_for_function(
-            "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+        wait_saved(pg)
     finally:
         pg.close()
 
@@ -1102,9 +1117,70 @@ def test_pressing_save_twice_quickly_saves_once(slow_server, page):
     pg, before = _open_on(page, slow_server)
     try:
         pg.get_by_role("button", name="저장", exact=True).last.dblclick()
-        pg.wait_for_function(
-            "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+        wait_saved(pg)
         pg.wait_for_timeout(4000)                # 두 번째 누름이 뭔가 한다면 이 사이에
         assert _rev_lines(pg) == before + 1
     finally:
         pg.close()
+
+
+# --------------------------------------------- 저장 완료 창, raw data 반영
+
+def test_saving_says_so_and_starts_the_raw_data_job(page):
+    """저장이 끝나면 '저장 완료!' 창에 반영까지 걸리는 시간을 알리고,
+    뒤에서 after_save.py 를 그 파일/사람/판으로 돌린다."""
+    reset(page)
+    had = AFTER_LOG.read_text(encoding="utf-8") if AFTER_LOG.exists() else ""
+    click_cell(page, 0, 2)
+    page.keyboard.type("반영시험")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page, table=False)
+    page.get_by_label("Remark — 사유").fill("raw data")
+    page.get_by_role("button", name="저장", exact=True).last.click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('저장 완료!')", timeout=60000)
+    box = page.locator("[role='dialog']").inner_text()
+    assert "raw data 반영까지 20분 정도 소요" in box, box
+
+    now = had
+    for _ in range(40):                      # 뒤에서 돌므로 조금 늦게 적힌다
+        now = AFTER_LOG.read_text(encoding="utf-8") if AFTER_LOG.exists() else ""
+        if len(now) > len(had):
+            break
+        page.wait_for_timeout(250)
+    new = now[len(had):]
+    assert f"{BOOK} 2GAPU/input/{BOOK}.xlsx hong " in new, new
+
+    page.get_by_role("button", name="확인").click()
+    page.wait_for_function(
+        "() => !document.body.innerText.includes('저장 완료!')", timeout=30000)
+
+
+def test_the_save_complete_popup_stays_until_closed_and_then_stays_closed(page):
+    """띄우면서 치우면 격자가 새 판을 받았다고 알려 오는 다음 판에서 창이
+    저절로 닫힌다 (눈 깜짝할 새 번쩍였다 사라진다). 닫은 뒤에는 칸을
+    고쳐서 다시 그려도 되살아나면 안 된다."""
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("창유지")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page, table=False)
+    page.get_by_label("Remark — 사유").fill("창")
+    page.get_by_role("button", name="저장", exact=True).last.click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('저장 완료!')", timeout=60000)
+    page.wait_for_timeout(4000)
+    assert "저장 완료!" in page.inner_text("body"), "창이 저절로 닫혔습니다"
+
+    page.keyboard.press("Escape")                 # X 로 닫는 것과 같다
+    page.wait_for_function(
+        "() => !document.body.innerText.includes('저장 완료!')", timeout=30000)
+    settle(page)
+    click_cell(page, 1, 2)
+    page.keyboard.type("다시그림")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    page.wait_for_timeout(1500)
+    assert "저장 완료!" not in page.inner_text("body"), "닫은 창이 되살아났습니다"

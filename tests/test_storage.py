@@ -837,3 +837,92 @@ def test_recalculating_a_whole_sheet_of_formulas_is_not_quadratic():
     assert got["Main"].loc[n - 1, "A"] == f"b{n - 1}"
     # 표를 한 번만 뒤집으면 0.2초쯤, 수식마다 훑으면 3초가 넘는다.
     assert spent < 1.5, f"{spent:.1f}초 걸렸습니다 -- 찾을 표를 또 훑고 있습니다"
+
+
+# ------------------------------------------- 저장 뒤 raw data 반영 코드 돌리기
+
+@pytest.fixture
+def after_script(tmp_path, monkeypatch):
+    """받은 인자를 파일에 적고 잠깐 도는 가짜 after_save.py."""
+    out = tmp_path / "ran.txt"
+    script = tmp_path / "after_save.py"
+    script.write_text(
+        "import sys, time\n"
+        f"open({str(out)!r}, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('반영 중', sys.argv[1])\n"
+        "time.sleep(float(__import__('os').environ.get('AFTER_SLEEP', '0')))\n",
+        encoding="utf-8")
+    monkeypatch.setattr(im, "AFTER_SAVE_SCRIPT", script)
+    monkeypatch.setattr(im, "AFTER_SAVE_LOG", tmp_path / "after.log")
+    im._after.clear()
+    yield out
+    im._after.clear()
+
+
+def _wait_done(book, limit=20.0):
+    import time
+    end = time.time() + limit
+    while time.time() < end:
+        with im._after_lock:
+            slot = im._after.get(book)
+            if slot is None or slot["proc"] is None:
+                return
+        time.sleep(0.05)
+    raise AssertionError("after_save 가 안 끝났습니다")
+
+
+def test_the_raw_data_job_gets_the_file_the_path_the_user_and_the_version(after_script):
+    im.run_after_save("A", "hong", "etag1")
+    _wait_done("A")
+    assert after_script.read_text(encoding="utf-8").split() == [
+        "A", "2GAPU/input/A.xlsx", "hong", "etag1"]
+
+
+def test_the_screen_does_not_wait_for_the_raw_data_job(after_script, monkeypatch):
+    """20분 걸리는 코드다. 저장 완료는 바로 떠야 한다."""
+    import time
+    monkeypatch.setenv("AFTER_SLEEP", "3")
+    start = time.time()
+    im.run_after_save("A", "hong", "etag1")
+    assert time.time() - start < 1.0
+    _wait_done("A")
+
+
+def test_saves_during_a_run_fold_into_one_more_run_with_the_latest(after_script,
+                                                                    monkeypatch):
+    """겹쳐 돌면 같은 raw data 를 둘이 동시에 쓴다. 도는 중에 몇 번을
+    저장했든 끝난 뒤 한 번만, 가장 최근 판으로 더 돈다."""
+    monkeypatch.setenv("AFTER_SLEEP", "1.5")
+    im.run_after_save("A", "hong", "v1")
+    im.run_after_save("A", "kim", "v2")
+    im.run_after_save("A", "lee", "v3")
+    _wait_done("A", limit=30)
+    runs = after_script.read_text(encoding="utf-8").splitlines()
+    assert [r.split()[3] for r in runs] == ["v1", "v3"], runs
+
+
+def test_different_files_run_side_by_side(after_script, monkeypatch):
+    monkeypatch.setenv("AFTER_SLEEP", "1")
+    im.run_after_save("A", "hong", "a1")
+    im.run_after_save("B", "hong", "b1")
+    with im._after_lock:
+        assert im._after["A"]["proc"] is not None
+        assert im._after["B"]["proc"] is not None, "다른 파일까지 줄 세웠습니다"
+    _wait_done("A"); _wait_done("B")
+
+
+def test_what_the_job_prints_lands_in_the_log(after_script, tmp_path):
+    im.run_after_save("A", "hong", "etag1")
+    _wait_done("A")
+    log = (tmp_path / "after.log").read_text(encoding="utf-8")
+    assert "A 2GAPU/input/A.xlsx hong etag1" in log   # 언제 무엇으로 돌았나
+    assert "반영 중 A" in log                          # 그 코드가 print 한 것
+
+
+def test_the_empty_after_save_file_runs_cleanly(tmp_path, monkeypatch):
+    """넣어 둔 빈 파일 그대로도 오류 없이 돌아야 한다."""
+    import subprocess, sys
+    got = subprocess.run([sys.executable, str(Path(im.__file__).with_name("after_save.py")),
+                          "A", "2GAPU/input/A.xlsx", "hong", "etag"],
+                         capture_output=True, text=True, timeout=30)
+    assert got.returncode == 0, got.stderr
