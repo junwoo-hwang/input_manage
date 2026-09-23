@@ -1167,3 +1167,121 @@ def test_the_save_complete_popup_stays_until_closed_and_then_stays_closed(page):
     wait_dirty(page)
     page.wait_for_timeout(1500)
     assert "저장 완료!" not in page.inner_text("body"), "닫은 창이 되살아났습니다"
+
+
+# ------------------------------------------- REV_INFO 는 화면에서 못 고친다
+
+def open_rev_info(page):
+    grid(page).locator(".sheetbar .tab", has_text="REV_INFO").click()
+    page.wait_for_timeout(600)
+
+
+def test_rev_info_cannot_be_edited_in_the_grid(page):
+    """REV_INFO 는 저장할 때 자동으로 한 줄씩 적히는 기록이다. 칸 고치기,
+    지우기, 붙여넣기, 줄 넣기가 전부 먹히지 않아야 하고, 그래서 '고친 것'
+    도 생기지 않아야 한다."""
+    reset(page)
+    open_rev_info(page)
+    assert grid(page).locator("#locknote").is_visible(), "잠겼다는 안내가 없습니다"
+    before = table(page)
+
+    click_cell(page, 0, 1)
+    page.keyboard.type("몰래고침")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(300)
+    click_cell(page, 0, 1)
+    page.keyboard.press("Delete")
+    paste(page, "X\tY")
+    grid(page).locator("#bar [data-act='row-above']").click()
+    page.wait_for_timeout(600)
+
+    assert table(page) == before, "잠긴 시트가 바뀌었습니다"
+    assert grid(page).locator("#val").evaluate("el => el.readOnly"), \
+        "수식 입력줄로 고칠 수 있습니다"
+    page.wait_for_timeout(800)
+    assert "저장하지 않은 수정" not in page.inner_text("body")
+
+
+def test_rev_info_can_still_be_selected_and_copied(page):
+    reset(page)
+    open_rev_info(page)
+    want = table(page)["rows"][0][1]
+    click_cell(page, 0, 1)
+    page.keyboard.press("Control+c")
+    page.wait_for_timeout(400)
+    assert page.evaluate("() => navigator.clipboard.readText()") == want
+
+
+def test_rev_info_tab_cannot_be_renamed(page):
+    """이름이 바뀌면 저장할 때 기록을 붙여 적을 시트를 못 찾는다."""
+    reset(page)
+    # 먼저 그 탭을 연다. 안 연 탭을 두 번 누르면 첫 누름에 탭 줄이 새로
+    # 그려져서, 두 번째 누름이 다른 요소에 떨어져 두 번 누른 것으로 안 잡힐
+    # 때가 있다 (검사가 가끔 깨지던 까닭).
+    open_rev_info(page)
+    said = []
+    # 알림창은 받자마자 닫는다. 안 닫으면 두 번 누르기가 그 창이 닫히기를
+    # 기다리며 멈춘다.
+    page.once("dialog", lambda d: (said.append(d.message), d.accept()))
+    grid(page).locator(".sheetbar .tab", has_text="REV_INFO").dblclick()
+    for _ in range(40):
+        if said:
+            break
+        page.wait_for_timeout(100)
+    assert said and "이름을 바꿀 수 없습니다" in said[0], said
+    assert grid(page).locator(".sheetbar .tab", has_text="REV_INFO").count() == 1
+
+
+def test_other_sheets_stay_editable_after_looking_at_rev_info(page):
+    reset(page)
+    open_rev_info(page)
+    grid(page).locator(".sheetbar .tab", has_text="STEP").click()
+    page.wait_for_timeout(600)
+    assert not grid(page).locator("#locknote").is_visible()
+    click_cell(page, 0, 2)
+    page.keyboard.type("다시고침")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    assert table(page)["rows"][0][2] == "다시고침"
+
+
+def test_an_uploaded_rev_info_is_ignored_and_the_log_grows_by_one(tmp_path, page):
+    """고친 REV_INFO 가 든 엑셀을 올려도 기록은 S3 것 그대로에 한 줄만 붙는다."""
+    import openpyxl
+    reset(page)
+    open_rev_info(page)
+    stored = table(page)["rows"]
+
+    b = openpyxl.Workbook()
+    ws = b.active
+    ws.title = "STEP"
+    ws.append(["step_seq", "step_id", "step_desc", "ppid", "사용"])
+    ws.append(["0010", "AA941234TR01", "업로드기록시험", "P-ULY-01", "Y"])
+    rev = b.create_sheet("REV_INFO")
+    rev.append(["Date", "Remark", "user", "관련"])
+    rev.append(["1999-01-01", "위조된 기록", "누군가", ""])
+    path = tmp_path / "기록위조.xlsx"
+    b.save(path)
+
+    reset(page)
+    page.get_by_role("button", name="엑셀 업로드", exact=True).click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('올릴 엑셀 파일')", timeout=30000)
+    page.locator("input[type='file']").set_input_files(str(path))
+    page.wait_for_function(
+        "() => document.body.innerText.includes('화면에 넣기')", timeout=30000)
+    box = page.locator("[role='dialog']").inner_text()
+    assert "올린 파일의 것을 쓰지 않습니다" in box, box
+    page.get_by_role("button", name="화면에 넣기").click()
+    page.wait_for_function(
+        "() => document.body.innerText.includes('올린 엑셀의 내용')", timeout=30000)
+    page.wait_for_timeout(1500)
+    confirm_save(page, remark="업로드 뒤 기록")
+
+    reset(page)
+    open_rev_info(page)
+    now = table(page)["rows"]
+    assert now[:len(stored)] == stored, "S3 의 기록이 바뀌었습니다"
+    assert len(now) == len(stored) + 1, now
+    assert "업로드 뒤 기록" in now[-1]
+    assert not any("위조된 기록" in r for r in now)

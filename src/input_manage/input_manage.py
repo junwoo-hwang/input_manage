@@ -1358,6 +1358,26 @@ def changes_text(changes: dict, limit: int = CELL_MAX) -> str:
     return text
 
 
+def pin_rev_info(sheets: dict[str, pd.DataFrame],
+                 stored: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """REV_INFO 시트는 늘 S3 에 있는 그대로(stored) 둔다.
+
+    그 시트는 저장할 때마다 우리가 한 줄씩 붙여 적는 기록이다. 화면에서
+    고치거나, 고친 엑셀을 올려서 바꾸거나, 그 시트가 빠진 엑셀을 올려서
+    지워지면 기록이 기록이 아니게 된다. 격자에서도 막지만(잠긴 시트) 저장은
+    여기를 거치므로 여기서 한 번 더 막는다.
+
+    그 시트가 이미 있으면 그 자리에, 없어졌으면 맨 뒤에 되살린다. S3 에 원래
+    없던 파일이면 건드리지 않는다.
+    """
+    keep = stored.get(REV_SHEET)
+    if keep is None:
+        return sheets
+    out = dict(sheets)
+    out[REV_SHEET] = keep
+    return out
+
+
 def rev_columns(sheets: dict[str, pd.DataFrame]) -> list[str] | None:
     """REV_INFO 시트의 칸 이름들. 그 시트가 없으면 None."""
     df = sheets.get(REV_SHEET)
@@ -1457,6 +1477,7 @@ def _grid_payload(sheets: dict[str, pd.DataFrame], version: str,
                  for v, gone in zip(row, holes)]
                 for row, holes in zip(arr.tolist(), blank.tolist())]
         payload.append({"name": str(name), "cols": cols, "n": len(rows),
+                        "locked": str(name) == REV_SHEET,
                         "rows_json": json.dumps(rows, ensure_ascii=False,
                                                 separators=(",", ":"))})
     st.session_state[held] = (version, payload)
@@ -1757,7 +1778,8 @@ def _take_full(got: dict, book: str) -> None:
         return
     st.session_state.pop(S_WANT, None)
     try:
-        edited = to_frames(got, st.session_state.get(S_SHOWN))
+        edited = pin_rev_info(to_frames(got, st.session_state.get(S_SHOWN)),
+                              st.session_state[S_SHEETS])
     except ValueError as err:
         st.session_state.pop(S_PENDING, None)
         st.error(f"화면의 표를 받지 못했습니다: {err} 초기화한 뒤 다시 해 주세요.")
@@ -1810,7 +1832,11 @@ def _upload_body(book: str) -> None:
             st.caption(" · ".join(f"{n} {len(df)}행 x {len(df.columns)}열"
                                   for n, df in sheets.items()))
             here = set(st.session_state[S_SHEETS])
-            there = set(sheets)
+            # REV_INFO 는 올린 파일의 것을 쓰지 않으므로 견줄 것이 없다
+            there = set(pin_rev_info(sheets, st.session_state[S_SHEETS]))
+            if REV_SHEET in here:
+                st.caption(f"`{REV_SHEET}` 시트는 올린 파일의 것을 쓰지 않습니다 — "
+                           "저장할 때 자동으로 한 줄씩 적히는 기록이라 그대로 둡니다.")
             # 시트 구성이 다르면 통째로 갈아엎는 셈이다. 막지는 않는다 --
             # 일부러 시트를 더하거나 뺄 수도 있다 -- 대신 눈에 띄게 알린다.
             if here != there:
@@ -1825,7 +1851,8 @@ def _upload_body(book: str) -> None:
             ok, cancel, _gap = st.columns([1, 1, 3])
             with ok:
                 if st.button("화면에 넣기", type="primary", **_WIDE):
-                    st.session_state[S_SHOWN] = sheets
+                    st.session_state[S_SHOWN] = pin_rev_info(
+                        sheets, st.session_state[S_SHEETS])
                     st.session_state[S_FORMULAS] = formulas
                     st.session_state[S_UPLOADED] = True
                     # 판 번호를 올려야 격자가 새 값으로 다시 그려진다
@@ -1930,7 +1957,7 @@ def _review_body(book: str, user_id: str) -> None:
 
     st.divider()
 
-    cols = rev_columns(st.session_state[S_SHOWN])
+    cols = rev_columns(edited)
     # 사유와 단추를 st.form 으로 묶는다. 묶지 않으면 한 글자 칠 때마다,
     # 칸을 떠날 때마다 streamlit 이 스크립트를 처음부터 다시 도는데, 그때마다
     # 15,000행짜리 격자를 다시 내려보내느라 창이 굼떠진다.

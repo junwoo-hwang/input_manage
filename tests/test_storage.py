@@ -353,6 +353,30 @@ def rev_book():
                 dtype=object)}
 
 
+def test_rev_info_is_always_the_stored_one():
+    """화면이나 업로드로 고친 REV_INFO 는 버리고 S3 에 있는 것을 쓴다."""
+    stored = rev_book()
+    mine = {k: v.copy() for k, v in stored.items()}
+    mine["REV_INFO"].loc[0, "Remark"] = "몰래 고침"
+    got = im.pin_rev_info(mine, stored)
+    assert got["REV_INFO"] is stored["REV_INFO"]
+    assert got["STEP"] is mine["STEP"], "다른 시트는 건드리면 안 된다"
+    assert list(got) == ["STEP", "REV_INFO"], "시트 자리가 바뀌었다"
+
+
+def test_a_rev_info_missing_from_an_upload_comes_back():
+    """REV_INFO 가 빠진 엑셀을 올려도 기록이 지워지면 안 된다."""
+    stored = rev_book()
+    got = im.pin_rev_info({"STEP": frame([["2", "y"]])}, stored)
+    assert list(got) == ["STEP", "REV_INFO"]
+    assert got["REV_INFO"] is stored["REV_INFO"]
+
+
+def test_a_file_without_rev_info_is_left_alone():
+    mine = {"STEP": frame([["1", "x"]])}
+    assert im.pin_rev_info(mine, {"STEP": frame([["1", "x"]])}) is mine
+
+
 def test_rev_columns_are_found():
     assert im.rev_columns(rev_book()) == ["Date", "Remark", "user", "관련"]
 

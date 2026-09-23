@@ -35,6 +35,16 @@
   .bar button[disabled] { opacity: .35; cursor: default; background: transparent;
                           border-color: transparent; }
   .bar button svg { width: 15px; height: 15px; flex: 0 0 15px; }
+
+  /* 잠긴 시트 (REV_INFO -- 저장할 때 자동으로 적힌다). 고칠 수 없다는 것을
+     위에 한 줄로 알리고, 고치는 단추와 차림표 항목은 흐리게 한다. */
+  .locknote { display: none; padding: 4px 8px; margin-bottom: 4px; font-size: 12px;
+              background: #fff6e0; border: 1px solid #f0d58a; border-radius: 3px;
+              color: #6b5000; }
+  body.locked .locknote { display: block; }
+  .locknote.flash { background: #ffe39a; }
+  body.locked .bar button.edit, body.locked .menu .item.edit {
+    opacity: .35; cursor: not-allowed; }
   .bar .sep { width: 1px; height: 18px; background: var(--line); margin: 0 5px; }
   .bar .spring { flex: 1 1 auto; }
 
@@ -180,29 +190,29 @@
     찾기</button>
   <span class="sep"></span>
 
-  <button type="button" data-act="row-above" title="고른 줄 위에 넣기">
+  <button type="button" class="edit" data-act="row-above" title="고른 줄 위에 넣기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M3 15h18M3 20h18M12 3v8M8 7h8"/></svg>
     행 위</button>
-  <button type="button" data-act="row-below" title="고른 줄 아래에 넣기">
+  <button type="button" class="edit" data-act="row-below" title="고른 줄 아래에 넣기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M3 4h18M3 9h18M12 21v-8M8 17h8"/></svg>
     행 아래</button>
-  <button type="button" data-act="row-del" title="고른 줄 지우기">
+  <button type="button" class="edit" data-act="row-del" title="고른 줄 지우기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18M16 9l5 5M21 9l-5 5"/></svg>
     행 삭제</button>
   <span class="sep"></span>
 
-  <button type="button" data-act="col-left" title="고른 칸 왼쪽에 넣기">
+  <button type="button" class="edit" data-act="col-left" title="고른 칸 왼쪽에 넣기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M15 3v18M20 3v18M3 12h8M7 8v8"/></svg>
     열 왼쪽</button>
-  <button type="button" data-act="col-right" title="고른 칸 오른쪽에 넣기">
+  <button type="button" class="edit" data-act="col-right" title="고른 칸 오른쪽에 넣기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M4 3v18M9 3v18M21 12h-8M17 8v8"/></svg>
     열 오른쪽</button>
-  <button type="button" data-act="col-del" title="고른 칸 지우기">
+  <button type="button" class="edit" data-act="col-del" title="고른 칸 지우기">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
          stroke-linecap="round"><path d="M6 3v18M12 3v18M18 3v18M15 8l5 5M20 8l-5 5"/></svg>
     열 삭제</button>
@@ -240,25 +250,26 @@
      조합(composition)으로 들어오는데 그건 편집 가능한 요소에만 온다. 그래서
      늘 이 칸에 초점을 두고, 글자가 들어오는 순간 칸 편집으로 넘긴다. -->
 <input id="ghost" autocomplete="off" aria-hidden="true">
+<div class="locknote" id="locknote">🔒 이 시트는 저장할 때 자동으로 적힙니다. 여기서는 고칠 수 없습니다 (고르기·복사는 됩니다).</div>
 <div class="scroll" id="scroll" tabindex="0"><div class="empty">불러오는 중...</div></div>
 <div class="sheetbar" id="sheetbar"></div>
 
 <!-- 오른쪽 클릭 차림표. 차림표의 모든 항목은 도구 줄이나 단축키로도 되는
      것들이다 -- 오른쪽 클릭은 엑셀에서 손이 먼저 가는 자리라서 같이 둔다. -->
 <div class="menu" id="menu">
-  <div class="item" data-act="cut">잘라내기<span class="key">Ctrl+X</span></div>
+  <div class="item edit" data-act="cut">잘라내기<span class="key">Ctrl+X</span></div>
   <div class="item" data-act="copy">복사<span class="key">Ctrl+C</span></div>
-  <div class="item" data-act="paste">붙여넣기<span class="key">Ctrl+V</span></div>
+  <div class="item edit" data-act="paste">붙여넣기<span class="key">Ctrl+V</span></div>
   <div class="line"></div>
-  <div class="item" data-act="row-above">위에 행 삽입</div>
-  <div class="item" data-act="row-below">아래에 행 삽입</div>
-  <div class="item" data-act="row-del">행 삭제</div>
+  <div class="item edit" data-act="row-above">위에 행 삽입</div>
+  <div class="item edit" data-act="row-below">아래에 행 삽입</div>
+  <div class="item edit" data-act="row-del">행 삭제</div>
   <div class="line"></div>
-  <div class="item" data-act="col-left">왼쪽에 열 삽입</div>
-  <div class="item" data-act="col-right">오른쪽에 열 삽입</div>
-  <div class="item" data-act="col-del">열 삭제</div>
+  <div class="item edit" data-act="col-left">왼쪽에 열 삽입</div>
+  <div class="item edit" data-act="col-right">오른쪽에 열 삽입</div>
+  <div class="item edit" data-act="col-del">열 삭제</div>
   <div class="line"></div>
-  <div class="item" data-act="clear">내용 지우기<span class="key">Delete</span></div>
+  <div class="item edit" data-act="clear">내용 지우기<span class="key">Delete</span></div>
 </div>
 
 <script>
@@ -346,6 +357,22 @@ const sheet = () => {
   return s;
 };
 const rowCount = (s) => (s.rows ? s.rows.length : s.n || 0);
+
+// 잠긴 시트(REV_INFO)는 고칠 수 없다. 저장할 때 파이썬이 한 줄씩 붙여 적는
+// 시트라, 여기서 고치면 기록이 기록이 아니게 된다. (파이썬도 저장할 때 이
+// 시트는 S3 에 있는 그대로 쓴다 -- 여기서 막는 것은 헛수고를 막는 것이다.)
+const lockedNow = () => !!(sheets[active] && sheets[active].locked);
+const lockNote = document.getElementById("locknote");
+let flashTimer = null;
+
+// 잠긴 시트면 막고 안내 줄을 한 번 반짝인다. 막았으면 true.
+function refuse() {
+  if (!lockedNow()) return false;
+  lockNote.classList.add("flash");
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => lockNote.classList.remove("flash"), 600);
+  return true;
+}
 const cols = () => sheet().cols;
 const rows = () => sheet().rows;
 
@@ -360,6 +387,7 @@ const rows = () => sheet().rows;
 // 복사해서 고치고 그 자리에 갈아 끼운다 (setCell, ensureCols, 칸 넣고 빼기).
 // 아직 안 푼 시트는 푼 글자(raw)를 그대로 들고 간다
 const copySheet = (s) => ({ name: s.name, orig: s.orig, touched: s.touched,
+                            locked: s.locked,
                             cols: s.cols.slice(), rows: s.rows ? s.rows.slice() : null,
                             raw: s.raw, n: s.n });
 
@@ -454,6 +482,7 @@ function clampSelection() {
 // ===================================================================
 // 표의 뼈대(줄 수, 칸 수, 시트)가 바뀌었을 때만 통째로 다시 만든다.
 function renderAll() {
+  document.body.classList.toggle("locked", lockedNow());
   renderGrid();
   renderSheetBar();
   renderFormula();
@@ -651,6 +680,7 @@ function addrOf(r, c) { return colLetter(c) + (r + 2); }
 function renderFormula() {
   if (!cols().length) { addrBox.textContent = ""; valBox.value = ""; return; }
   addrBox.textContent = addrOf(anchor.r, anchor.c);
+  valBox.readOnly = lockedNow();
   addrBox.title = `${sheet().name} · ${cols()[anchor.c]}`;
   if (document.activeElement !== valBox) valBox.value = cell(anchor.r, anchor.c);
 }
@@ -672,7 +702,7 @@ valBox.addEventListener("keydown", (e) => {
 valBox.addEventListener("blur", commitFormula);
 
 function commitFormula() {
-  if (!cols().length) return;
+  if (!cols().length || lockedNow()) return;
   const text = valBox.value;
   if (text === cell(anchor.r, anchor.c)) return;
   pushUndo();
@@ -782,6 +812,7 @@ function offscreen(td) {
 }
 
 function startEdit(r, c, seed) {
+  if (refuse()) return;
   const td = cellEl(r, c);
   if (!td) return;
   // 칸이 화면 밖이면(스크롤해 두고 글자를 치면) 그 칸으로 데려가야 한다.
@@ -914,6 +945,7 @@ scroll.addEventListener("dblclick", (e) => {
 });
 
 function renameCol(c) {
+  if (refuse()) return;
   const name = window.prompt("칸 이름", cols()[c]);
   if (name === null) return;
   const trimmed = name.trim();
@@ -957,6 +989,10 @@ sheetbar.addEventListener("dblclick", (e) => {
   const tab = e.target.closest(".tab");
   if (!tab) return;
   const i = Number(tab.dataset.i);
+  if (sheets[i].locked) {
+    window.alert(`'${sheets[i].name}' 은(는) 저장할 때 자동으로 적히는 시트라 이름을 바꿀 수 없습니다.`);
+    return;
+  }
   const name = window.prompt("시트 이름", sheets[i].name);
   if (name === null) return;
   const trimmed = name.trim();
@@ -1036,6 +1072,7 @@ function scrollIntoView() {
 }
 
 function clearSelection() {
+  if (refuse()) return;
   const { r0, r1, c0, c1 } = selRange();
   pushUndo();
   for (let r = r0; r <= r1; r++)
@@ -1101,6 +1138,7 @@ document.addEventListener("paste", (e) => {
 });
 
 function pasteTsv(text) {
+  if (refuse()) return;
   // 끝의 줄바꿈 하나는 버린다. 엑셀이 늘 붙여서 주는데, 그대로 두면
   // 붙여넣을 때마다 빈 줄이 하나씩 생긴다.
   const body = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
@@ -1225,10 +1263,11 @@ function doAction(act) {
   if (act === "find") return openFind();
   if (act === "fit") return fitWidths();
   if (act === "copy") return copySelection();
-  if (act === "cut") { copySelection(); clearSelection(); return; }
+  if (act === "cut") { copySelection(); clearSelection(); return; }  // 잠겼으면 복사만 된다
   if (act === "paste") return pasteFromClipboard();
   if (act === "clear") return clearSelection();
   if (!cols().length && act !== "col-right" && act !== "col-left") return;
+  if (refuse()) return;                    // 줄·칸 넣고 빼기
 
   const s = sheet();
   const { r0, r1, c0, c1 } = selRange();
@@ -1382,7 +1421,7 @@ window.addEventListener("message", (event) => {
   // 줄은 시트마다 JSON 글자 하나로 온다. 지금 보는 시트만 바로 풀고 나머지는
   // 그 시트를 처음 열 때 푼다 (loadRows).
   sheets = args.sheets.map(s => ({
-    name: String(s.name), orig: String(s.name), touched: false,
+    name: String(s.name), orig: String(s.name), touched: false, locked: !!s.locked,
     cols: (s.cols || []).map(String), rows: null, raw: s.rows_json || "[]",
     n: s.n || 0,
   }));
