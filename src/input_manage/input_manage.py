@@ -23,6 +23,7 @@ import difflib
 import functools
 import gc
 import inspect
+import json
 import io
 import os
 import re
@@ -1255,6 +1256,9 @@ def surviving_formulas(before: dict[str, pd.DataFrame],
         if old is None or new is None:
             lost[name] = len(want)
             continue
+        if old is new:
+            kept[name] = dict(want)  # 손대지 않은 시트: 수식도 전부 제자리다
+            continue
         cols = list(dict.fromkeys([*map(str, old.columns), *map(str, new.columns)]))
         old_rows = _text_rows(old, cols)
         new_rows = _text_rows(new, cols)
@@ -1302,6 +1306,8 @@ def workbook_changes(before: dict[str, pd.DataFrame],
     out: dict[str, dict] = {}
     for name, df in after.items():
         old = before.get(name)
+        if old is df:
+            continue                 # 격자가 손대지 않은 시트는 같은 표 그대로 온다
         rows, total = row_changes(old, df)
         notes = []
         if old is None:
@@ -1413,28 +1419,74 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
     want_full 은 '지금 표를 통째로 올려달라' 는 표다. 평소에는 빈 글자다 --
     칸 하나 고칠 때마다 15,000행을 통째로 주고받으면 한 번에 2.6초가 걸린다.
     저장할 때처럼 진짜로 값이 필요할 때만 표를 하나 들려 보낸다.
-    """
-    payload = [{
-        "name": str(name),
-        "cols": [str(c) for c in df.columns],
-        "rows": [["" if pd.isna(v) else str(v) for v in row]
-                 for row in df.itertuples(index=False, name=None)],
-    } for name, df in sheets.items()]
 
-    got = _grid(sheets=payload, version=version, max_height=max_height,
+    표는 격자가 이 판을 아직 안 가졌을 때만 내려보낸다. 격자는 올려보낼
+    때마다 자기가 가진 판(have)을 같이 알린다. streamlit 은 컴포넌트에 넘기는
+    값이 하나라도 바뀌면 전부를 다시 보내는데, 저장을 누르면 want_full 이
+    바뀌므로 그때마다 14MB 가 다시 내려갔다. 격자 틀이 새로 만들어져 표를
+    잃었으면 격자가 have 를 비워 올리고, 그러면 다음 판에서 다시 보낸다.
+    """
+    prev = st.session_state.get(key)
+    have = prev.get("have") if isinstance(prev, dict) else None
+    data = None if have == version else _grid_payload(sheets, version, key)
+
+    got = _grid(sheets=data, version=version, max_height=max_height,
                 want_full=want_full, key=key, default=None)
     return got or {}
 
 
+def _grid_payload(sheets: dict[str, pd.DataFrame], version: str,
+                  key: str) -> list[dict]:
+    """격자에 내려보낼 표. 판마다 한 번만 만든다.
+
+    시트마다 줄들을 JSON 글자 하나로 싸 보낸다. 줄과 칸을 그대로 넘기면
+    브라우저가 받는 쪽에서 146만 개의 글자를 하나씩 만들고, 격자 틀로 옮길
+    때 또 하나씩 복사한다. 글자 하나로 넘기면 옮기는 것은 한 번의 복사이고,
+    격자는 지금 보는 시트만 풀면 된다 (나머지는 그 시트를 열 때 푼다).
+    """
+    held = f"_im_grid_payload_{key}"
+    got = st.session_state.get(held)
+    if got is not None and got[0] == version:
+        return got[1]
+    payload = []
+    for name, df in sheets.items():
+        cols = [str(c) for c in df.columns]
+        arr = df.to_numpy(dtype=object)
+        blank = pd.isna(arr)
+        rows = [["" if gone else (v if type(v) is str else str(v))
+                 for v, gone in zip(row, holes)]
+                for row, holes in zip(arr.tolist(), blank.tolist())]
+        payload.append({"name": str(name), "cols": cols, "n": len(rows),
+                        "rows_json": json.dumps(rows, ensure_ascii=False,
+                                                separators=(",", ":"))})
+    st.session_state[held] = (version, payload)
+    return payload
+
+
 @_no_gc
-def to_frames(payload: dict) -> dict[str, pd.DataFrame]:
-    """격자가 올려준 것을 {시트이름: DataFrame} 으로."""
+def to_frames(payload: dict,
+              kept: dict[str, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
+    """격자가 올려준 것을 {시트이름: DataFrame} 으로.
+
+    격자는 손대지 않은 시트는 내용 없이 {"name", "keep": 원래이름} 만 올린다.
+    그 시트는 kept(격자에 내려보냈던 표)에서 그대로 꺼낸다 -- 같은 객체를
+    그대로 쓰므로, 뒤에서 '무엇이 바뀌었나' 를 셀 때 한눈에 안 바뀐 줄 안다.
+    """
+    kept = kept or {}
     out: dict[str, pd.DataFrame] = {}
     for i, sheet in enumerate(payload.get("sheets", []) or []):
         name = str(sheet.get("name") or f"Sheet{i + 1}")
         while name in out:                      # 시트 이름도 겹치면 안 된다
             name += "_"
-        out[name] = _to_frame(sheet)
+        if "keep" in sheet:
+            orig = str(sheet["keep"])
+            if orig not in kept:
+                # 격자와 파이썬이 서로 다른 판을 보고 있다. 없는 시트를
+                # 빈 시트로 채워 저장하면 그 시트가 통째로 지워지므로 멈춘다.
+                raise ValueError(f"'{orig}' 시트의 내용을 찾지 못했습니다.")
+            out[name] = kept[orig]
+        else:
+            out[name] = _to_frame(sheet)
     return out
 
 
@@ -1540,7 +1592,10 @@ def _seed(book: str, raw: bytes, sheets: dict[str, pd.DataFrame],
     st.session_state[S_FORMULAS] = formulas
     st.session_state[S_BOOK] = book
     st.session_state[S_SHEETS] = sheets
-    st.session_state[S_SHOWN] = {k: v.copy() for k, v in sheets.items()}
+    # 사본을 뜨지 않고 같은 표를 가리킨다. 어느 쪽도 그 자리에서 고치지 않고
+    # (고칠 때는 늘 새 표를 만든다), 같은 객체여야 저장할 때 격자가 손대지
+    # 않은 시트를 '안 바뀜' 으로 바로 알아본다.
+    st.session_state[S_SHOWN] = dict(sheets)
     st.session_state[S_STAMP] = stamp
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
     # 다른 파일의 값과 진행 중이던 저장·업로드는 들고 가지 않는다
@@ -1685,7 +1740,12 @@ def _take_full(got: dict, book: str) -> None:
     if not want or not got.get("full") or got.get("token") != want:
         return
     st.session_state.pop(S_WANT, None)
-    edited = to_frames(got)
+    try:
+        edited = to_frames(got, st.session_state.get(S_SHOWN))
+    except ValueError as err:
+        st.session_state.pop(S_PENDING, None)
+        st.error(f"화면의 표를 받지 못했습니다: {err} 초기화한 뒤 다시 해 주세요.")
+        return
     st.session_state[S_EDITED] = edited
     if st.session_state.pop(S_PENDING, None) == "save":
         # 여기서 한 번만 센다. 창이 떠 있는 동안 streamlit 이 스크립트를

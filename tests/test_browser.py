@@ -561,22 +561,49 @@ def test_cutting_from_the_menu_copies_and_clears(page):
 
 # ------------------------------------------------------- 많은 줄 버티기
 
-def test_row_height_matches_what_the_css_promises(page):
-    """줄 높이가 contain-intrinsic-size 와 같은가.
-
-    화면 밖 줄은 배치를 미루고 '25px 쯤 될 것' 이라고만 알려 둔다. 그 값이
-    실제와 다르면 스크롤 막대 길이가 틀어져서, 끝까지 내렸는데 줄이 더
-    남아 있거나 빈 자리가 생긴다. CSS 의 padding 하나만 건드려도 어긋난다.
-    """
+def test_the_last_short_block_promises_its_own_height(page):
+    """시트 끝 묶음은 50줄이 안 찬다. 그 묶음이 미리 알려 주는 높이는 제
+    줄 수만큼이어야 한다 -- 1250px 로 두면 끝에 빈 자리가 생긴다."""
     reset(page)
-    got = grid(page).locator(".tbl .row").first.evaluate("""(el) => ({
-      height: el.getBoundingClientRect().height,
-      promised: getComputedStyle(el).containIntrinsicSize,
-      skipping: getComputedStyle(el).contentVisibility,
+    got = grid(page).locator(".tbl .blk").last.evaluate("""(b) => ({
+      height: b.getBoundingClientRect().height,
+      promised: getComputedStyle(b).containIntrinsicSize,
+      rows: b.querySelectorAll('.row').length,
     })""")
-    assert got["height"] == 25, got
-    assert "25px" in got["promised"], got
-    assert got["skipping"] == "auto", got
+    assert got["rows"] < 50, got
+    assert got["height"] == got["rows"] * 25, got
+    assert f"{got['rows'] * 25}px" in got["promised"], got
+
+
+def test_undo_after_two_edits_in_one_row_goes_back_one_step_at_a_time(page):
+    """되돌리기 판은 줄을 나눠 쓴다. 줄을 그 자리에서 고치면 지난 판까지 같이
+    바뀌어서, 되돌려도 안 돌아가거나 두 걸음이 한꺼번에 사라진다."""
+    reset(page)
+    first = table(page)["rows"][0][:]
+    click_cell(page, 0, 1)
+    page.keyboard.type("하나")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(300)
+    click_cell(page, 0, 2)
+    page.keyboard.type("둘")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(300)
+    row = table(page)["rows"][0]
+    assert row[1] == "하나" and row[2] == "둘", row
+
+    undo = grid(page).locator("button[data-act='undo']")
+    undo.click()
+    page.wait_for_timeout(400)
+    row = table(page)["rows"][0]
+    assert row[1] == "하나" and row[2] == first[2], row
+    undo.click()
+    page.wait_for_timeout(400)
+    assert table(page)["rows"][0] == first
+
+    grid(page).locator("button[data-act='redo']").click()
+    page.wait_for_timeout(400)
+    row = table(page)["rows"][0]
+    assert row[1] == "하나" and row[2] == first[2], row
 
 
 def test_the_grid_is_not_a_table_element(page):
@@ -915,3 +942,84 @@ def test_a_file_that_is_not_an_excel_is_refused(tmp_path, page):
     assert not page.get_by_role("button", name="화면에 넣기").count()
     page.get_by_role("button", name="닫기").click()
     page.wait_for_timeout(800)
+
+
+def test_a_block_of_rows_is_as_tall_as_it_promises(big_page):
+    """줄은 50줄씩 묶어 화면 밖 묶음의 배치를 미룬다. 미루는 동안에는 미리
+    알려 준 높이(1250px)로 자리를 잡으므로, 그 값이 실제 높이와 다르면 스크롤
+    막대 길이가 틀어져 끝까지 내렸는데 줄이 더 남아 있거나 빈 자리가 생긴다.
+    CSS 의 padding 하나만 건드려도 어긋난다."""
+    g = big_page.frame_locator(
+        "iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+    got = g.locator(".tbl .blk").first.evaluate("""(b) => ({
+      height: b.getBoundingClientRect().height,
+      promised: getComputedStyle(b).containIntrinsicSize,
+      skipping: getComputedStyle(b).contentVisibility,
+      rows: b.querySelectorAll('.row').length,
+      rowHeight: b.querySelector('.row').getBoundingClientRect().height,
+    })""")
+    assert got["rowHeight"] == 25, got
+    assert got["rows"] == 50 and got["height"] == 50 * 25, got
+    assert "1250px" in got["promised"], got
+    assert got["skipping"] == "auto", got
+
+
+def test_typing_while_scrolled_away_brings_the_cell_back(big_page):
+    """엑셀처럼, 고른 칸이 화면 밖일 때 글자를 치면 그 칸으로 데려간다.
+    안 그러면 보이지 않는 칸에 글자가 들어간다."""
+    g = big_page.frame_locator(
+        "iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+    g.locator(".cell[data-r='0'][data-c='1']").click()
+    big_page.wait_for_timeout(200)
+    g.locator("#scroll").evaluate("el => { el.scrollTop = 40000; }")
+    big_page.wait_for_timeout(300)
+    big_page.keyboard.type("x")
+    big_page.wait_for_timeout(300)
+    top = g.locator("#scroll").evaluate("el => el.scrollTop")
+    big_page.keyboard.press("Escape")               # 고친 것은 버린다
+    big_page.wait_for_timeout(300)
+    assert top < 1000, f"고치는 칸(맨 위)이 화면 밖에 있습니다: scrollTop={top}"
+
+
+def test_saving_sends_only_the_sheet_you_touched(big_server, page):
+    """3,000줄짜리 STEP 은 그대로 두고 작은 시트 하나만 고쳤으면, 저장할 때
+    오가는 것도 그 한 장이어야 한다. 예전에는 저장을 누를 때마다 파일 전체가
+    브라우저로 한 번 내려오고(누른 표시가 바뀌었다고) 또 전체가 올라갔다."""
+    pg = page.context.new_page()
+    sent, got = [], []
+    pg.on("websocket", lambda ws: (
+        ws.on("framesent", lambda p: sent.append(len(p))),
+        ws.on("framereceived", lambda p: got.append(len(p)))))
+    try:
+        pg.goto(big_server)
+        pg.wait_for_timeout(5000)
+        pg.get_by_role("combobox").click()
+        pg.wait_for_timeout(600)
+        pg.get_by_text(BOOK, exact=True).click()
+        pg.wait_for_function(
+            "() => document.body.innerText.includes('고친 것 없음')", timeout=60000)
+        pg.wait_for_timeout(3000)
+        assert max(got) > 60_000, "처음에는 표가 통째로 내려와야 한다"
+
+        g = pg.frame_locator("iframe[title*='sheet_grid'], iframe[src*='sheet_grid']").first
+        g.locator("#sheetbar .tab", has_text="ITEM").click()
+        pg.wait_for_timeout(500)
+        g.locator(".cell[data-r='0'][data-c='1']").click()
+        pg.keyboard.type("작은시트만")
+        pg.keyboard.press("Enter")
+        pg.wait_for_function(
+            "() => document.body.innerText.includes('저장하지 않은 수정')", timeout=30000)
+        pg.wait_for_timeout(1000)
+
+        sent.clear()
+        got.clear()
+        pg.get_by_role("button", name="저장", exact=True).first.click()
+        pg.wait_for_selector("[role='dialog'] [data-testid='stTable']", timeout=60000)
+        pg.wait_for_timeout(1000)
+        assert "sheet : ITEM" in pg.locator("[role='dialog']").inner_text()
+        assert max(sent) < 20_000, f"안 고친 시트까지 올라갔습니다: {max(sent)} bytes"
+        assert max(got) < 60_000, f"표가 다시 내려왔습니다: {max(got)} bytes"
+        pg.get_by_role("button", name="취소").click()
+        pg.wait_for_timeout(600)
+    finally:
+        pg.close()

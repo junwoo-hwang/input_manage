@@ -82,3 +82,43 @@ def test_two_sheets_with_the_same_name_do_not_swallow_each_other():
     ]})
     assert len(got) == 2, got
     assert got["S"]["a"].tolist() == ["1"]
+
+
+# ------------------------------------------------ 손대지 않은 시트는 안 올라온다
+
+def test_an_untouched_sheet_is_taken_from_what_python_already_has():
+    """격자는 손대지 않은 시트를 내용 없이 이름만 올린다. 파이썬은 내려보냈던
+    그 표를 그대로 쓴다 -- 사본이 아니라 같은 표여야 뒤에서 '안 바뀜' 을
+    한눈에 안다."""
+    step = pd.DataFrame({"a": ["1", "2"]}, dtype=object)
+    got = to_frames({"sheets": [
+        {"name": "STEP", "keep": "STEP"},
+        {"name": "ITEM", "cols": ["b"], "rows": [["고침"]]},
+    ]}, {"STEP": step, "ITEM": pd.DataFrame({"b": ["원래"]}, dtype=object)})
+    assert got["STEP"] is step
+    assert got["ITEM"]["b"].tolist() == ["고침"]
+    assert list(got) == ["STEP", "ITEM"]
+
+
+def test_a_renamed_untouched_sheet_keeps_its_contents_under_the_new_name():
+    step = pd.DataFrame({"a": ["1"]}, dtype=object)
+    got = to_frames({"sheets": [{"name": "공정", "keep": "STEP"}]}, {"STEP": step})
+    assert list(got) == ["공정"] and got["공정"] is step
+
+
+def test_a_kept_sheet_python_does_not_have_stops_the_save():
+    """없는 시트를 빈 시트로 채워 저장하면 그 시트가 통째로 지워진다."""
+    import pytest
+    with pytest.raises(ValueError):
+        to_frames({"sheets": [{"name": "STEP", "keep": "STEP"}]}, {})
+
+
+def test_an_untouched_sheet_is_not_diffed_and_keeps_every_formula():
+    from src.input_manage import input_manage as im
+    step = pd.DataFrame({"a": ["1", "2"]}, dtype=object)
+    before = {"STEP": step}
+    after = to_frames({"sheets": [{"name": "STEP", "keep": "STEP"}]}, before)
+    assert im.workbook_changes(before, after) == {}
+    formulas = {"STEP": {(0, "a"): "VLOOKUP(B2,X!$A:$B,2,0)"}}
+    kept, lost = im.surviving_formulas(before, after, formulas)
+    assert kept == formulas and not lost

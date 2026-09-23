@@ -76,6 +76,10 @@ def seed():
 
 if not fake_s3.STORE:
     seed()
+    # 진짜 크기의 엑셀로 보고 싶을 때:  IM_LOCAL_XLSX=경로 streamlit run app_local.py
+    real = __import__("os").environ.get("IM_LOCAL_XLSX")
+    if real:
+        fake_s3.put_object("2GAPU/input/AAA_REAL.xlsx", Path(real).read_bytes())
 
 from src.input_manage.input_manage import show_input_manage
 
