@@ -16,6 +16,7 @@ from tests import fake_s3
 @pytest.fixture(autouse=True)
 def fake(monkeypatch):
     fake_s3.reset()
+    im._BOOKS.clear()
     monkeypatch.setattr(im, "s3", fake_s3)
     monkeypatch.setattr(im, "FOLDER_PATH", "2GAPU/input")
     return fake_s3
@@ -94,6 +95,64 @@ def test_saving_with_the_returned_stamp_goes_through():
                              base_stamp=stamp).stamp
     im.save_workbook("A", sheets(S=[{"a": 3}]), "hong", base_stamp=stamp)
     assert im.load_workbook("A")[0]["S"]["a"].tolist() == [3]
+
+
+def test_opening_the_same_version_twice_reads_it_once(monkeypatch):
+    """8MB 짜리를 읽는 데 몇 초다. 판이 같으면 다시 읽을 까닭이 없다."""
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    reads, gets = [], []
+    real_read, real_get = im.read_xlsx, fake_s3.get_object
+    monkeypatch.setattr(im, "read_xlsx",
+                        lambda *a, **k: reads.append(1) or real_read(*a, **k))
+    monkeypatch.setattr(fake_s3, "get_object",
+                        lambda key: gets.append(key) or real_get(key))
+    first = im.fetch_workbook("A")
+    again = im.fetch_workbook("A")
+    assert len(reads) == 1, "같은 판을 두 번 읽었습니다"
+    assert len(gets) == 1, "같은 판인데 파일을 또 내려받았습니다"
+    assert again[1]["S"]["a"].tolist() == first[1]["S"]["a"].tolist() == [1]
+
+
+def test_someone_elses_save_is_read_fresh():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    assert im.fetch_workbook("A")[1]["S"]["a"].tolist() == [1]
+    im.save_workbook("A", sheets(S=[{"a": 2}]), "kim")       # 판이 바뀐다
+    raw, got, _f, stamp = im.fetch_workbook("A")
+    assert got["S"]["a"].tolist() == [2], "지난 판을 그대로 보여줍니다"
+    assert stamp == fake_s3.head_etag("2GAPU/input/A.xlsx")
+    assert raw == fake_s3.STORE["2GAPU/input/A.xlsx"]
+
+
+def test_a_file_that_is_gone_opens_empty_and_forgets_the_old_copy():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    im.fetch_workbook("A")
+    fake_s3.delete_object("2GAPU/input/A.xlsx")
+    assert im.fetch_workbook("A") == (b"", {}, {}, "")
+
+
+def test_the_gc_is_back_on_after_reading():
+    import gc
+    assert gc.isenabled()
+    im.read_xlsx(im.to_xlsx(sheets(S=[{"a": 1}])))
+    assert gc.isenabled(), "읽고 나서 GC 를 다시 안 켰습니다"
+
+
+def test_the_gc_is_back_on_even_when_reading_fails():
+    import gc
+    with pytest.raises(im.BadWorkbook):
+        im.read_xlsx(b"not a zip")
+    assert gc.isenabled()
+
+
+def test_the_gc_stays_off_if_it_was_off_before():
+    """누가 일부러 꺼 두었으면 우리가 켜면 안 된다."""
+    import gc
+    gc.disable()
+    try:
+        im.read_xlsx(im.to_xlsx(sheets(S=[{"a": 1}])))
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
 
 
 def test_what_a_save_hands_back_is_what_landed_in_s3():

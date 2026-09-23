@@ -20,6 +20,8 @@ streamlit 컴포넌트가 iframe 에 띄우는 방식이라 파일이 나뉠 수
 from __future__ import annotations
 
 import difflib
+import functools
+import gc
 import inspect
 import io
 import os
@@ -162,6 +164,43 @@ MIDNIGHT = time(0, 0)
 
 class BadWorkbook(Exception):
     """엑셀 파일로 읽을 수 없다."""
+
+
+# ----------------------------------------------------------------------
+# 큰 표를 다루는 동안 파이썬의 순환 쓰레기 수거(GC)를 잠시 멈춘다.
+#
+# 8MB 짜리 엑셀 하나를 읽으면 XML 칸 객체가 300만 개 가까이 생긴다. GC 는
+# 객체가 일정 수 늘 때마다 깨어나 '지금까지 만든 것 전부' 를 훑는데, 만드는
+# 중에 그게 수십 번 일어나서 읽는 시간의 절반 이상이 거기 들었다 (실측 7.2초
+# 중 4초). 멈추고 읽으면 같은 파서로 3.3초다.
+#
+# 멈춰도 메모리가 새지는 않는다. 파이썬은 대부분의 객체를 참조 수로 바로
+# 치우고, GC 는 서로 물고 있는 고리만 치운다 -- 그것도 다시 켜면 치운다.
+# 여러 사람이 동시에 읽을 수 있으므로 몇 명이 들어와 있는지 세어서, 마지막
+# 사람이 나갈 때 원래대로 켠다. 원래 꺼져 있었으면 켜지 않는다.
+# ----------------------------------------------------------------------
+_gc_lock = threading.Lock()
+_gc_inside = 0
+_gc_was_on = True
+
+
+def _no_gc(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        global _gc_inside, _gc_was_on
+        with _gc_lock:
+            if _gc_inside == 0:
+                _gc_was_on = gc.isenabled()
+                gc.disable()
+            _gc_inside += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            with _gc_lock:
+                _gc_inside -= 1
+                if _gc_inside == 0 and _gc_was_on:
+                    gc.enable()
+    return run
 
 
 def xlsx_read(data: bytes, formulas: dict | None = None) -> dict[str, list[list]]:
@@ -361,12 +400,22 @@ def _to_datetime(serial: float):
     return at.date() if at.time() == MIDNIGHT else at
 
 
+# 손봐야 할 글자가 하나라도 있는가. 대부분의 칸은 하나도 없어서, 이것
+# 하나로 걸러내면 나머지 치환을 통째로 건너뛴다.
+_XML_SPECIAL = re.compile('[&<>"\x00-\x08\x0b\x0c\x0e-\x1f]')
+# 엑셀이 못 읽는 제어문자 (탭 \t, 줄바꿈 \n \r 은 된다)
+_XML_CTRL = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
 def _esc(text) -> str:
-    out = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = str(text)
+    if not _XML_SPECIAL.search(out):
+        return out
+    out = out.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     out = out.replace('"', "&quot;")
     # 엑셀이 못 읽는 제어문자는 뺀다. 붙여넣기로 섞여 들어오면 파일 자체가
     # 안 열리는데, 그게 제일 알아채기 어려운 고장이다.
-    return "".join(c for c in out if c in "\t\n\r" or ord(c) >= 32)
+    return _XML_CTRL.sub("", out)
 
 
 def _looks_numeric(text: str) -> bool:
@@ -378,42 +427,84 @@ def _looks_numeric(text: str) -> bool:
 
 
 def _sheet_xml(rows: list[list],
-               formulas: dict[tuple[int, int], str] | None = None) -> bytes:
+               formulas: dict[tuple[int, int], str] | None = None,
+               strings: dict[str, int] | None = None) -> bytes:
+    """시트 한 장의 XML.
+
+    글자는 엑셀처럼 통합문서 한 곳(sharedStrings)에 모으고 칸에는 그 번호만
+    적는다. strings 가 그 모음이고, 시트끼리 나눠 쓴다. 칸마다 글자를 그대로
+    넣던 때(inlineStr)보다 XML 이 절반 가까이 줄어서 쓰기도, 나중에 다시
+    읽기도 그만큼 빠르다. 같은 글자('Y', 'PRE', ...)는 한 번만 적힌다.
+    """
     formulas = formulas or {}
+    strings = {} if strings is None else strings
+    f_rows = {r for r, _c in formulas}
+    width = max(map(len, rows), default=0)
+    letters = [col_letter(c) for c in range(width)]   # 칸마다 새로 셀 것 없다
     parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
              '<worksheet xmlns="http://schemas.openxmlformats.org/'
              'spreadsheetml/2006/main"><sheetData>']
-    for r, row in enumerate(rows, start=1):
-        has_f = any((r - 1, c) in formulas for c in range(len(row)))
-        if not has_f and not any(v is not None and str(v) != "" for v in row):
+    add = parts.append
+    for r0, row in enumerate(rows):
+        r = r0 + 1
+        has_f = r0 in f_rows
+        if not has_f and not any(v is not None and v != "" for v in row):
             continue                                  # 빈 줄은 안 쓴다
-        parts.append(f'<row r="{r}">')
+        add(f'<row r="{r}">')
         for c, value in enumerate(row):
-            ref = f"{col_letter(c)}{r}"
-            formula = formulas.get((r - 1, c))
-            if formula is not None:
-                # 수식은 수식으로 쓴다. 마지막으로 계산된 값도 같이 적어 둬야
-                # 엑셀로 열기 전에(우리 화면에서) 빈 칸으로 보이지 않는다.
-                # 진짜 값은 엑셀이 열 때 다시 계산한다(아래 fullCalcOnLoad).
-                cached = ("" if value is None else str(value))
-                kind = "" if _looks_numeric(cached) else ' t="str"'
-                body = f"<v>{_esc(cached)}</v>" if cached else ""
-                parts.append(f'<c r="{ref}"{kind}><f>{_esc(formula)}</f>{body}</c>')
+            if has_f:
+                formula = formulas.get((r0, c))
+                if formula is not None:
+                    # 수식은 수식으로 쓴다. 마지막으로 계산된 값도 같이 적어
+                    # 둬야 엑셀로 열기 전에(우리 화면에서) 빈 칸으로 보이지
+                    # 않는다. 진짜 값은 엑셀이 열 때 다시 계산한다(아래
+                    # fullCalcOnLoad).
+                    cached = ("" if value is None else str(value))
+                    kind = "" if _looks_numeric(cached) else ' t="str"'
+                    body = f"<v>{_esc(cached)}</v>" if cached else ""
+                    add(f'<c r="{letters[c]}{r}"{kind}><f>{_esc(formula)}</f>'
+                        f'{body}</c>')
+                    continue
+            if value is None or value == "":
                 continue
-            if value is None or str(value) == "":
-                continue
-            if isinstance(value, bool):
-                parts.append(f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>')
+            kind = type(value)
+            if kind is str:
+                at = strings.get(value)
+                if at is None:
+                    at = strings[value] = len(strings)
+                add(f'<c r="{letters[c]}{r}" t="s"><v>{at}</v></c>')
+            elif kind is int or kind is float:
+                add(f'<c r="{letters[c]}{r}"><v>{value}</v></c>')
+            elif isinstance(value, bool):
+                add(f'<c r="{letters[c]}{r}" t="b"><v>{1 if value else 0}</v></c>')
             elif isinstance(value, (int, float)):
-                parts.append(f'<c r="{ref}"><v>{value}</v></c>')
+                add(f'<c r="{letters[c]}{r}"><v>{value}</v></c>')
             else:
-                # 글자는 칸 안에 그대로 넣는다(inlineStr). sharedStrings 를
-                # 쓰면 파일이 조금 작아지지만 표를 하나 더 만들어야 하고,
-                # 기준 정보는 같은 글자가 반복되는 표가 아니라 이득이 적다.
-                parts.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space='
-                             f'"preserve">{_esc(value)}</t></is></c>')
-        parts.append("</row>")
-    parts.append("</sheetData></worksheet>")
+                text = str(value)
+                if text == "":
+                    continue
+                at = strings.get(text)
+                if at is None:
+                    at = strings[text] = len(strings)
+                add(f'<c r="{letters[c]}{r}" t="s"><v>{at}</v></c>')
+        add("</row>")
+    add("</sheetData></worksheet>")
+    return "".join(parts).encode("utf-8")
+
+
+def _shared_xml(strings: dict[str, int]) -> bytes:
+    """모은 글자들을 sharedStrings.xml 로. 번호 순서대로 적는다."""
+    parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+             f' uniqueCount="{len(strings)}">']
+    add = parts.append
+    for text in strings:                      # dict 는 넣은 순서 = 번호 순서
+        # 앞뒤 빈칸은 이렇게 적어 둬야 엑셀이 안 떼어 먹는다
+        if text[:1].isspace() or text[-1:].isspace():
+            add(f'<si><t xml:space="preserve">{_esc(text)}</t></si>')
+        else:
+            add(f"<si><t>{_esc(text)}</t></si>")
+    add("</sst>")
     return "".join(parts).encode("utf-8")
 
 
@@ -426,7 +517,14 @@ def xlsx_write(sheets: dict[str, list[list]],
     """
     formulas = formulas or {}
     names = list(sheets) or ["Sheet1"]
+    # 시트를 먼저 만든다 -- 글자 모음(sharedStrings)은 시트를 다 훑어야 나온다
+    strings: dict[str, int] = {}
+    sheet_xml = [_sheet_xml(sheets.get(name, []), formulas.get(name), strings)
+                 for name in names]
     buf = io.BytesIO()
+    # 압축 단계는 기본(6) 그대로 둔다. 1 로 낮추면 8MB 짜리에서 0.8초 빨라지지만
+    # 파일이 2MB 커지는데, 그 파일은 저장 한 번에 두 번(이력, 본 파일) 올라가고
+    # 열 때마다 내려온다.
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml",
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -441,7 +539,10 @@ def xlsx_write(sheets: dict[str, list[list]],
                 f'"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
                 for i in range(1, len(names) + 1))
             + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
-              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+              'openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+              '<Override PartName="/xl/sharedStrings.xml" ContentType="application/'
+              'vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+              '</Types>')
 
         zf.writestr("_rels/.rels",
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -474,7 +575,10 @@ def xlsx_write(sheets: dict[str, list[list]],
                 for i in range(1, len(names) + 1))
             + f'<Relationship Id="rId{len(names) + 1}" Type="http://schemas.'
               f'openxmlformats.org/officeDocument/2006/relationships/styles" '
-              f'Target="styles.xml"/></Relationships>')
+              f'Target="styles.xml"/>'
+            + f'<Relationship Id="rId{len(names) + 2}" Type="http://schemas.'
+              f'openxmlformats.org/officeDocument/2006/relationships/sharedStrings" '
+              f'Target="sharedStrings.xml"/></Relationships>')
 
         # 서식은 안 쓰지만 styles.xml 자체는 있어야 엑셀이 연다
         zf.writestr("xl/styles.xml",
@@ -487,9 +591,9 @@ def xlsx_write(sheets: dict[str, list[list]],
             '</cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" '
             'borderId="0" xfId="0"/></cellXfs></styleSheet>')
 
-        for i, name in enumerate(names, start=1):
-            zf.writestr(f"xl/worksheets/sheet{i}.xml",
-                        _sheet_xml(sheets.get(name, []), formulas.get(name)))
+        zf.writestr("xl/sharedStrings.xml", _shared_xml(strings))
+        for i, body in enumerate(sheet_xml, start=1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", body)
     return buf.getvalue()
 
 
@@ -537,6 +641,57 @@ def load_workbook(book: str,
     return read_xlsx(data, formulas), etag
 
 
+# ----------------------------------------------------------------------
+# 읽은 것을 판(ETag)마다 한 번만 읽는다.
+#
+# 8MB 짜리 엑셀을 읽는 데 몇 초가 든다. 그런데 같은 판을 여러 번 읽는 일이
+# 많다 -- 여럿이 같은 파일을 열 때, 파일을 바꿔 골랐다 돌아올 때, 아무도
+# 저장하지 않았는데 '초기화' 를 누를 때. 판이 같으면 읽은 결과도 같으므로
+# 한 번 읽은 것을 서버 안에서 나눠 쓴다. 판을 가리는 것은 S3 의 ETag(내용
+# 해시)라서, 누가 저장하면 ETag 가 바뀌고 그때는 새로 읽는다.
+#
+# 먼저 HEAD 로 ETag 만 물어본다. 가진 판과 같으면 파일을 내려받지도 않는다.
+#
+# 여기 든 표와 수식은 여러 사람이 같이 본다 -- 고치면 안 된다. 화면은
+# _seed 에서 사본을 떠서 쓴다. 파일마다 가장 최근 판 하나만 들고 있는다.
+# ----------------------------------------------------------------------
+_BOOKS: dict[str, tuple[str, bytes, dict, dict]] = {}
+_BOOKS_LOCK = threading.Lock()
+# 같은 파일을 둘이 동시에 처음 열면 둘 다 읽느라 몇 초씩 쓴다. 파일마다
+# 자물쇠를 두어 뒷사람은 앞사람이 다 읽을 때까지 기다렸다가 그걸 받는다.
+_BOOK_LOCKS: dict[str, threading.Lock] = {}
+
+
+def fetch_workbook(book: str) -> tuple[bytes, dict[str, pd.DataFrame], dict, str]:
+    """(파일 바이트, {시트: DataFrame}, 수식, 버전표). 없는 파일이면 비어 있다.
+
+    돌려주는 표와 수식은 나눠 쓰는 것이다. 읽기만 한다.
+    """
+    key = _key(f"{book}.xlsx")
+    with _BOOKS_LOCK:
+        lock = _BOOK_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        stamp = s3.head_etag(key)
+        with _BOOKS_LOCK:
+            hit = _BOOKS.get(key)
+        if hit is not None and stamp and hit[0] == stamp:
+            _stamp, raw, sheets, formulas = hit
+            return raw, sheets, formulas, stamp
+
+        got = s3.get_object(key)
+        if got is None:
+            with _BOOKS_LOCK:
+                _BOOKS.pop(key, None)
+            return b"", {}, {}, ""
+        raw, stamp = got
+        formulas: dict = {}
+        sheets = read_xlsx(raw, formulas) if raw else {}
+        with _BOOKS_LOCK:
+            _BOOKS[key] = (stamp, raw, sheets, formulas)
+        return raw, sheets, formulas, stamp
+
+
+@_no_gc
 def read_xlsx(data: bytes, formulas: dict | None = None) -> dict[str, pd.DataFrame]:
     """엑셀 바이트 -> {시트이름: DataFrame}. 첫 줄이 칸 이름이다."""
     raw: dict[str, dict] = {}
@@ -655,6 +810,7 @@ def to_xlsx(sheets: dict[str, pd.DataFrame],
     return build_xlsx(sheets, formulas)[0]
 
 
+@_no_gc
 def build_xlsx(sheets: dict[str, pd.DataFrame],
                formulas: dict | None = None) -> tuple[bytes, dict]:
     """엑셀 파일 한 벌과, 그 안에 실제로 담긴 값.
@@ -677,8 +833,12 @@ def build_xlsx(sheets: dict[str, pd.DataFrame],
             key = key[:30] + "_"
         clean = _clean(df)
         cols = [str(c) for c in clean.columns]
-        out[key] = ([cols] + [[_cell(v) for v in row]
-                              for row in clean.itertuples(index=False, name=None)])
+        # 칸이 146만 개라 칸마다 부르는 함수 한 겹도 1초 가까이 된다. 격자가
+        # 올려준 값은 거의 다 글자이고 나머지는 빈 칸이라, 그 둘은 바로 처리한다.
+        out[key] = ([cols] + [
+            [_number(v) if type(v) is str else (None if v is None else _cell(v))
+             for v in row]
+            for row in clean.to_numpy(dtype=object).tolist()])
 
         want = formulas.get(name)
         if not want:
@@ -742,9 +902,14 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy().where(pd.notna(df), None)
     if not len(out):
         return out
-    blank = out.apply(lambda row: all(
-        v is None or str(v).strip() == "" for v in row), axis=1)
-    return out[~blank]
+    # 줄마다 첫 칸만 보고 끝나는 게 보통이다 (any 가 값 있는 칸에서 멈춘다).
+    # pandas 의 줄 단위 apply 는 줄마다 Series 를 하나씩 만들어서 52,000줄
+    # 이면 그것만 몇 초였다.
+    keep = [any(v is not None
+                and (v.strip() if type(v) is str else str(v).strip())
+                for v in row)
+            for row in out.to_numpy(dtype=object).tolist()]
+    return out[keep]
 
 
 def _as_text(df: pd.DataFrame, cols: list[str], rows: int) -> pd.DataFrame:
@@ -760,6 +925,40 @@ def _as_text(df: pd.DataFrame, cols: list[str], rows: int) -> pd.DataFrame:
     out = out.where(pd.notna(out), "")
     out = out.reindex(index=range(rows), columns=cols, fill_value="")
     return out.astype(str).apply(lambda s: s.str.strip())
+
+
+def _text_rows(df: pd.DataFrame | None, cols: list[str],
+               rows: int | None = None) -> list[tuple[str, ...]]:
+    """_as_text 와 같은 값을, 표가 아니라 줄마다 글자 튜플로.
+
+    같은 일을 pandas 로 하면 칸 하나 꺼낼 때마다 pandas 를 한 겹씩 거친다.
+    52,000줄 x 28칸이면 그 칸이 146만 개라, '무엇이 바뀌었나' 하나 세는 데
+    10초가 걸렸다. 여기서는 칸 하나씩 꺼내 쓰는 쪽이 전부 파이썬 튜플이다.
+
+    칸은 cols 순서로 맞추고 df 에 없는 칸은 빈 글자다. 자리는 줄 번호가
+    아니라 몇 번째 줄인지로 센다.
+    """
+    n_have = 0 if df is None else len(df)
+    n = n_have if rows is None else rows
+    if not cols:
+        return [()] * n
+    if df is None or not n_have:
+        return [("",) * len(cols)] * n
+    where = {str(c): i for i, c in enumerate(df.columns)}
+    arr = df.to_numpy(dtype=object)
+    blank = pd.isna(arr)
+    columns = []
+    for name in cols:
+        i = where.get(name)
+        if i is None:
+            columns.append([""] * n)
+            continue
+        col = ["" if gone else (v.strip() if type(v) is str else str(v).strip())
+               for v, gone in zip(arr[:n, i].tolist(), blank[:n, i].tolist())]
+        if len(col) < n:
+            col.extend([""] * (n - len(col)))
+        columns.append(col)
+    return list(zip(*columns))
 
 
 def changed_cells(before: pd.DataFrame | None, after: pd.DataFrame) -> int:
@@ -811,13 +1010,15 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
     """
     cols = list(dict.fromkeys([*map(str, (before.columns if before is not None else [])),
                                *map(str, after.columns)]))
-    old = _as_text(before, cols, len(before)) if before is not None else None
-    new = _as_text(after, cols, len(after))
-    old_rows = [tuple(r) for r in old.itertuples(index=False, name=None)] if old is not None else []
-    new_rows = [tuple(r) for r in new.itertuples(index=False, name=None)]
+    old_rows = _text_rows(before, cols) if before is not None else []
+    new_rows = _text_rows(after, cols)
 
     out: list[dict] = []
     total = 0
+    if old_rows == new_rows:
+        # 대개는 여기서 끝난다. 시트가 다섯 장이어도 고친 것은 한두 장이라,
+        # 나머지는 줄 맞추기(difflib)를 돌릴 것도 없이 같은지만 보면 된다.
+        return out, total
 
     def add(kind: str, n: int, values: tuple):
         nonlocal total
@@ -883,100 +1084,136 @@ def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
     if not formulas:
         return sheets
     out = dict(sheets)
-    # 찾아볼 표를 미리 뒤집어 둔 것. 이게 없으면 수식 한 줄마다 찾을 표를
-    # 처음부터 끝까지 훑어서, 수식 4,000개 x 표 5,000줄이 5초가 넘는다 --
-    # 줄마다 VLOOKUP 이 걸린 시트에서는 저장이 분 단위로 걸린다.
-    index: dict[tuple[str, object], dict[str, object]] = {}
+    grids = _Grids(out)
     for name, cells in formulas.items():
         df = out.get(name)
         if df is None or not cells:
             continue
-        cols = list(df.columns)
+        # 수식의 첫 인자(찾을 값)는 고치기 전의 이 시트에서 읽는다
+        own = grids.values(name)
+        where = {c: i for i, c in enumerate(df.columns)}
+        rows_at = _positions(df.index)
         touched = None
         for (row, col), text in cells.items():
-            if col not in cols or row not in df.index:
+            ci, ri = where.get(col), rows_at(row)
+            if ci is None or ri is None:
                 continue
-            got = _eval_vlookup(text, own=df, sheets=out, index=index)
+            got = _eval_vlookup(text, own, grids)
             if got is _NOT_EVALUATED:
                 continue
             if touched is None:
-                touched = df.copy()
-            touched.at[row, col] = got
+                touched = own.copy()
+            touched[ri, ci] = got
         if touched is not None:
-            out[name] = touched
-            # 이 시트의 값이 갈렸으니 뒤집어 둔 것도 버린다. 다른 시트의
+            out[name] = pd.DataFrame(touched, index=df.index, columns=df.columns,
+                                     dtype=object)
+            # 이 시트의 값이 갈렸으니 들고 있던 것도 버린다. 다른 시트의
             # 수식이 이 시트를 찾아본다면 방금 고친 값으로 찾아야 맞다.
-            for cached in [k for k in index if k[0] == name]:
-                del index[cached]
+            grids.forget(name)
     return out
 
 
-def _lookup_index(target: pd.DataFrame, key_col, cache: dict,
-                  at: tuple[str, object]) -> dict[str, object]:
-    """찾을 값 -> 그 값이 처음 나온 줄. 표 하나를 한 번만 훑는다.
+def _positions(index: pd.Index):
+    """줄 이름 -> 몇 번째 줄인지. 없는 이름이면 None."""
+    if isinstance(index, pd.RangeIndex) and index.start == 0 and index.step == 1:
+        n = len(index)
 
-    처음 나온 줄만 담는 것은 엑셀과 같다 -- 같은 키가 여러 줄이면 VLOOKUP 은
-    맨 위엣것을 준다.
+        def at(row):
+            try:
+                i = row.__index__()           # int 이든 numpy 정수든
+            except AttributeError:
+                return None
+            return i if 0 <= i < n else None
+        return at
+    found = {label: i for i, label in enumerate(index)}
+    return found.get
+
+
+class _Grids:
+    """VLOOKUP 을 계산하는 동안 시트들을 들고 있는 곳.
+
+    시트마다 한 번만 값 배열로 꺼내 두고, 찾을 표는 한 번만 뒤집어 둔다.
+    수식 하나를 계산할 때마다 pandas 에서 칸을 하나씩 꺼내면(.iloc, .at)
+    그 한 번이 수십 마이크로초라, 줄마다 수식이 걸린 16,000줄 시트에서는
+    그것만 몇 초였다. 찾을 표를 수식마다 처음부터 훑으면 수식 개수 x 표 줄수가
+    되어 저장이 분 단위로 걸렸다.
     """
-    got = cache.get(at)
-    if got is None:
-        got = {}
-        for row, value in target[key_col].items():
-            text = ("" if value is None
-                    or (isinstance(value, float) and pd.isna(value))
-                    else str(value).strip())
-            if text not in got:
-                got[text] = row
-        cache[at] = got
-    return got
+
+    def __init__(self, sheets: dict[str, pd.DataFrame]):
+        self.sheets = sheets
+        self._values: dict[str, object] = {}
+        self._index: dict[tuple[str, int], dict[str, int]] = {}
+
+    def values(self, name: str):
+        got = self._values.get(name)
+        if got is None:
+            got = self._values[name] = self.sheets[name].to_numpy(dtype=object)
+        return got
+
+    def lookup(self, name: str, col: int) -> dict[str, int]:
+        """찾을 값 -> 그 값이 처음 나온 줄. 표 하나를 한 번만 훑는다.
+
+        처음 나온 줄만 담는 것은 엑셀과 같다 -- 같은 키가 여러 줄이면
+        VLOOKUP 은 맨 위엣것을 준다.
+        """
+        got = self._index.get((name, col))
+        if got is None:
+            got = {}
+            for row, value in enumerate(self.values(name)[:, col].tolist()):
+                text = ("" if value is None
+                        or (isinstance(value, float) and value != value)
+                        else str(value).strip())
+                if text not in got:
+                    got[text] = row
+            self._index[(name, col)] = got
+        return got
+
+    def forget(self, name: str) -> None:
+        self._values.pop(name, None)
+        for key in [k for k in self._index if k[0] == name]:
+            del self._index[key]
 
 
-def _eval_vlookup(formula: str, own: pd.DataFrame, sheets: dict[str, pd.DataFrame],
-                  index: dict | None = None):
+def _eval_vlookup(formula: str, own, grids: _Grids):
     """수식 하나를 지금 값으로. 못 하면 _NOT_EVALUATED.
 
-    own 은 이 수식이 들어 있는 시트다 -- 첫 인자(찾을 값)가 칸 자리를
-    가리키면 그 시트에서 값을 가져와야 하므로, 수식을 어느 시트가 들고
-    있는지가 따로 필요하다. sheets 는 VLOOKUP 이 찾아볼 대상 시트를 이름으로
-    꺼내려고 쓴다.
-
-    index 는 '찾을 표를 뒤집어 둔 것' 을 수식끼리 나눠 쓰는 자리다. 안 주면
-    이 수식 하나를 위해 그때그때 만든다 (검사에서 하나만 계산해 볼 때).
+    own 은 이 수식이 들어 있는 시트의 값 배열이다 -- 첫 인자(찾을 값)가 칸
+    자리를 가리키면 그 시트에서 값을 가져와야 하므로, 수식을 어느 시트가
+    들고 있는지가 따로 필요하다. grids 는 VLOOKUP 이 찾아볼 대상 시트를
+    이름으로 꺼내려고 쓴다.
     """
     m = _VLOOKUP_RE.match(formula.strip())
     if not m:
         return _NOT_EVALUATED
     lookup_expr, sheet_name, c1, c2, idx = m.groups()
     sheet_name = sheet_name.strip()
-    target = sheets.get(sheet_name)
+    target = grids.sheets.get(sheet_name)
     if target is None:
         return _NOT_EVALUATED
     key = _resolve_ref(lookup_expr, own)
     if key is _NOT_EVALUATED:
         return _NOT_EVALUATED
 
-    t_cols = list(target.columns)
+    width = len(target.columns)
     start, end = col_index(c1.upper()), col_index(c2.upper())
     idx = int(idx)
-    if idx < 1 or idx - 1 > end - start or start >= len(t_cols):
+    if idx < 1 or idx - 1 > end - start or start >= width:
         return _NOT_EVALUATED
     pos = start + idx - 1
-    if pos >= len(t_cols):
+    if pos >= width:
         return _NOT_EVALUATED
-    key_col, val_col = t_cols[start], t_cols[pos]
 
-    where = _lookup_index(target, key_col,
-                          {} if index is None else index, (sheet_name, key_col))
-    row = where.get(str(key).strip())
+    row = grids.lookup(sheet_name, start).get(str(key).strip())
     if row is None:
         return "#N/A"                        # 엑셀도 못 찾으면 이렇게 보여준다
-    found = target.at[row, val_col]
-    return "" if found is None or (isinstance(found, float) and pd.isna(found)) else found
+    found = grids.values(sheet_name)[row, pos]
+    return ("" if found is None or (isinstance(found, float) and found != found)
+            else found)
 
 
-def _resolve_ref(expr: str, own: pd.DataFrame):
-    """VLOOKUP 의 첫 인자를 값으로. 같은 시트의 칸 자리(E10220)면 own 에서
-    그 값을 가져오고, 아니면 글자/수로 적은 값 그대로다.
+def _resolve_ref(expr: str, own):
+    """VLOOKUP 의 첫 인자를 값으로. 같은 시트의 칸 자리(E10220)면 own(그
+    시트의 값 배열)에서 그 값을 가져오고, 아니면 글자/수로 적은 값 그대로다.
 
     참조에 시트 이름이 안 붙어 있으므로(그냥 'E10220') 수식이 든 시트
     자신을 본다 -- VLOOKUP 의 찾을 값은 대개 자기 줄의 다른 칸이다.
@@ -989,16 +1226,14 @@ def _resolve_ref(expr: str, own: pd.DataFrame):
         return expr
     letters, excel_row = m.groups()
     at_row = int(excel_row) - 2          # 머리글이 엑셀 1행이므로 -2
-    cols = list(own.columns)
     c = col_index(letters.upper())
-    if at_row < 0 or at_row >= len(own) or c >= len(cols):
+    rows, cols = own.shape
+    if at_row < 0 or at_row >= rows or c >= cols:
         return _NOT_EVALUATED
-    try:
-        return own.iloc[at_row, c]
-    except Exception:
-        return _NOT_EVALUATED
+    return own[at_row, c]
 
 
+@_no_gc
 def surviving_formulas(before: dict[str, pd.DataFrame],
                        after: dict[str, pd.DataFrame],
                        formulas: dict) -> tuple[dict, dict[str, int]]:
@@ -1021,19 +1256,20 @@ def surviving_formulas(before: dict[str, pd.DataFrame],
             lost[name] = len(want)
             continue
         cols = list(dict.fromkeys([*map(str, old.columns), *map(str, new.columns)]))
-        old_text = _as_text(old, cols, len(old))
-        new_text = _as_text(new, cols, len(new))
-        same = _rows_in_place(
-            [tuple(r) for r in old_text.itertuples(index=False, name=None)],
-            [tuple(r) for r in new_text.itertuples(index=False, name=None)])
+        old_rows = _text_rows(old, cols)
+        new_rows = _text_rows(new, cols)
+        same = (range(len(old_rows)) if old_rows == new_rows
+                else _rows_in_place(old_rows, new_rows))
+        at = {c: i for i, c in enumerate(cols)}
+        new_cols = set(map(str, new.columns))
         live = {}
         for (row, col), text in want.items():
-            if row not in same or col not in map(str, new.columns):
+            if row not in same or col not in new_cols:
                 continue
             # 그 칸을 사람이 직접 고쳤으면 사람이 적은 값이 이긴다
-            if (row < len(old_text) and row < len(new_text)
-                    and col in cols
-                    and old_text.iloc[row][col] != new_text.iloc[row][col]):
+            i = at[col]
+            if (row < len(old_rows) and row < len(new_rows)
+                    and old_rows[row][i] != new_rows[row][i]):
                 continue
             live[(row, col)] = text
         if live:
@@ -1059,6 +1295,7 @@ def _rows_in_place(old: list, new: list) -> set[int]:
     return out
 
 
+@_no_gc
 def workbook_changes(before: dict[str, pd.DataFrame],
                      after: dict[str, pd.DataFrame]) -> dict:
     """{시트이름: {"rows": [...], "total": n, "note": "..."}}. 안 바뀐 시트는 뺀다."""
@@ -1189,6 +1426,7 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
     return got or {}
 
 
+@_no_gc
 def to_frames(payload: dict) -> dict[str, pd.DataFrame]:
     """격자가 올려준 것을 {시트이름: DataFrame} 으로."""
     out: dict[str, pd.DataFrame] = {}
@@ -1291,10 +1529,7 @@ def _load(book: str) -> None:
     내주기 때문이다. 우리가 다시 만들어 주면 저장된 판과 한 글자라도 다를
     수 있는데, 내려받아 고쳐서 다시 올릴 사람에게는 그게 곧 사고다.
     """
-    got = s3.get_object(_key(f"{book}.xlsx"))
-    raw, stamp = got if got is not None else (b"", "")
-    formulas: dict = {}
-    sheets = read_xlsx(raw, formulas) if raw else {}
+    raw, sheets, formulas, stamp = fetch_workbook(book)
     _seed(book, raw, sheets, formulas, stamp)
 
 
