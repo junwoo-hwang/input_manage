@@ -89,10 +89,19 @@ def test_the_guard_is_per_workbook_not_global():
 
 
 def test_saving_with_the_returned_stamp_goes_through():
-    stamp = im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
-    stamp = im.save_workbook("A", sheets(S=[{"a": 2}]), "hong", base_stamp=stamp)
+    stamp = im.save_workbook("A", sheets(S=[{"a": 1}]), "hong").stamp
+    stamp = im.save_workbook("A", sheets(S=[{"a": 2}]), "hong",
+                             base_stamp=stamp).stamp
     im.save_workbook("A", sheets(S=[{"a": 3}]), "hong", base_stamp=stamp)
     assert im.load_workbook("A")[0]["S"]["a"].tolist() == [3]
+
+
+def test_what_a_save_hands_back_is_what_landed_in_s3():
+    """저장한 뒤 화면은 이걸로 맞춘다 -- S3 에서 도로 안 읽으려고."""
+    done = im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    assert done.body == fake_s3.STORE["2GAPU/input/A.xlsx"]
+    assert done.stamp == fake_s3.head_etag("2GAPU/input/A.xlsx")
+    assert im.read_xlsx(done.body)["S"]["a"].tolist() == [1]
 
 
 def test_a_failed_save_leaves_the_stored_file_intact():
@@ -715,3 +724,57 @@ def test_a_blank_gap_above_the_formula_does_not_confuse_the_cached_value():
     formulas = {"Main": {(2, "A"): "VLOOKUP(E4,ET추출여부!$A:$C,3,0)"}}
     got = im.refresh_formula_cache({"ET추출여부": et, "Main": main}, formulas)
     assert got["Main"].loc[2, "A"] == "이름1"
+
+
+def test_the_first_matching_row_wins_like_excel():
+    """같은 키가 두 줄이면 엑셀은 맨 위엣것을 준다."""
+    et = pd.DataFrame([
+        {"코드": "P-01", "b값": "b1", "이름": "위"},
+        {"코드": "P-01", "b값": "b2", "이름": "아래"},
+    ], dtype=object)
+    main = pd.DataFrame({"A": [""], "B": [""], "C": [""], "D": [""],
+                         "E": ["P-01"]}, dtype=object)
+    formulas = {"Main": {(0, "C"): "VLOOKUP(E2,ET추출여부!$A:$C,3,0)"}}
+    got = im.refresh_formula_cache({"ET추출여부": et, "Main": main}, formulas)
+    assert got["Main"].loc[0, "C"] == "위"
+
+
+def test_a_sheet_fixed_first_is_looked_up_with_its_new_values():
+    """A 시트의 수식을 먼저 계산해 값이 갈렸으면, 그 시트를 찾아보는 B 시트는
+    갈린 값을 봐야 한다. 찾을 표를 뒤집어 두고 쓰기 때문에 눌러 두는 자리다.
+    """
+    a = pd.DataFrame({"A": ["K1"], "B": ["헌값"], "C": [""]}, dtype=object)
+    b = pd.DataFrame({"A": ["K1"], "B": ["새값"], "C": [""]}, dtype=object)
+    main = pd.DataFrame({"A": [""], "B": [""], "C": [""], "D": [""],
+                         "E": ["K1"]}, dtype=object)
+    formulas = {
+        # A 시트가 제 B 칸을 다른 시트에서 끌어와 채운다
+        "A시트": {(0, "B"): "VLOOKUP(A2,원본!$A:$B,2,0)"},
+        # Main 은 그 A 시트를 찾아본다
+        "Main": {(0, "C"): "VLOOKUP(E2,A시트!$A:$B,2,0)"},
+    }
+    got = im.refresh_formula_cache(
+        {"원본": b, "A시트": a, "Main": main}, formulas)
+    assert got["A시트"].loc[0, "B"] == "새값"
+    assert got["Main"].loc[0, "C"] == "새값", "낡은 값을 그대로 들고 왔습니다"
+
+
+def test_recalculating_a_whole_sheet_of_formulas_is_not_quadratic():
+    """줄마다 VLOOKUP 이 걸린 시트가 진짜로 있다. 수식마다 찾을 표를 처음부터
+    훑으면 저장이 분 단위로 걸린다 -- 그래서 표를 한 번만 뒤집어 둔다.
+    """
+    import time
+    look = pd.DataFrame({"A": [f"K{i}" for i in range(3000)],
+                         "B": [f"b{i}" for i in range(3000)]}, dtype=object)
+    n = 3000
+    main = pd.DataFrame({"A": [""] * n, "B": [""] * n, "C": [""] * n,
+                         "D": [""] * n, "E": [f"K{i}" for i in range(n)]},
+                        dtype=object)
+    formulas = {"Main": {(r, "A"): f"VLOOKUP(E{r + 2},찾을표!$A:$B,2,0)"
+                         for r in range(n)}}
+    start = time.perf_counter()
+    got = im.refresh_formula_cache({"찾을표": look, "Main": main}, formulas)
+    spent = time.perf_counter() - start
+    assert got["Main"].loc[n - 1, "A"] == f"b{n - 1}"
+    # 표를 한 번만 뒤집으면 0.2초쯤, 수식마다 훑으면 3초가 넘는다.
+    assert spent < 1.5, f"{spent:.1f}초 걸렸습니다 -- 찾을 표를 또 훑고 있습니다"

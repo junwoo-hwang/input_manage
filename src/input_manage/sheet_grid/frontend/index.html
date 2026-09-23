@@ -1216,6 +1216,9 @@ function pasteFromClipboard() {
 window.addEventListener("message", (event) => {
   if (!event.data || event.data.type !== "streamlit:render") return;
   const args = event.data.args || {};
+  // 파이썬이 스크립트를 한 판 돌 때마다 여기로 한 번 온다. 몇 판 돌았는지는
+  // 검사에서 센다 -- 저장 창에서 사유를 치는 동안에는 안 돌아야 한다.
+  window.__rendered = (window.__rendered || 0) + 1;
   maxHeight = args.max_height || 520;
 
   // 판 번호가 그대로면 건드리지 않는다. 값을 올려보낼 때마다 streamlit 이

@@ -130,12 +130,13 @@ def review_text(page):
 def confirm_save(page, remark="사유"):
     """저장 -> 사유 적기 -> 진짜 저장. '저장했습니다' 가 뜰 때까지 기다린다.
 
+    적자마자 바로 누른다. 사람이 그렇게 하기 때문이다 -- 칸을 떠나라고
+    Tab 을 눌러 주거나 한 박자 기다려 주지 않는다.
+
     user 는 로그인한 사람으로 고정이라 못 고친다.
     """
     open_review(page, table=False)
     page.get_by_label("Remark — 사유").fill(remark)
-    page.keyboard.press("Tab")          # streamlit 은 칸을 떠나야 값을 받는다
-    page.wait_for_timeout(900)
     page.get_by_role("button", name="저장", exact=True).last.click()
     page.wait_for_function(
         "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
@@ -625,18 +626,78 @@ def test_a_new_row_is_marked_new_not_edited(page):
 
 
 def test_saving_needs_a_reason(page):
-    """Remark 를 안 적으면 저장 단추가 안 켜진다."""
+    """Remark 를 안 적으면 저장이 안 되고, 왜 안 되는지 말해 준다."""
     reset(page)
     click_cell(page, 0, 2)
     page.keyboard.type("사유없이")
     page.keyboard.press("Enter")
     wait_dirty(page)
     open_review(page)
-    assert not page.get_by_role("button", name="저장", exact=True).last.is_enabled()
-    page.get_by_label("Remark — 사유").fill("이유 있음")
-    page.keyboard.press("Tab")          # streamlit 은 칸을 떠나야 값을 받는다
+    page.get_by_role("button", name="저장", exact=True).last.click()
+    page.wait_for_timeout(2000)
+    assert "Remark 를 적어야" in review_text(page), review_text(page)
+    assert "저장했습니다" not in page.inner_text("body"), "사유 없이 저장됐습니다"
+    page.get_by_role("button", name="취소").click()
+    page.wait_for_timeout(600)
+
+
+def test_one_click_saves_right_after_typing_the_reason(page):
+    """적자마자 누른다 -- 칸을 떠나 주기를 기다려 주는 사람은 없다.
+
+    예전에는 그 누름이 '칸을 떠났다' 로 먼저 처리되고, 그 판에서 저장
+    단추는 사유가 아직 빈 줄 알고 꺼져 있었다. 그래서 한 번 눌러서는
+    저장이 안 됐다.
+    """
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("한번에저장")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page, table=False)
+    page.get_by_label("Remark — 사유").fill("한 번에")
+    page.get_by_role("button", name="저장", exact=True).last.click()   # 한 번만
+    page.wait_for_function(
+        "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+    settle(page)
+    assert "한번에저장" in [v for row in table(page)["rows"] for v in row]
+
+
+def test_esc_does_not_close_the_save_popup(page):
+    """Esc 로 닫히면 적던 사유가 통째로 날아간다."""
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("esc확인")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page, table=False)
+    page.get_by_label("Remark — 사유").fill("적던 중")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(1500)
+    assert "변경내용" in page.inner_text("body"), "Esc 에 창이 닫혔습니다"
+    assert page.get_by_label("Remark — 사유").input_value() == "적던 중"
+    page.get_by_role("button", name="취소").click()     # 닫는 길은 그대로 있다
     page.wait_for_timeout(1200)
-    assert page.get_by_role("button", name="저장", exact=True).last.is_enabled()
+    assert "변경내용" not in page.inner_text("body"), "취소로도 안 닫힙니다"
+
+
+def test_typing_the_reason_does_not_wake_python(page):
+    """사유를 칠 때마다 파이썬이 돌면 15,000행짜리 격자를 그때마다 다시
+    내려보내느라 창이 굼떠진다. 그래서 단추를 누를 때 한 번만 돈다.
+    """
+    reset(page)
+    click_cell(page, 0, 2)
+    page.keyboard.type("굼뜸확인")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    open_review(page, table=False)
+    before = grid(page).locator("body").evaluate("() => window.__rendered || 0")
+    page.get_by_label("Remark — 사유").fill("사유를 적는다")
+    page.keyboard.press("Tab")
+    page.get_by_label("관련 — 세부 내용 (필수X)").fill("세부 내용도 적는다")
+    page.keyboard.press("Tab")
+    page.wait_for_timeout(2500)
+    after = grid(page).locator("body").evaluate("() => window.__rendered || 0")
+    assert after == before, f"칸 두 개 적는 동안 파이썬이 {after - before}번 돌았습니다"
     page.get_by_role("button", name="취소").click()
     page.wait_for_timeout(600)
 

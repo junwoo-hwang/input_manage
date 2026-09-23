@@ -28,6 +28,7 @@ import threading
 import zipfile
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 from xml.etree import ElementTree as ET
 
 import boto3
@@ -580,9 +581,21 @@ def _frame(rows: list[list]) -> pd.DataFrame:
     return pd.DataFrame(fixed, columns=cols, dtype=object)
 
 
+class Saved(NamedTuple):
+    """저장하고 나서 알게 되는 것들.
+
+    body 와 sheets 를 같이 돌려주는 이유: 저장한 뒤 화면을 맞추려면 방금
+    올린 판이 필요한데, 그걸 S3 에서 도로 내려받아 다시 읽으면 8MB 짜리
+    파일에서 몇 초가 그냥 간다. 방금 우리가 올린 것이 곧 S3 에 있는 것이다.
+    """
+    stamp: str                          # 새 버전표 (S3 ETag)
+    body: bytes                         # 올린 파일 그대로
+    sheets: dict[str, pd.DataFrame]     # 그 파일에 실제로 담긴 값
+
+
 def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
                   base_stamp: str | None = None,
-                  formulas: dict | None = None) -> str:
+                  formulas: dict | None = None) -> Saved:
     """고친 값을 올리고 새 버전표를 돌려준다.
 
     base_stamp 를 주면 그 사이에 다른 사람이 올렸는지 보고, 그랬으면
@@ -597,13 +610,13 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
 
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
-    body = to_xlsx(sheets, formulas)
+    body, written = build_xlsx(sheets, formulas)
 
     # 이력 폴더에 한 벌 먼저 넣는다. 본 파일을 먼저 덮어쓰고 나면, 그 뒤에
     # 이력 넣기가 실패했을 때 되돌릴 것이 없는 채로 끝난다. 순서를 이렇게
     # 두면 '사본을 못 남기면 덮어쓰지도 않는다' 가 된다.
     s3.put_object(_history_key(book, user_id), body)
-    return s3.put_object(key, body)
+    return Saved(s3.put_object(key, body), body, written)
 
 
 def _history_key(book: str, user_id: str, now: datetime | None = None) -> str:
@@ -638,7 +651,13 @@ def _safe(text: str) -> str:
 
 def to_xlsx(sheets: dict[str, pd.DataFrame],
             formulas: dict | None = None) -> bytes:
-    """시트들을 엑셀 파일 한 벌로. 저장과 내려받기가 같은 것을 쓴다.
+    """시트들을 엑셀 파일 한 벌로."""
+    return build_xlsx(sheets, formulas)[0]
+
+
+def build_xlsx(sheets: dict[str, pd.DataFrame],
+               formulas: dict | None = None) -> tuple[bytes, dict]:
+    """엑셀 파일 한 벌과, 그 안에 실제로 담긴 값.
 
     formulas 는 {시트이름: {(줄, 칸이름): '수식'}}. 그 칸은 값 대신 수식으로
     나간다 -- 안 그러면 VLOOKUP 이 걸려 있던 칸이 마지막으로 계산된 값으로
@@ -674,7 +693,7 @@ def to_xlsx(sheets: dict[str, pd.DataFrame],
                 placed[(moved[row] + 1, at[col])] = text   # +1 은 머리글 줄
         if placed:
             out_f[key] = placed
-    return xlsx_write(out, out_f)
+    return xlsx_write(out, out_f), sheets
 
 
 def _cell(value):
@@ -864,6 +883,10 @@ def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
     if not formulas:
         return sheets
     out = dict(sheets)
+    # 찾아볼 표를 미리 뒤집어 둔 것. 이게 없으면 수식 한 줄마다 찾을 표를
+    # 처음부터 끝까지 훑어서, 수식 4,000개 x 표 5,000줄이 5초가 넘는다 --
+    # 줄마다 VLOOKUP 이 걸린 시트에서는 저장이 분 단위로 걸린다.
+    index: dict[tuple[str, object], dict[str, object]] = {}
     for name, cells in formulas.items():
         df = out.get(name)
         if df is None or not cells:
@@ -873,7 +896,7 @@ def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
         for (row, col), text in cells.items():
             if col not in cols or row not in df.index:
                 continue
-            got = _eval_vlookup(text, own=df, sheets=out)
+            got = _eval_vlookup(text, own=df, sheets=out, index=index)
             if got is _NOT_EVALUATED:
                 continue
             if touched is None:
@@ -881,22 +904,51 @@ def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
             touched.at[row, col] = got
         if touched is not None:
             out[name] = touched
+            # 이 시트의 값이 갈렸으니 뒤집어 둔 것도 버린다. 다른 시트의
+            # 수식이 이 시트를 찾아본다면 방금 고친 값으로 찾아야 맞다.
+            for cached in [k for k in index if k[0] == name]:
+                del index[cached]
     return out
 
 
-def _eval_vlookup(formula: str, own: pd.DataFrame, sheets: dict[str, pd.DataFrame]):
+def _lookup_index(target: pd.DataFrame, key_col, cache: dict,
+                  at: tuple[str, object]) -> dict[str, object]:
+    """찾을 값 -> 그 값이 처음 나온 줄. 표 하나를 한 번만 훑는다.
+
+    처음 나온 줄만 담는 것은 엑셀과 같다 -- 같은 키가 여러 줄이면 VLOOKUP 은
+    맨 위엣것을 준다.
+    """
+    got = cache.get(at)
+    if got is None:
+        got = {}
+        for row, value in target[key_col].items():
+            text = ("" if value is None
+                    or (isinstance(value, float) and pd.isna(value))
+                    else str(value).strip())
+            if text not in got:
+                got[text] = row
+        cache[at] = got
+    return got
+
+
+def _eval_vlookup(formula: str, own: pd.DataFrame, sheets: dict[str, pd.DataFrame],
+                  index: dict | None = None):
     """수식 하나를 지금 값으로. 못 하면 _NOT_EVALUATED.
 
     own 은 이 수식이 들어 있는 시트다 -- 첫 인자(찾을 값)가 칸 자리를
     가리키면 그 시트에서 값을 가져와야 하므로, 수식을 어느 시트가 들고
     있는지가 따로 필요하다. sheets 는 VLOOKUP 이 찾아볼 대상 시트를 이름으로
     꺼내려고 쓴다.
+
+    index 는 '찾을 표를 뒤집어 둔 것' 을 수식끼리 나눠 쓰는 자리다. 안 주면
+    이 수식 하나를 위해 그때그때 만든다 (검사에서 하나만 계산해 볼 때).
     """
     m = _VLOOKUP_RE.match(formula.strip())
     if not m:
         return _NOT_EVALUATED
     lookup_expr, sheet_name, c1, c2, idx = m.groups()
-    target = sheets.get(sheet_name.strip())
+    sheet_name = sheet_name.strip()
+    target = sheets.get(sheet_name)
     if target is None:
         return _NOT_EVALUATED
     key = _resolve_ref(lookup_expr, own)
@@ -913,14 +965,12 @@ def _eval_vlookup(formula: str, own: pd.DataFrame, sheets: dict[str, pd.DataFram
         return _NOT_EVALUATED
     key_col, val_col = t_cols[start], t_cols[pos]
 
-    key_text = str(key).strip()
-    key_series = target[key_col].apply(
-        lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v))
-        else str(v).strip())
-    matches = target.index[key_series == key_text]
-    if len(matches) == 0:
+    where = _lookup_index(target, key_col,
+                          {} if index is None else index, (sheet_name, key_col))
+    row = where.get(str(key).strip())
+    if row is None:
         return "#N/A"                        # 엑셀도 못 찾으면 이렇게 보여준다
-    found = target.loc[matches[0], val_col]
+    found = target.at[row, val_col]
     return "" if found is None or (isinstance(found, float) and pd.isna(found)) else found
 
 
@@ -1207,6 +1257,10 @@ S_WANT = "_im_want"
 S_PENDING = "_im_pending"    # 표를 받으면 할 일: 지금은 "save" 뿐
 S_EDITED = "_im_edited"      # 격자가 올려준 지금 값
 S_REVIEW = "_im_review"      # 저장 팝업에 띄울 변경 내역
+# 그때 같이 셈해 둔 (살아남는 수식, 시트별로 버리는 개수). 창이 떠 있는
+# 동안에는 값이 안 바뀌므로 다시 셀 일이 없다 -- 15,000행에서 한 번 세는 데
+# 0.14초라, 사유를 한 글자 칠 때마다 다시 세면 창이 그만큼씩 굼떠진다.
+S_KEPT = "_im_kept"
 # 파일을 띄웠을 때 그 안에 있던 수식들. 격자는 값만 다루므로, 이걸 안 들고
 # 있으면 저장할 때 VLOOKUP 이 걸려 있던 칸이 마지막 계산값으로 굳어 버린다.
 S_FORMULAS = "_im_formulas"
@@ -1241,6 +1295,12 @@ def _load(book: str) -> None:
     raw, stamp = got if got is not None else (b"", "")
     formulas: dict = {}
     sheets = read_xlsx(raw, formulas) if raw else {}
+    _seed(book, raw, sheets, formulas, stamp)
+
+
+def _seed(book: str, raw: bytes, sheets: dict[str, pd.DataFrame],
+          formulas: dict, stamp: str) -> None:
+    """'이 파일의 지금 판은 이것' 으로 화면 상태를 통째로 갈아끼운다."""
     st.session_state[S_RAW] = raw
     st.session_state[S_FORMULAS] = formulas
     st.session_state[S_BOOK] = book
@@ -1249,7 +1309,8 @@ def _load(book: str) -> None:
     st.session_state[S_STAMP] = stamp
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
     # 다른 파일의 값과 진행 중이던 저장·업로드는 들고 가지 않는다
-    for key in (S_EDITED, S_REVIEW, S_WANT, S_PENDING, S_UPLOAD, S_UPLOADED):
+    for key in (S_EDITED, S_REVIEW, S_KEPT, S_WANT, S_PENDING,
+                S_UPLOAD, S_UPLOADED):
         st.session_state.pop(key, None)
 
 
@@ -1356,8 +1417,10 @@ def show_input_manage() -> None:
         _upload(book)
     if st.session_state.get(S_REVIEW):
         _review(book, user_id)
-
-    _show_history(book)
+    else:
+        # 창이 떠 있는 동안에는 안 그린다. 창에 가려 안 보이는데 그리느라
+        # 창 안에서 뭘 할 때마다 그만큼씩 기다리게 된다.
+        _show_history(book)
 
 
 def _row_label(text: str = "") -> None:
@@ -1390,8 +1453,15 @@ def _take_full(got: dict, book: str) -> None:
     edited = to_frames(got)
     st.session_state[S_EDITED] = edited
     if st.session_state.pop(S_PENDING, None) == "save":
+        # 여기서 한 번만 센다. 창이 떠 있는 동안 streamlit 이 스크립트를
+        # 다시 돌 때마다 또 세면, 15,000행에서는 그때마다 0.4초씩 얼어붙는다.
         st.session_state[S_REVIEW] = workbook_changes(
             st.session_state[S_SHEETS], edited)
+        # 수식의 자리는 '화면에 띄운 판' 기준이다 (엑셀을 올렸으면 그 판).
+        # 무엇이 바뀌었나는 'S3 에 있는 판' 기준이고, 둘은 다를 수 있다.
+        st.session_state[S_KEPT] = surviving_formulas(
+            st.session_state[S_SHOWN], edited,
+            st.session_state.get(S_FORMULAS, {}))
     st.rerun()
 
 
@@ -1476,9 +1546,42 @@ def _review(book: str, user_id: str) -> None:
             _review_body(book, user_id)
 
 
+def _keep_open() -> None:
+    """이 창이 떠 있는 동안 Esc 로 닫히지 않게 한다.
+
+    streamlit 의 창은 Esc 를 누르면 닫히고, 그러면 적던 사유가 통째로
+    사라진다. 끄는 설정이 따로 없어서 Esc 를 창 밖으로 못 나가게 막는다.
+
+    막는 것을 그만둘 때를 이 틀(iframe)이 알려 준다 -- 창이 닫히면 이 틀도
+    같이 화면에서 빠지므로, 그때 손을 뗀다. 창을 닫는 길은 그대로 있다
+    (취소, 오른쪽 위 X).
+    """
+    components.html("""
+<script>
+(function () {
+  var me = window.frameElement;
+  var doc = window.parent.document;
+  if (!me || !doc || me.dataset.imEsc) return;
+  me.dataset.imEsc = "1";
+  function block(e) {
+    if (!me.isConnected) {              // 창이 닫혔다 -- 이제 남 일이다
+      doc.removeEventListener("keydown", block, true);
+      return;
+    }
+    if (e.key === "Escape" || e.keyCode === 27) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    }
+  }
+  doc.addEventListener("keydown", block, true);
+})();
+</script>""", height=0)
+
+
 def _review_body(book: str, user_id: str) -> None:
     changes: dict = st.session_state[S_REVIEW]
     edited: dict[str, pd.DataFrame] = st.session_state[S_EDITED]
+    _keep_open()
 
     if not any(v["total"] or v["note"] for v in changes.values()):
         st.info("바뀐 것이 없습니다. 저장할 것이 없어요.")
@@ -1502,10 +1605,7 @@ def _review_body(book: str, user_id: str) -> None:
         if info["total"] > len(info["rows"]):
             st.caption(f"…외 {info['total'] - len(info['rows'])}줄은 접었습니다.")
 
-    # 수식의 자리는 '화면에 띄운 판' 기준이다 (엑셀을 올렸으면 그 판).
-    # 무엇이 바뀌었나는 'S3 에 있는 판' 기준이고, 둘은 다를 수 있다.
-    kept, lost = surviving_formulas(
-        st.session_state[S_SHOWN], edited, st.session_state.get(S_FORMULAS, {}))
+    kept, lost = st.session_state.get(S_KEPT) or ({}, {})
     if lost:
         st.warning(
             "**수식이 사라집니다** — "
@@ -1520,54 +1620,68 @@ def _review_body(book: str, user_id: str) -> None:
     st.divider()
 
     cols = rev_columns(st.session_state[S_SHOWN])
-    if cols is None:
-        st.caption(f"이 파일에는 `{REV_SHEET}` 시트가 없어 변경 사유는 안 받습니다.")
-        remark = link = ""
-        who = user_id
-        ok = True
-    else:
-        st.markdown(f"**{REV_SHEET} 에 남길 기록**")
-        today = f"{datetime.now(KST):%Y-%m-%d}"
-        # 날짜와 사람은 사람이 못 바꾼다. 언제 누가 바꿨는지는 기록이지
-        # 입력이 아니다 -- 고칠 수 있으면 남의 이름으로 적을 수도 있다.
-        c1, c2 = st.columns(2)
-        with c1:
-            st.text_input(REV_DATE, value=today, disabled=True, key="im_rev_date")
-        with c2:
-            st.text_input(REV_USER, value=user_id, disabled=True, key="im_rev_user")
-        who = user_id
-        remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark")
-        link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link")
-        ok = bool(remark.strip())
-        if not ok:
+    # 사유와 단추를 st.form 으로 묶는다. 묶지 않으면 한 글자 칠 때마다,
+    # 칸을 떠날 때마다 streamlit 이 스크립트를 처음부터 다시 도는데, 그때마다
+    # 15,000행짜리 격자를 다시 내려보내느라 창이 굼떠진다.
+    #
+    # 굼뜬 것보다 나빴던 것은 따로 있다. 칸에 적은 값은 칸을 떠나야 파이썬에
+    # 닿는데, 사람은 적자마자 저장을 누른다 -- 그 누름은 '칸을 떠났다' 로
+    # 먼저 처리되고, 그 판에서 저장 단추는 아직 사유가 빈 줄 알고 꺼져 있다.
+    # 그래서 한 번 눌러서는 저장이 안 되고 두 번 눌러야 했다. form 안에서는
+    # 누름 한 번에 칸 값이 같이 실려 온다.
+    with st.form("im_rev_form", clear_on_submit=False):
+        if cols is None:
+            st.caption(f"이 파일에는 `{REV_SHEET}` 시트가 없어 변경 사유는 안 받습니다.")
+            remark = link = ""
+        else:
+            st.markdown(f"**{REV_SHEET} 에 남길 기록**")
+            today = f"{datetime.now(KST):%Y-%m-%d}"
+            # 날짜와 사람은 사람이 못 바꾼다. 언제 누가 바꿨는지는 기록이지
+            # 입력이 아니다 -- 고칠 수 있으면 남의 이름으로 적을 수도 있다.
+            c1, c2 = st.columns(2)
+            with c1:
+                st.text_input(REV_DATE, value=today, disabled=True,
+                              key="im_rev_date")
+            with c2:
+                st.text_input(REV_USER, value=user_id, disabled=True,
+                              key="im_rev_user")
+            remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark")
+            link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link")
             st.caption(f"{REV_REMARK} 를 적어야 저장할 수 있습니다.")
-        if user_id == "unknown":
-            st.caption("로그인한 사람을 못 읽어 'unknown' 으로 남습니다. "
-                       "포털이 st.session_state['user_id'] 를 채우는지 봐 주세요.")
+            if user_id == "unknown":
+                st.caption("로그인한 사람을 못 읽어 'unknown' 으로 남습니다. "
+                           "포털이 st.session_state['user_id'] 를 채우는지 봐 주세요.")
 
-    go, cancel, _gap = st.columns([1, 1, 3])
-    with go:
-        if st.button("저장", type="primary", disabled=not ok, **_WIDE):
-            body = edited
-            if cols is not None:
-                body = append_rev_info(
-                    edited, f"{datetime.now(KST):%Y-%m-%d}",
-                    remark.strip(), who.strip(), link.strip(),
-                    changes_text(changes))
-            st.session_state.pop(S_REVIEW, None)
-            _save(book, body, who.strip() or user_id, kept)
-    with cancel:
-        if st.button("취소", **_WIDE):
-            st.session_state.pop(S_REVIEW, None)
-            st.rerun()
+        go, cancel, _gap = st.columns([1, 1, 3])
+        with go:
+            saving = st.form_submit_button("저장", type="primary", **_WIDE)
+        with cancel:
+            quit_now = st.form_submit_button("취소", **_WIDE)
+
+    who = user_id
+    if quit_now:
+        st.session_state.pop(S_REVIEW, None)
+        st.rerun()
+    if saving:
+        if cols is not None and not remark.strip():
+            st.error(f"{REV_REMARK} 를 적어야 저장할 수 있습니다.")
+            return
+        body = edited
+        if cols is not None:
+            body = append_rev_info(
+                edited, f"{datetime.now(KST):%Y-%m-%d}",
+                remark.strip(), who.strip(), link.strip(),
+                changes_text(changes))
+        st.session_state.pop(S_REVIEW, None)
+        _save(book, body, who.strip() or user_id, kept)
 
 
 def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
           formulas: dict | None = None) -> None:
     try:
-        stamp = save_workbook(book, edited, user_id,
-                              base_stamp=st.session_state[S_STAMP],
-                              formulas=formulas)
+        done = save_workbook(book, edited, user_id,
+                             base_stamp=st.session_state[S_STAMP],
+                             formulas=formulas)
     except ConcurrentEdit as err:
         # 덮어쓰지 않는다. 누구 값이 맞는지는 코드가 못 정한다.
         st.error(str(err))
@@ -1576,11 +1690,11 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
         st.error(f"저장하지 못했습니다: {err}\n\n"
                  f"S3 의 값은 그대로입니다. 고친 내용은 화면에 남아 있습니다.")
         return
-    # 저장한 판을 S3 에서 다시 읽어 화면을 맞춘다. 방금 올린 것을 그대로
-    # 화면 값으로 삼을 수도 있지만, 그러면 '엑셀 다운로드' 가 내줄 바이트를
-    # 우리가 또 만들어야 하고 그게 저장된 것과 한 글자라도 다를 수 있다.
-    # S3 에 있는 것이 진짜이므로 그것을 읽는다.
-    _load(book)
+    # 방금 올린 판으로 화면을 맞춘다. S3 에서 도로 내려받아 다시 읽으면
+    # 확실하기야 하겠지만, 8MB 짜리 파일에서 그 왕복만 몇 초다 -- 그리고
+    # 방금 우리가 올린 바이트가 곧 지금 S3 에 있는 바이트다. 버전표까지
+    # 그 put 이 돌려준 것이라, 이어서 또 저장할 때도 맞는 판을 짚는다.
+    _seed(book, done.body, done.sheets, formulas or {}, done.stamp)
     # 다음 저장 때 지난번 사유가 그대로 남아 있으면, 그걸 못 보고 그대로
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):
