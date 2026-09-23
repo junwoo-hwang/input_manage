@@ -1023,3 +1023,88 @@ def test_saving_sends_only_the_sheet_you_touched(big_server, page):
         pg.wait_for_timeout(600)
     finally:
         pg.close()
+
+
+# ---------------------------------------------- 저장하는 동안 단추를 끈다
+
+@pytest.fixture(scope="module")
+def slow_server():
+    """저장에 3초가 걸리는 서버. 가짜 저장소는 순식간이라 '저장하는 동안'
+    이 없어서, 그동안 단추가 어떻게 보이는지 볼 수가 없다."""
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
+         "--server.port", str(port), "--server.headless", "true",
+         "--browser.gatherUsageStats", "false"],
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_SLOW_SAVE="3"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(120):
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        proc.terminate()
+        pytest.fail("streamlit 이 안 떴습니다")
+    time.sleep(3)
+    yield f"http://localhost:{port}/"
+    proc.terminate()
+    proc.wait(timeout=20)
+
+
+def _open_on(page, url):
+    """다른 서버에 새 탭을 열고 검사할 파일을 골라 한 칸을 고쳐 둔다."""
+    import re
+    pg = page.context.new_page()
+    pg.goto(url)
+    pg.wait_for_timeout(5000)
+    pg.get_by_role("combobox").click()
+    pg.wait_for_timeout(600)
+    pg.get_by_text(BOOK, exact=True).click()
+    settle(pg)
+    shown = re.search(r"REV_INFO · (\d+)줄", pg.inner_text("body"))
+    click_cell(pg, 0, 2)
+    pg.keyboard.type(f"느린저장{time.time():.0f}")
+    pg.keyboard.press("Enter")
+    wait_dirty(pg)
+    open_review(pg, table=False)
+    pg.get_by_label("Remark — 사유").fill("단추 끄기")
+    return pg, int(shown.group(1))
+
+
+def _rev_lines(pg):
+    import re
+    pg.wait_for_function("() => /REV_INFO · \\d+줄/.test(document.body.innerText)",
+                         timeout=30000)
+    return int(re.search(r"REV_INFO · (\d+)줄", pg.inner_text("body")).group(1))
+
+
+def test_the_save_button_greys_out_the_moment_you_press_it(slow_server, page):
+    """저장이 도는 몇 초 동안 단추가 켜져 있으면 한 번 더 누르게 된다."""
+    pg, _before = _open_on(page, slow_server)
+    try:
+        pg.get_by_role("button", name="저장", exact=True).last.click()
+        busy = pg.get_by_role("button", name="저장 중…")
+        busy.wait_for(timeout=2500)              # 저장(3초)이 끝나기 전에
+        assert busy.is_disabled(), "저장하는 동안 단추가 켜져 있습니다"
+        assert pg.get_by_role("button", name="취소").is_disabled()
+        assert pg.get_by_label("Remark — 사유").is_disabled()
+        pg.wait_for_function(
+            "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+    finally:
+        pg.close()
+
+
+def test_pressing_save_twice_quickly_saves_once(slow_server, page):
+    """두 번째 누름이 단추가 꺼지기 전에 들어가도 저장은 한 번이어야 한다.
+    두 번 저장되면 REV_INFO 에 같은 줄이 두 번 쌓이고 이력 사본도 두 벌이다."""
+    pg, before = _open_on(page, slow_server)
+    try:
+        pg.get_by_role("button", name="저장", exact=True).last.dblclick()
+        pg.wait_for_function(
+            "() => document.body.innerText.includes('저장했습니다')", timeout=60000)
+        pg.wait_for_timeout(4000)                # 두 번째 누름이 뭔가 한다면 이 사이에
+        assert _rev_lines(pg) == before + 1
+    finally:
+        pg.close()

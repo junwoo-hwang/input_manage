@@ -18,6 +18,18 @@ from tests import fake_s3
 im.s3 = fake_s3
 im.FOLDER_PATH = "2GAPU/input"
 
+# 진짜 S3 처럼 저장에 시간이 걸리게 할 때 (초):  IM_LOCAL_SLOW_SAVE=2
+# 가짜 저장소는 순식간이라 '저장하는 동안 단추가 꺼져 있나' 를 볼 수가 없다.
+SLOW = float(__import__("os").environ.get("IM_LOCAL_SLOW_SAVE", "0"))
+if SLOW and not getattr(fake_s3.put_object, "_slow", False):
+    _put = fake_s3.put_object
+
+    def _slow_put(key, data):
+        __import__("time").sleep(SLOW / 2)       # 이력 한 번, 본 파일 한 번
+        return _put(key, data)
+    _slow_put._slow = True
+    fake_s3.put_object = _slow_put
+
 
 BIG_ROWS = int(__import__("os").environ.get("IM_LOCAL_ROWS", "0"))
 

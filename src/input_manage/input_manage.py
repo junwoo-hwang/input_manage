@@ -1551,6 +1551,12 @@ S_REVIEW = "_im_review"      # 저장 팝업에 띄울 변경 내역
 # 동안에는 값이 안 바뀌므로 다시 셀 일이 없다 -- 15,000행에서 한 번 세는 데
 # 0.14초라, 사유를 한 글자 칠 때마다 다시 세면 창이 그만큼씩 굼떠진다.
 S_KEPT = "_im_kept"
+# 저장 창에서 저장을 눌렀다: {"remark", "link"}. 누른 판에서는 이것만 적고
+# 곧바로 다시 그린다 -- 그래야 저장이 도는 몇 초 동안 단추가 회색으로 보인다.
+# 누른 판에서 바로 저장하면 그동안 화면은 누르기 전 그대로라 단추가 켜져
+# 있고, 한 번 더 누를 수 있다.
+S_SAVING = "_im_saving"
+S_SAVE_ERR = "_im_save_err"  # 저장이 실패한 까닭. 창을 다시 켜서 보여 준다
 # 파일을 띄웠을 때 그 안에 있던 수식들. 격자는 값만 다루므로, 이걸 안 들고
 # 있으면 저장할 때 VLOOKUP 이 걸려 있던 칸이 마지막 계산값으로 굳어 버린다.
 S_FORMULAS = "_im_formulas"
@@ -1568,6 +1574,14 @@ _WIDE = ({"width": "stretch"}
 _NO_LABEL = ({"label_visibility": "collapsed"}
              if "label_visibility" in inspect.signature(st.selectbox).parameters
              else {})
+
+# 폼 단추를 끄는 법(disabled)도 예전 streamlit 에는 없다. 없으면 그냥 켜진
+# 채로 둔다 -- 두 번 눌러도 두 번 저장되지는 않는다 (저장 중 표시를 먼저 본다).
+def _off(on: bool) -> dict:
+    return ({"disabled": on}
+            if "disabled" in inspect.signature(st.form_submit_button).parameters
+            else {})
+
 
 # st.dialog 는 예전 streamlit 에 없다. 없으면 팝업 대신 화면 안에 펼쳐서
 # 보여준다 -- 보기는 덜 좋아도 저장 전에 확인하는 절차는 그대로 지킨다.
@@ -1600,7 +1614,7 @@ def _seed(book: str, raw: bytes, sheets: dict[str, pd.DataFrame],
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
     # 다른 파일의 값과 진행 중이던 저장·업로드는 들고 가지 않는다
     for key in (S_EDITED, S_REVIEW, S_KEPT, S_WANT, S_PENDING,
-                S_UPLOAD, S_UPLOADED):
+                S_UPLOAD, S_UPLOADED, S_SAVING, S_SAVE_ERR):
         st.session_state.pop(key, None)
 
 
@@ -1924,6 +1938,14 @@ def _review_body(book: str, user_id: str) -> None:
     # 먼저 처리되고, 그 판에서 저장 단추는 아직 사유가 빈 줄 알고 꺼져 있다.
     # 그래서 한 번 눌러서는 저장이 안 되고 두 번 눌러야 했다. form 안에서는
     # 누름 한 번에 칸 값이 같이 실려 온다.
+    # 저장을 눌러 지금 저장하는 중이면 칸과 단추를 전부 끈다 (회색). 두 번
+    # 눌러 두 번 저장되는 일이 없게.
+    pending = st.session_state.get(S_SAVING)
+    busy = pending is not None
+    failed = st.session_state.pop(S_SAVE_ERR, None)
+    if failed:
+        st.error(failed)
+
     with st.form("im_rev_form", clear_on_submit=False):
         if cols is None:
             st.caption(f"이 파일에는 `{REV_SHEET}` 시트가 없어 변경 사유는 안 받습니다.")
@@ -1940,8 +1962,10 @@ def _review_body(book: str, user_id: str) -> None:
             with c2:
                 st.text_input(REV_USER, value=user_id, disabled=True,
                               key="im_rev_user")
-            remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark")
-            link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link")
+            remark = st.text_input(f"{REV_REMARK} — 사유", key="im_rev_remark",
+                                   disabled=busy)
+            link = st.text_input(f"{REV_LINK} — 세부 내용 (필수X)", key="im_rev_link",
+                                 disabled=busy)
             st.caption(f"{REV_REMARK} 를 적어야 저장할 수 있습니다.")
             if user_id == "unknown":
                 st.caption("로그인한 사람을 못 읽어 'unknown' 으로 남습니다. "
@@ -1949,11 +1973,26 @@ def _review_body(book: str, user_id: str) -> None:
 
         go, cancel, _gap = st.columns([1, 1, 3])
         with go:
-            saving = st.form_submit_button("저장", type="primary", **_WIDE)
+            saving = st.form_submit_button("저장 중…" if busy else "저장",
+                                           type="primary", **_off(busy), **_WIDE)
         with cancel:
-            quit_now = st.form_submit_button("취소", **_WIDE)
+            quit_now = st.form_submit_button("취소", **_off(busy), **_WIDE)
 
     who = user_id
+    if busy:
+        # 두 번째 판: 단추는 위에서 이미 회색으로 나갔다. 이제 진짜 저장한다.
+        # 표시는 저장하기 전에 치운다 -- 저장 도중 무슨 일로 이 판이 다시
+        # 돌더라도 두 번 저장하지 않게.
+        st.session_state.pop(S_SAVING, None)
+        body = edited
+        if cols is not None:
+            body = append_rev_info(
+                edited, f"{datetime.now(KST):%Y-%m-%d}",
+                pending["remark"], who.strip(), pending["link"],
+                changes_text(changes))
+        with st.spinner("저장하는 중입니다…"):
+            _save(book, body, who.strip() or user_id, kept)
+        return
     if quit_now:
         st.session_state.pop(S_REVIEW, None)
         st.rerun()
@@ -1961,14 +2000,10 @@ def _review_body(book: str, user_id: str) -> None:
         if cols is not None and not remark.strip():
             st.error(f"{REV_REMARK} 를 적어야 저장할 수 있습니다.")
             return
-        body = edited
-        if cols is not None:
-            body = append_rev_info(
-                edited, f"{datetime.now(KST):%Y-%m-%d}",
-                remark.strip(), who.strip(), link.strip(),
-                changes_text(changes))
-        st.session_state.pop(S_REVIEW, None)
-        _save(book, body, who.strip() or user_id, kept)
+        # 첫 판: 눌렀다는 것만 적고 곧바로 다시 그린다 (단추가 회색이 된다)
+        st.session_state[S_SAVING] = {"remark": remark.strip(),
+                                      "link": link.strip()}
+        st.rerun()
 
 
 def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
@@ -1979,12 +2014,15 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
                              formulas=formulas)
     except ConcurrentEdit as err:
         # 덮어쓰지 않는다. 누구 값이 맞는지는 코드가 못 정한다.
-        st.error(str(err))
-        return
+        st.session_state[S_SAVE_ERR] = str(err)
+        st.rerun()
     except Exception as err:
-        st.error(f"저장하지 못했습니다: {err}\n\n"
-                 f"S3 의 값은 그대로입니다. 고친 내용은 화면에 남아 있습니다.")
-        return
+        # 창을 다시 켜서(단추도 다시 켜진다) 까닭을 보여 준다. 적어 둔
+        # 사유는 그대로 있으니 다시 누르면 된다.
+        st.session_state[S_SAVE_ERR] = (
+            f"저장하지 못했습니다: {err}\n\n"
+            f"S3 의 값은 그대로입니다. 고친 내용은 화면에 남아 있습니다.")
+        st.rerun()
     # 방금 올린 판으로 화면을 맞춘다. S3 에서 도로 내려받아 다시 읽으면
     # 확실하기야 하겠지만, 8MB 짜리 파일에서 그 왕복만 몇 초다 -- 그리고
     # 방금 우리가 올린 바이트가 곧 지금 S3 에 있는 바이트다. 버전표까지

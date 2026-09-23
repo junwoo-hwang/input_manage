@@ -52,6 +52,11 @@ G-DVC / 2GAPU/input /
   언제 누가 바꿨는지는 기록이지 입력이 아니다. `관련` 은 안 적어도 된다
 - 그 창은 **Esc 로 닫히지 않는다** — 적던 사유가 통째로 날아가기 때문이다.
   닫으려면 `취소` 나 오른쪽 위 X 다
+- 창에서 저장을 누르면 **그 자리에서 단추가 `저장 중…` 회색으로 꺼진다**. 저장이
+  도는 몇 초 동안 켜져 있으면 한 번 더 누르게 되기 때문이다. 그래서 누른 판에서는
+  '눌렀다' 만 적고 곧바로 다시 그리고(단추가 꺼진 채로), 저장은 그다음 판에서
+  한 번만 한다. 빠르게 두 번 눌러도 한 번 저장된다. 저장이 실패하면 창이 다시
+  켜지고 까닭이 뜬다 (적어 둔 사유는 그대로)
 - **`변경 이력`** 을 펼치면 그 `REV_INFO` 시트를 최근 것부터 보여준다
 - 저장하면 S3 의 그 엑셀이 바로 바뀌고, **창에서 본 변경내용이 그대로**
   `REV_INFO` 의 `관련` 칸에 들어간다 (사람이 적은 것 먼저, 그 아래에)
@@ -283,7 +288,7 @@ render / setComponentValue)만 직접 지킨다.
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 playwright install chromium
-pytest -q            # 201개
+pytest -q            # 203개
 ```
 
 - `tests/test_storage.py` — 저장이 조용히 덮어써지거나 반쯤 되다 말지 않는가
@@ -297,4 +302,5 @@ pytest -q            # 201개
 ```bash
 streamlit run app_local.py
 IM_LOCAL_XLSX=진짜파일.xlsx streamlit run app_local.py   # 실제 크기로 볼 때
+IM_LOCAL_SLOW_SAVE=3 streamlit run app_local.py         # 저장에 3초 걸리게
 ```
