@@ -1285,3 +1285,44 @@ def test_an_uploaded_rev_info_is_ignored_and_the_log_grows_by_one(tmp_path, page
     assert len(now) == len(stored) + 1, now
     assert "업로드 뒤 기록" in now[-1]
     assert not any("위조된 기록" in r for r in now)
+
+
+# ------------------------------------------- 엑셀과 복사·붙여넣기 (여러 줄 칸)
+
+def test_pasting_a_multi_line_cell_from_excel_keeps_it_in_one_cell(page):
+    """엑셀은 Alt+Enter 로 줄을 바꾼 칸을 "..." 로 감싸 클립보드에 넣는다.
+    줄바꿈마다 자르면 그 칸이 두 줄로 쪼개져 아래 줄이 전부 밀린다."""
+    reset(page)
+    click_cell(page, 0, 0)
+    paste(page, 'A1\t"첫줄\n둘째줄"\r\nB1\tB2\r\n')
+    got = table(page)["rows"]
+    assert got[0][0] == "A1" and got[0][1] == "첫줄\n둘째줄", got[:2]
+    assert got[1][0] == "B1" and got[1][1] == "B2", got[:2]
+
+
+def test_copying_a_multi_line_cell_quotes_it_like_excel(page):
+    reset(page)
+    click_cell(page, 0, 1)
+    paste(page, '"한\n칸 ""따옴표"""')
+    click_cell(page, 0, 1)
+    page.keyboard.press("Control+c")
+    page.wait_for_timeout(400)
+    assert page.evaluate("() => navigator.clipboard.readText()") == \
+        '"한\n칸 ""따옴표"""'
+
+
+def test_the_file_picker_is_locked_while_there_are_unsaved_edits(page):
+    """파일을 바꾸면 고친 것을 들고 가지 않는다. 한 번 잘못 누른 것으로
+    말없이 사라지지 않게, 저장하거나 초기화하기 전에는 못 바꾼다."""
+    reset(page)
+    assert page.get_by_role("combobox").is_enabled()
+    click_cell(page, 0, 2)
+    page.keyboard.type("잠금")
+    page.keyboard.press("Enter")
+    wait_dirty(page)
+    page.wait_for_timeout(800)
+    assert page.get_by_role("combobox").is_disabled(), "고친 게 있는데 파일을 바꿀 수 있다"
+    page.get_by_role("button", name="초기화").click()
+    settle(page)
+    page.wait_for_timeout(800)
+    assert page.get_by_role("combobox").is_enabled(), "초기화한 뒤에도 잠겨 있다"

@@ -346,7 +346,11 @@ function loadRows(s) {
 
 // 걸린 시간을 적어 두는 곳. 검사와 실측에서 읽는다 (화면에는 안 쓴다).
 window.__marks = [];
-const mark = (what) => window.__marks.push([what, performance.now()]);
+const mark = (what) => {
+  const m = window.__marks;
+  m.push([what, performance.now()]);
+  if (m.length > 500) m.splice(0, m.length - 500);   // 끝없이 쌓이지 않게
+};
 
 const NO_SHEET = { name: "", cols: [], rows: [] };
 // 지금 보는 시트. 늘 풀린 채로 준다 -- 고치는 곳은 전부 여기를 거친다.
@@ -796,7 +800,7 @@ function publishFull(token) {
   setValue({
     rev: ++rev, dirty: dirty, full: true, token: token, have: version,
     sheets: sheets.map(s => (s.touched || s.orig === undefined
-      ? { name: s.name, cols: s.cols.slice(), rows: loadRows(s) }
+      ? { name: s.name, orig: s.orig, cols: s.cols.slice(), rows: loadRows(s) }
       : { name: s.name, keep: s.orig })),
   });
 }
@@ -1069,6 +1073,14 @@ document.addEventListener("keydown", (e) => {
 function scrollIntoView() {
   const td = cellEl(anchor.r, anchor.c);
   if (td) td.scrollIntoView({ block: "nearest", inline: "nearest" });
+  else scrollToRow(anchor.r, false);
+}
+
+// 아직 안 그린 줄로 스크롤한다. 줄 높이가 늘 같아서(ROW_H) 자리를 셈할 수 있다.
+function scrollToRow(r, middle) {
+  const y = (r + 1) * ROW_H;             // +1 은 머리줄
+  scroll.scrollTop = middle ? Math.max(0, y - scroll.clientHeight / 2)
+                            : Math.max(0, y - ROW_H);
 }
 
 function clearSelection() {
@@ -1098,15 +1110,65 @@ function redo() {
 // 엑셀은 클립보드에 탭으로 칸을, 줄바꿈으로 줄을 나눈 글자를 넣는다.
 // 같은 꼴로 주고받으면 엑셀 <-> 이 화면이 그대로 오간다.
 // ===================================================================
+// 칸 안에 탭·줄바꿈·따옴표가 있으면 엑셀처럼 "..." 로 감싸고 안의 " 는 ""
+// 로 적는다. 안 그러면 엑셀에 붙일 때 칸 안의 줄바꿈이 줄을 나눠 버린다.
+function tsvField(v) {
+  return /[\t\n\r"]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
 function selectionAsTsv() {
   const { r0, r1, c0, c1 } = selRange();
   const out = [];
   for (let r = r0; r <= r1; r++) {
     const line = [];
-    for (let c = c0; c <= c1; c++) line.push(cell(r, c));
+    for (let c = c0; c <= c1; c++) line.push(tsvField(cell(r, c)));
     out.push(line.join("\t"));
   }
   return out.join("\n");
+}
+
+// 엑셀이 클립보드에 넣는 꼴을 줄·칸으로 푼다. 칸은 탭, 줄은 줄바꿈으로
+// 나누되, "..." 로 감싼 칸 안의 탭·줄바꿈은 그 칸의 글자다 (엑셀에서 Alt+Enter
+// 로 줄을 바꾼 칸). 그냥 줄바꿈마다 자르면 그 칸이 두 줄로 쪼개져서 그 아래
+// 줄이 전부 한 칸씩 밀려 들어간다. 짝이 안 맞는 따옴표는 그냥 글자로 둔다.
+function parseTsv(text) {
+  const t = text.replace(/\r\n?/g, "\n");
+  const rows = [];
+  let row = [];
+  let i = 0;
+  const n = t.length;
+  const plain = (from) => {
+    let k = from;
+    while (k < n && t[k] !== "\t" && t[k] !== "\n") k++;
+    return k;
+  };
+  while (true) {
+    let field;
+    if (t[i] === '"') {
+      let j = i + 1, buf = "", closed = false;
+      while (j < n) {
+        if (t[j] === '"') {
+          if (t[j + 1] === '"') { buf += '"'; j += 2; continue; }
+          closed = true; j++; break;
+        }
+        buf += t[j++];
+      }
+      if (closed && (j >= n || t[j] === "\t" || t[j] === "\n")) {
+        field = buf; i = j;
+      } else {
+        const k = plain(i); field = t.slice(i, k); i = k;
+      }
+    } else {
+      const k = plain(i); field = t.slice(i, k); i = k;
+    }
+    row.push(field);
+    if (i >= n) { rows.push(row); break; }
+    if (t[i] === "\t") { i++; continue; }
+    i++;                                   // 줄바꿈
+    rows.push(row); row = [];
+    if (i >= n) break;                     // 엑셀은 끝에 줄바꿈을 하나 붙인다
+  }
+  return rows;
 }
 
 function copySelection() {
@@ -1139,10 +1201,9 @@ document.addEventListener("paste", (e) => {
 
 function pasteTsv(text) {
   if (refuse()) return;
-  // 끝의 줄바꿈 하나는 버린다. 엑셀이 늘 붙여서 주는데, 그대로 두면
-  // 붙여넣을 때마다 빈 줄이 하나씩 생긴다.
-  const body = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
-  const grid = body.split("\n").map(line => line.split("\t"));
+  // 끝의 줄바꿈 하나는 버린다 (parseTsv). 엑셀이 늘 붙여서 주는데, 그대로
+  // 두면 붙여넣을 때마다 빈 줄이 하나씩 생긴다.
+  const grid = parseTsv(text);
   if (!grid.length) return;
   pushUndo();
   const wide = Math.max(...grid.map(g => g.length));
@@ -1190,19 +1251,26 @@ function clearHits() {
   }
 }
 
+// 찾은 칸에 칠하는 것은 이만큼까지만. 'a' 처럼 흔한 글자를 찾으면 몇 만 칸이
+// 걸리는데, 그걸 다 칠하느라 한참 멈춘다. 몇 개인지는 전부 센다.
+const HIT_PAINT_MAX = 2000;
+
 function runFind() {
   clearHits();
   const q = findInput.value.trim().toLowerCase();
   hits = []; hitAt = -1;
   if (!q) { findHits.textContent = ""; return; }
+  // 칸마다 cell() 을 거치면 45만 칸에서 그 한 겹이 눈에 띄게 느리다
   const rs = rows(), n = cols().length;
   for (let r = 0; r < rs.length; r++) {
+    const row = rs[r];
     for (let c = 0; c < n; c++) {
-      if (cell(r, c).toLowerCase().includes(q)) hits.push({ r, c });
+      const v = row[c];
+      if (v && String(v).toLowerCase().includes(q)) hits.push({ r, c });
     }
   }
-  for (const h of hits) {
-    const td = cellEl(h.r, h.c);
+  for (let i = 0; i < hits.length && i < HIT_PAINT_MAX; i++) {
+    const td = cellEl(hits[i].r, hits[i].c);
     if (td) td.classList.add("hit");
   }
   if (hits.length) gotoHit(0);
@@ -1221,6 +1289,8 @@ function gotoHit(i) {
   if (td) {
     td.classList.add("hit-now");
     td.scrollIntoView({ block: "center", inline: "nearest" });
+  } else {
+    scrollToRow(h.r, true);             // 아직 안 그린 줄이면 자리로 간다
   }
   findHits.textContent = `${hitAt + 1} / ${hits.length}`;
 }

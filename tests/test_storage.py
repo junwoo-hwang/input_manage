@@ -220,42 +220,11 @@ def test_missing_values_are_saved_blank_not_as_the_word_nan():
     assert im.load_workbook("A")[0]["S"]["b"].tolist() == [None]
 
 
-@pytest.mark.parametrize("before,after,want", [
-    ([{"a": 1}], [{"a": 1}], 0),
-    ([{"a": 1}], [{"a": 2}], 1),
-    ([{"a": 1}], [{"a": 1}, {"a": 2}], 1),              # 줄이 늘었다
-    ([{"a": 1}, {"a": 2}], [{"a": 1}], 1),              # 줄이 줄었다
-    ([{"a": 1}], [{"a": 1, "b": 2}], 1),                # 칸이 늘었다
-])
-def test_changed_cells_counts_what_a_person_would_count(before, after, want):
-    assert im.changed_cells(pd.DataFrame(before), pd.DataFrame(after)) == want
-
-
 @pytest.mark.parametrize("name", ["아주긴시트이름" * 10, "재고/현황", "a[b]c", "매출:합"])
 def test_sheet_names_excel_would_refuse_do_not_break_the_save(name):
     im.save_workbook("A", {name: pd.DataFrame([{"a": 1}])}, "hong")
     got = list(im.load_workbook("A")[0])[0]
     assert len(got) <= 31 and not set(got) & set(':\\/?*[]'), got
-
-
-def test_adding_an_empty_column_counts_as_a_change():
-    """값만 견주면 0 이 나와서 열을 넣고 저장을 누를 수가 없다."""
-    before = pd.DataFrame([{"a": "1"}, {"a": "2"}])
-    after = pd.DataFrame([{"a": "1", "새칸": ""}, {"a": "2", "새칸": ""}])
-    assert im.changed_cells(before, after) == 1
-
-
-def test_removing_an_empty_column_counts_as_a_change():
-    before = pd.DataFrame([{"a": "1", "빈칸": ""}])
-    after = pd.DataFrame([{"a": "1"}])
-    assert im.changed_cells(before, after) == 1
-
-
-def test_a_column_added_with_content_is_not_counted_twice():
-    """내용이 있으면 그 값이 이미 세어졌으므로 더하지 않는다."""
-    before = pd.DataFrame([{"a": "1"}])
-    after = pd.DataFrame([{"a": "1", "b": "2"}])
-    assert im.changed_cells(before, after) == 1
 
 
 # -------------------------------------- 저장 전에 보여 줄 것 (무엇이 바뀌나)
@@ -520,16 +489,36 @@ def test_a_column_inserted_to_the_left_does_not_move_the_formula():
     assert str(book["STEP"]["D2"].value).startswith("=VLOOKUP")
 
 
-def test_a_blank_row_removed_on_save_pulls_the_formula_up():
-    """_clean 이 빈 줄을 빼면 아래 줄이 당겨진다. 수식도 같이 당겨야 한다."""
+def test_a_blank_row_in_the_middle_is_kept_so_formulas_point_right():
+    """가운데의 빈 줄을 빼면 그 아래 줄이 당겨지는데 수식 안의 줄 번호(A3)는
+    그대로라, 엑셀로 열면 한 줄 어긋난 칸을 가리킨다. 빈 줄은 그 자리에 둔다."""
     sheets = {"STEP": pd.DataFrame(
         [{"a": "", "f": ""}, {"a": "x", "f": "1"}], dtype=object)}
     formulas = {"STEP": {(1, "f"): "SUM(A3:A3)"}}
     im.save_workbook("A", sheets, "hong", formulas=formulas)
     raw = fake_s3.STORE["2GAPU/input/A.xlsx"]
     book = openpyxl.load_workbook(io.BytesIO(raw))
-    assert book["STEP"]["B2"].value == "=SUM(A3:A3)", \
+    assert book["STEP"]["A3"].value == "x", "값이 한 줄 당겨졌다"
+    assert book["STEP"]["B3"].value == "=SUM(A3:A3)", \
         [c.value for c in book["STEP"]["B"]]
+
+
+def test_a_formula_row_whose_result_is_blank_is_not_dropped():
+    """수식 결과가 빈 글자면 줄이 비어 보인다. 끝에 있어도 빼면 수식이 사라진다."""
+    sheets = {"STEP": pd.DataFrame(
+        [{"a": "x", "f": "1"}, {"a": "", "f": ""}], dtype=object)}
+    formulas = {"STEP": {(1, "f"): 'IF(A3="","",1)'}}
+    im.save_workbook("A", sheets, "hong", formulas=formulas)
+    book = openpyxl.load_workbook(io.BytesIO(fake_s3.STORE["2GAPU/input/A.xlsx"]))
+    assert book["STEP"]["B3"].value == '=IF(A3="","",1)'
+
+
+def test_a_blank_row_put_in_the_middle_shows_as_new():
+    """가운데 끼운 빈 줄은 그대로 저장되고 아래 줄을 민다 -- 창에 보여야 한다."""
+    before = frame([["1", "x"], ["2", "y"]])
+    after = frame([["1", "x"], ["", ""], ["2", "y"]])
+    rows, total = im.row_changes(before, after)
+    assert total == 1 and rows[0]["kind"] == "신규" and rows[0]["row"] == 2, rows
 
 
 def test_excel_is_told_to_recompute_on_open():
@@ -792,9 +781,7 @@ def test_the_users_actual_formula_shapes_all_recompute():
 
 
 def test_a_blank_gap_above_the_formula_does_not_confuse_the_cached_value():
-    """빈 줄이 위에서 빠지면 그 아래 줄들이 저장 파일에서 자리가 당겨진다
-    (_clean 이 늘 그래 왔다). 캐시 값은 그래도 맞아야 한다 -- 자리가
-    당겨지기 전의 원래 자리를 기준으로 계산하기 때문이다.
+    """위에 빈 줄이 있어도 캐시 값은 제 줄을 기준으로 맞아야 한다.
     """
     # DataFrame 의 칸은 실제 엑셀 열(A,B,C,D,E...) 과 자리가 그대로
     # 맞아야 한다 -- 읽을 때 건너뛴 열은 'Unnamed: N' 으로 자리를 채워 두는
@@ -872,3 +859,148 @@ def test_the_empty_after_save_file_runs_cleanly(tmp_path, monkeypatch):
                           "A", "2GAPU/input/A.xlsx", "hong", "etag"],
                          capture_output=True, text=True, timeout=30)
     assert got.returncode == 0, got.stderr
+
+
+# ------------------------------------------- VLOOKUP 은 엑셀과 똑같이 계산한다
+
+def _vl(formula, table_rows, key_value, *, own_extra=None):
+    """Main!C2 에 formula 를 걸고, E2 에 key_value 를 넣은 채 다시 계산한 값."""
+    look = pd.DataFrame(table_rows, columns=["코드", "b값", "이름"], dtype=object)
+    main = pd.DataFrame({"A": [""], "B": [""], "C": ["낡은값"], "D": [""],
+                         "E": [key_value]}, dtype=object)
+    books = {"ET추출여부": look, "ET 추출": look, "Main": main}
+    if own_extra is not None:
+        books["Main"] = own_extra
+    got = im.refresh_formula_cache(books, {"Main": {(0, "C"): formula}})
+    return got["Main"].loc[0, "C"]
+
+
+TABLE = [["K1", "b1", "이름1"], ["k2", "b2", "이름2"], ["1001", "b3", "수"],
+         ["0010", "b4", "글자"], ["K5", "b5", None]]
+
+
+def test_vlookup_ignores_case_like_excel():
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", TABLE, "K2") == "이름2"
+
+
+def test_vlookup_does_not_trim_spaces_like_excel():
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", TABLE, "K1 ") == "#N/A"
+
+
+def test_vlookup_reads_a_quoted_sheet_name():
+    """이름에 빈칸이 있는 시트는 엑셀이 따옴표로 감싸 적는다."""
+    assert _vl("VLOOKUP(E2,'ET 추출'!$A:$C,2,0)", TABLE, "K1") == "b1"
+
+
+def test_vlookup_with_no_sheet_name_looks_in_its_own_sheet():
+    own = pd.DataFrame({"A": ["K9", "K1"], "B": ["자기", "x"], "C": ["낡은값", ""],
+                        "D": ["", ""], "E": ["K9", ""]}, dtype=object)
+    assert _vl("VLOOKUP(E2,$A:$B,2,0)", TABLE, "", own_extra=own) == "자기"
+
+
+def test_vlookup_keeps_to_the_rows_it_names():
+    """$A$2:$C$3 이면 3행까지만 찾는다 -- 그 아래에 있는 것은 #N/A."""
+    assert _vl("VLOOKUP(E2,ET추출여부!$A$2:$C$3,3,0)", TABLE, "1001") == "#N/A"
+    assert _vl("VLOOKUP(E2,ET추출여부!$A$2:$C$4,3,0)", TABLE, "1001") == "수"
+
+
+def test_vlookup_of_an_empty_cell_gives_zero_like_excel():
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", TABLE, "K5") == 0
+
+
+def test_vlookup_tells_numbers_from_text_like_excel():
+    """'0010' 은 글자라 수 10 과 다르다. 격자가 올려준 '1001' 은 저장하면 수다."""
+    table = [[1001, "b", "수로 찾음"], ["0010", "b", "글자로 찾음"]]
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", table, "1001") == "수로 찾음"
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", table, "0010") == "글자로 찾음"
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", table, "10") == "#N/A"
+
+
+@pytest.mark.parametrize("formula", [
+    "VLOOKUP(TRIM(E2),ET추출여부!$A:$C,3,0)",     # 찾을 값이 식이다
+    "VLOOKUP(E2&\"x\",ET추출여부!$A:$C,3,0)",
+    "VLOOKUP(Other!E2,ET추출여부!$A:$C,3,0)",     # 다른 시트의 칸
+])
+def test_vlookup_with_an_expression_key_is_left_alone(formula):
+    """예전에는 식을 글자 그대로 찾아서 #N/A 를 적었다. 모르는 것은 안 건드린다."""
+    assert _vl(formula, TABLE, "K1") == "낡은값"
+
+
+def test_vlookup_with_a_wildcard_key_is_left_alone():
+    """엑셀은 * ? 를 와일드카드로 본다 -- 흉내 내다 틀리느니 안 한다."""
+    assert _vl("VLOOKUP(E2,ET추출여부!$A:$C,3,0)", TABLE, "K*") == "낡은값"
+
+
+def test_vlookup_of_a_literal_key():
+    assert _vl('VLOOKUP("k1",ET추출여부!$A:$C,2,0)', TABLE, "") == "b1"
+    assert _vl("VLOOKUP(1001,ET추출여부!$A:$C,3,0)", TABLE, "") == "수"
+
+
+# ------------------------------------------------------------- S3 다루기
+
+def test_a_save_that_lands_while_we_build_the_file_is_not_overwritten(monkeypatch):
+    """처음 확인과 올리기 사이에 몇 초가 있다 (파일 만들기, 이력 올리기).
+    그 사이에 누가 저장했으면 올리기 바로 앞의 확인에서 멈춰야 한다."""
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    _s, stamp = im.load_workbook("A")
+    real_build = im.build_xlsx
+    theirs = im.to_xlsx(sheets(S=[{"a": 99}]))       # 바꿔 끼우기 전에 만든다
+
+    def someone_saves_meanwhile(*a, **k):
+        out = real_build(*a, **k)
+        fake_s3.put_object("2GAPU/input/A.xlsx", theirs)
+        return out
+    monkeypatch.setattr(im, "build_xlsx", someone_saves_meanwhile)
+    with pytest.raises(im.ConcurrentEdit):
+        im.save_workbook("A", sheets(S=[{"a": 2}]), "hong", base_stamp=stamp)
+    monkeypatch.setattr(im, "build_xlsx", real_build)
+    assert im.load_workbook("A")[0]["S"]["a"].tolist() == [99]
+
+
+class _FakeClient:
+    """진짜 boto3 대신. 오류 코드를 골라 던진다."""
+    def __init__(self, code=None):
+        self.code, self.heads = code, 0
+
+    def head_object(self, **_k):
+        self.heads += 1
+        import botocore.exceptions
+        raise botocore.exceptions.ClientError(
+            {"Error": {"Code": self.code}}, "HeadObject")
+
+    def put_object(self, **_k):
+        return {"ETag": '"abc123"'}
+
+
+@pytest.mark.parametrize("code", ["403", "AccessDenied", "500", "SlowDown"])
+def test_head_does_not_call_an_s3_failure_a_missing_file(monkeypatch, code):
+    """권한 오류나 잠깐의 탈을 '파일 없음' 으로 삼키면, 저장할 때 엉뚱하게
+    '다른 사람이 먼저 저장했다' 가 뜨거나 버전표가 빈 채로 남는다."""
+    import botocore.exceptions
+    monkeypatch.setattr(im, "_s3_client", lambda: _FakeClient(code))
+    with pytest.raises(botocore.exceptions.ClientError):
+        im.head_etag("x.xlsx")
+
+
+@pytest.mark.parametrize("code", ["404", "NoSuchKey", "NotFound"])
+def test_head_of_a_missing_file_is_empty(monkeypatch, code):
+    monkeypatch.setattr(im, "_s3_client", lambda: _FakeClient(code))
+    assert im.head_etag("x.xlsx") == ""
+
+
+def test_put_takes_the_version_from_its_own_answer(monkeypatch):
+    """버전표는 올린 대답에 들어 있다 -- HEAD 를 또 보내지 않는다."""
+    client = _FakeClient("404")
+    monkeypatch.setattr(im, "_s3_client", lambda: client)
+    assert im.put_object("x.xlsx", b"data") == "abc123"
+    assert client.heads == 0
+
+
+def test_the_history_name_is_found_without_listing_the_whole_folder(monkeypatch):
+    """이력은 저장할 때마다 쌓인다. 폴더를 통째로 훑으면 점점 느려진다."""
+    asked = []
+    real = fake_s3.list_keys
+    monkeypatch.setattr(fake_s3, "list_keys", lambda p: asked.append(p) or real(p))
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    hist_asks = [p for p in asked if "/이력/" in p]
+    assert hist_asks and all(p.rsplit("/", 1)[-1].endswith("_A_hong") for p in hist_asks), asked

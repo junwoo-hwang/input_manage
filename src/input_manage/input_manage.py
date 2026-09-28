@@ -29,7 +29,7 @@ import os
 import re
 import threading
 import zipfile
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 from xml.etree import ElementTree as ET
@@ -99,17 +99,26 @@ def get_object(key: str) -> tuple[bytes, str] | None:
 
 
 def head_etag(key: str) -> str:
-    """지금 올라가 있는 것의 버전표. 없으면 빈 글자."""
+    """지금 올라가 있는 것의 버전표. 없으면 빈 글자.
+
+    '없다' 는 404 일 때뿐이다. 권한이 없거나 S3 가 잠깐 탈이 난 것까지
+    '없다' 로 삼키면, 저장 직전 확인에서 '다른 사람이 먼저 저장했다' 는
+    엉뚱한 말이 뜨거나 버전표가 빈 채로 남아 다음 저장이 까닭 없이 막힌다.
+    """
     try:
         got = _s3_client().head_object(Bucket=BUCKET_NAME, Key=key)
-    except botocore.exceptions.ClientError:
-        return ""
+    except botocore.exceptions.ClientError as err:
+        if err.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return ""
+        raise
     return got.get("ETag", "").strip('"')
 
 
 def put_object(key: str, data: bytes) -> str:
-    _s3_client().put_object(Bucket=BUCKET_NAME, Key=key, Body=data)
-    return head_etag(key)
+    """올리고 새 버전표를 돌려준다. 버전표는 올린 대답에 들어 있다 -- 확인하려고
+    HEAD 를 한 번 더 보낼 것 없다 (저장 한 번에 두 번씩 헛걸음이었다)."""
+    got = _s3_client().put_object(Bucket=BUCKET_NAME, Key=key, Body=data)
+    return got.get("ETag", "").strip('"') or head_etag(key)
 
 
 def list_keys(prefix: str) -> list[str]:
@@ -236,9 +245,22 @@ def xlsx_read(data: bytes, formulas: dict | None = None) -> dict[str, list[list]
 
 def _read_shared(zf: zipfile.ZipFile) -> list[str]:
     root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-    # <si> 안에 <t> 가 여럿일 수 있다 (글자마다 서식이 다른 경우). 이어 붙인다.
-    return ["".join(t.text or "" for t in si.iter(NS + "t"))
-            for si in root.findall(NS + "si")]
+    return [_rich_text(si) for si in root.findall(NS + "si")]
+
+
+def _rich_text(node) -> str:
+    """<si> 나 <is> 안의 글자. 글자마다 서식이 다르면 <r><t>..</t></r> 여럿으로
+    나뉘어 있어 이어 붙인다. 발음 표기(<rPh>, 일본어 후리가나)는 칸의 글자가
+    아니라서 뺀다."""
+    out = []
+    for child in node:
+        if child.tag == _T:
+            out.append(child.text or "")
+        elif child.tag == _R:
+            t = child.find(_T)
+            if t is not None:
+                out.append(t.text or "")
+    return "".join(out)
 
 
 def _read_date_styles(zf: zipfile.ZipFile) -> set[int]:
@@ -250,10 +272,7 @@ def _read_date_styles(zf: zipfile.ZipFile) -> set[int]:
     root = ET.fromstring(zf.read("xl/styles.xml"))
     custom = set()
     for fmt in root.iter(NS + "numFmt"):
-        code = fmt.get("formatCode", "")
-        # 따옴표 안의 글자는 서식이 아니라 그대로 찍는 글자다
-        bare = re.sub(r'"[^"]*"', "", code)
-        if re.search(r"[yYmMdDhHsS]", bare):
+        if _is_date_format(fmt.get("formatCode", "")):
             custom.add(int(fmt.get("numFmtId")))
 
     out = set()
@@ -265,6 +284,22 @@ def _read_date_styles(zf: zipfile.ZipFile) -> set[int]:
         if fid in BUILTIN_DATE_FMTS or fid in custom:
             out.add(i)
     return out
+
+
+def _is_date_format(code: str) -> bool:
+    """서식 문자열이 날짜/시각 서식인가.
+
+    날짜 기호(y m d h s)만 남기고 본다. 빼는 것:
+    - "…" 안의 글자 (0"m" 은 단위 m 을 붙이는 수 서식)
+    - \\x 와 _x, *x (그대로 찍는 글자, 자리 채우기)
+    - [Red] [$-412] [>100] 같은 꺾쇠. 회계 서식 #,##0;[Red]-#,##0 은 Red 의 d
+      때문에 날짜로 잘못 읽혀, 그 서식의 수가 전부 날짜로 바뀌었다. 단 [h]
+      [mm] [ss] 는 '지난 시간' 서식이라 남긴다.
+    """
+    bare = re.sub(r'"[^"]*"', "", code)
+    bare = re.sub(r"\\.|[_*].", "", bare)
+    bare = re.sub(r"\[(?![hHmMsS]+\])[^\]]*\]", "", bare)
+    return bool(re.search(r"[yYmMdDhHsS]", bare))
 
 
 def _sheet_paths(zf: zipfile.ZipFile) -> dict[str, str]:
@@ -309,6 +344,95 @@ def col_letter(index: int) -> str:
             return out
 
 
+# ----------------------------------------------------------------------
+# 수식을 다른 칸으로 옮겨 적기 (엑셀의 '채우기' 와 같은 셈)
+#
+# 엑셀은 수식을 아래로 끌어 채우면 그 수식을 파일에 한 번만 적는다. 맨 윗칸
+# 에만 수식이 있고(<f t="shared" ref="C2:C9" si="0">VLOOKUP(E2,..)</f>),
+# 나머지 칸은 '0번 공유 수식을 내 자리로 옮겨 써라'(<f t="shared" si="0"/>)
+# 뿐이다. 그 칸들의 수식은 맨 윗칸 수식의 상대 참조(E2)를 줄·칸 차이만큼
+# 옮겨서(E3, E4, ...) 우리가 만들어야 한다. 안 그러면 저장할 때 맨 윗칸만
+# 수식으로 남고 나머지는 값으로 굳는다.
+#
+# 옮기는 것은 $ 가 안 붙은 쪽뿐이다 ($A$1 은 그대로, $A1 은 줄만, A$1 은
+# 칸만). 글자열("A2")과 따옴표 친 시트 이름('A 1')은 건드리지 않는다.
+# ----------------------------------------------------------------------
+_F_SKIP = re.compile(r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'')
+_F_REF = re.compile(
+    r"(?<![\w.$\]])"                     # 이름·수의 한가운데가 아니다
+    r"(?:"
+    r"(?P<c1d>\$?)(?P<c1>[A-Za-z]{1,3}):(?P<c2d>\$?)(?P<c2>[A-Za-z]{1,3})"   # A:C
+    r"|(?P<r1d>\$?)(?P<r1>\d+):(?P<r2d>\$?)(?P<r2>\d+)"                     # 2:5
+    r"|(?P<cd>\$?)(?P<col>[A-Za-z]{1,3})(?P<rd>\$?)(?P<row>\d+)"            # E2
+    r")(?![\w(\[!.])")                   # 함수 이름(LOG10()·시트 이름(Q1!)이 아니다
+_MAX_COL = 16383                         # XFD
+_MAX_ROW = 1048576
+
+
+class _BadShift(ValueError):
+    """옮긴 참조가 시트 밖으로 나간다 (엑셀이면 #REF!)."""
+
+
+def _shift_col(letters: str, fixed: str, dc: int) -> str:
+    if fixed:
+        return fixed + letters.upper()
+    c = col_index(letters.upper()) + dc
+    if not 0 <= c <= _MAX_COL:
+        raise _BadShift(letters)
+    return col_letter(c)
+
+
+def _shift_row(digits: str, fixed: str, dr: int) -> str:
+    if fixed:
+        return fixed + digits
+    r = int(digits) + dr
+    if not 1 <= r <= _MAX_ROW:
+        raise _BadShift(digits)
+    return str(r)
+
+
+def _shift_formula(text: str, dr: int, dc: int) -> str:
+    """수식을 dr 줄, dc 칸 떨어진 칸으로 옮겨 적은 꼴. 못 옮기면 _BadShift."""
+    def one(m: re.Match) -> str:
+        if m.group("col") is not None:
+            return (_shift_col(m.group("col"), m.group("cd"), dc)
+                    + _shift_row(m.group("row"), m.group("rd"), dr))
+        if m.group("c1") is not None:
+            return (_shift_col(m.group("c1"), m.group("c1d"), dc) + ":"
+                    + _shift_col(m.group("c2"), m.group("c2d"), dc))
+        return (_shift_row(m.group("r1"), m.group("r1d"), dr) + ":"
+                + _shift_row(m.group("r2"), m.group("r2d"), dr))
+
+    if not dr and not dc:
+        return text
+    out, pos = [], 0
+    for skip in _F_SKIP.finditer(text):
+        out.append(_F_REF.sub(one, text[pos:skip.start()]))
+        out.append(skip.group(0))
+        pos = skip.end()
+    out.append(_F_REF.sub(one, text[pos:]))
+    return "".join(out)
+
+
+_A1 = re.compile(r"\$?([A-Za-z]{1,3})\$?(\d+)")
+
+
+class ArrayFormula(str):
+    """배열 수식 ({=...}). 글자로는 보통 수식과 같고, 차지하는 칸 수를 들고
+    다닌다 -- 쓸 때 다시 배열 수식으로 적어야 엑셀이 같게 계산한다."""
+    span: tuple[int, int] = (1, 1)       # (줄 수, 칸 수)
+
+    @classmethod
+    def of(cls, text: str, ref: str | None) -> "ArrayFormula":
+        out = cls(text)
+        if ref and ":" in ref:
+            a, b = (_A1.fullmatch(p) for p in ref.split(":", 1))
+            if a and b:
+                out.span = (abs(int(b[2]) - int(a[2])) + 1,
+                            abs(col_index(b[1].upper()) - col_index(a[1].upper())) + 1)
+        return out
+
+
 def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
                 formulas: dict[tuple[int, int], str] | None = None) -> list[list]:
     rows: list[list] = []
@@ -317,6 +441,8 @@ def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
     # 칸 이름에서 자리를 따는 것은 칸마다 한 번씩 일어난다. 15,000행 x 10칸
     # 이면 15만 번이라, 같은 칸 이름('A','B',...)의 답을 적어 두고 쓴다.
     seen: dict[str, int] = {}
+    # 공유 수식 번호(si) -> (맨 윗칸 수식, 그 칸의 줄, 칸)
+    shared_f: dict[str, tuple[str, int, int]] = {}
     for row in root.iter(NS + "row"):
         # 줄 번호가 건너뛰었으면 그만큼 빈 줄을 채운다
         at_row = int(row.get("r") or len(rows) + 1) - 1
@@ -340,15 +466,37 @@ def _read_sheet(raw: bytes, shared: list[str], date_styles: set[int],
             add(_cell_value(cell, shared, date_styles))
             if formulas is not None:
                 f = cell.find(f_tag)
-                # 배열 수식의 나머지 칸(t="shared" 이면서 내용이 빈 것)은
-                # 본체가 따로 있어서 여기 적을 것이 없다
-                if f is not None and (f.text or "").strip():
-                    formulas[(len(rows), at)] = f.text
+                if f is not None:
+                    _read_formula(f, len(rows), at, formulas, shared_f)
         rows.append(values)
     return rows
 
 
-_V, _IS, _T = NS + "v", NS + "is", NS + "t"
+def _read_formula(f, r: int, c: int, formulas: dict, shared_f: dict) -> None:
+    """수식 칸 하나. 끌어 채운 수식(공유 수식)은 제 자리의 수식으로 펼친다."""
+    kind = f.get("t")
+    text = f.text or ""
+    if kind == "shared":
+        si = f.get("si")
+        if text.strip():                          # 맨 윗칸: 수식이 여기 있다
+            shared_f[si] = (text, r, c)
+            formulas[(r, c)] = text
+        elif si in shared_f:                      # 나머지: 맨 윗칸 것을 옮겨 쓴다
+            base, r0, c0 = shared_f[si]
+            try:
+                formulas[(r, c)] = _shift_formula(base, r - r0, c - c0)
+            except _BadShift:
+                pass                              # 엑셀이면 #REF! -- 값으로 둔다
+    elif kind == "array":
+        if text.strip():
+            formulas[(r, c)] = ArrayFormula.of(text, f.get("ref"))
+    elif kind == "dataTable":
+        pass            # '데이터 표' 는 수식이 아니다 -- 계산된 값만 둔다
+    elif text.strip():
+        formulas[(r, c)] = text
+
+
+_V, _IS, _T, _R = NS + "v", NS + "is", NS + "t", NS + "r"
 
 
 def _cell_value(cell, shared: list[str], date_styles: set[int]):
@@ -361,7 +509,7 @@ def _cell_value(cell, shared: list[str], date_styles: set[int]):
         # 그 경우를 먼저 쳐내면 15만 번의 join 과 generator 를 아낀다.
         if len(node) == 1 and node[0].tag == _T:
             return node[0].text or ""
-        return "".join(t.text or "" for t in node.iter(_T))
+        return _rich_text(node)
     if kind == "s":                                   # sharedStrings 색인
         v = cell.find(_V)
         if v is None or v.text is None:
@@ -419,12 +567,13 @@ def _esc(text) -> str:
     return _XML_CTRL.sub("", out)
 
 
+# 엑셀이 수로 읽는 꼴. 파이썬의 float() 는 'nan', 'inf', '1_000' 도 받아 주는데,
+# 그걸 수로 적으면 엑셀이 파일을 열 때 '복구' 창을 띄운다.
+_EXCEL_NUM = re.compile(r"^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
 def _looks_numeric(text: str) -> bool:
-    try:
-        float(text)
-        return True
-    except (TypeError, ValueError):
-        return False
+    return bool(_EXCEL_NUM.match(text))
 
 
 def _sheet_xml(rows: list[list],
@@ -463,7 +612,13 @@ def _sheet_xml(rows: list[list],
                     cached = ("" if value is None else str(value))
                     kind = "" if _looks_numeric(cached) else ' t="str"'
                     body = f"<v>{_esc(cached)}</v>" if cached else ""
-                    add(f'<c r="{letters[c]}{r}"{kind}><f>{_esc(formula)}</f>'
+                    ftag = "<f>"
+                    if isinstance(formula, ArrayFormula):
+                        nr, nc = formula.span
+                        end = (f":{col_letter(c + nc - 1)}{r + nr - 1}"
+                               if (nr, nc) != (1, 1) else "")
+                        ftag = f'<f t="array" ref="{letters[c]}{r}{end}">'
+                    add(f'<c r="{letters[c]}{r}"{kind}>{ftag}{_esc(formula)}</f>'
                         f'{body}</c>')
                     continue
             if value is None or value == "":
@@ -478,6 +633,12 @@ def _sheet_xml(rows: list[list],
                 add(f'<c r="{letters[c]}{r}"><v>{value}</v></c>')
             elif isinstance(value, bool):
                 add(f'<c r="{letters[c]}{r}" t="b"><v>{1 if value else 0}</v></c>')
+            elif isinstance(value, datetime):
+                # 엑셀의 날짜는 날 수 + 날짜 서식이다. 글자로 적으면 그 칸이
+                # 날짜가 아니게 되어, pandas 로 읽는 쪽에서 형이 바뀐다.
+                add(f'<c r="{letters[c]}{r}" s="2"><v>{_serial(value)!r}</v></c>')
+            elif isinstance(value, date):
+                add(f'<c r="{letters[c]}{r}" s="1"><v>{int(_serial(value))}</v></c>')
             elif isinstance(value, (int, float)):
                 add(f'<c r="{letters[c]}{r}"><v>{value}</v></c>')
             else:
@@ -581,16 +742,22 @@ def xlsx_write(sheets: dict[str, list[list]],
               f'openxmlformats.org/officeDocument/2006/relationships/sharedStrings" '
               f'Target="sharedStrings.xml"/></Relationships>')
 
-        # 서식은 안 쓰지만 styles.xml 자체는 있어야 엑셀이 연다
+        # 서식은 날짜 둘만 쓴다 (칸 서식 1 = 날짜, 2 = 날짜+시각). 날짜를 날 수로
+        # 적으므로 이게 없으면 엑셀에서 46285 같은 수로 보인다.
         zf.writestr("xl/styles.xml",
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<numFmts count="2"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>'
+            '<numFmt numFmtId="165" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts>'
             '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
             '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
             '<borders count="1"><border/></borders>'
             '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
-            '</cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" '
-            'borderId="0" xfId="0"/></cellXfs></styleSheet>')
+            '</cellStyleXfs><cellXfs count="3">'
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+            '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+            '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+            '</cellXfs></styleSheet>')
 
         zf.writestr("xl/sharedStrings.xml", _shared_xml(strings))
         for i, body in enumerate(sheet_xml, start=1):
@@ -758,11 +925,15 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
     아무것도 쓰지 않고 ConcurrentEdit 를 던진다.
     """
     key = _key(f"{book}.xlsx")
-    if base_stamp is not None and s3.head_etag(key) != base_stamp:
-        raise ConcurrentEdit(
-            f"'{book}' 을(를) 화면에 띄운 뒤 다른 사람이 먼저 저장했습니다. "
-            f"덮어쓰지 않았습니다 -- 다시 불러와서 고친 내용을 옮겨 주세요."
-        )
+
+    def check() -> None:
+        if base_stamp is not None and s3.head_etag(key) != base_stamp:
+            raise ConcurrentEdit(
+                f"'{book}' 을(를) 화면에 띄운 뒤 다른 사람이 먼저 저장했습니다. "
+                f"덮어쓰지 않았습니다 -- 다시 불러와서 고친 내용을 옮겨 주세요."
+            )
+
+    check()                  # 먼저 한 번 -- 몇 초씩 파일을 만들기 전에 알린다
 
     # 통째로 만들어 한 번에 올린다. S3 의 put 은 그 자체로 원자적이라,
     # 올리다 끊겨도 옛 파일이 반쯤 덮어써지는 일은 없다.
@@ -772,6 +943,10 @@ def save_workbook(book: str, sheets: dict[str, pd.DataFrame], user_id: str,
     # 이력 넣기가 실패했을 때 되돌릴 것이 없는 채로 끝난다. 순서를 이렇게
     # 두면 '사본을 못 남기면 덮어쓰지도 않는다' 가 된다.
     s3.put_object(_history_key(book, user_id), body)
+
+    # 본 파일을 올리기 바로 앞에서 한 번 더 본다. 파일을 만들고 이력을 올리는
+    # 몇 초 사이에 누가 저장했으면, 처음 확인만으로는 그걸 덮어쓴다.
+    check()
     return Saved(s3.put_object(key, body), body, written)
 
 
@@ -786,7 +961,9 @@ def _history_key(book: str, user_id: str, now: datetime | None = None) -> str:
     """
     now = now or datetime.now(KST)
     base = f"{now:%y%m%d}_{book}_{_safe(user_id)}"
-    taken = {k.rsplit("/", 1)[-1] for k in s3.list_keys(_key(HISTORY_DIR) + "/")}
+    # 겹칠 수 있는 것은 이름이 이렇게 시작하는 것뿐이다. 폴더를 통째로 훑으면
+    # 저장할수록 이력이 쌓여 점점 느려진다.
+    taken = {k.rsplit("/", 1)[-1] for k in s3.list_keys(_key(HISTORY_DIR, base))}
     name = f"{base}.xlsx"
     n = 2
     while name in taken:
@@ -832,20 +1009,22 @@ def build_xlsx(sheets: dict[str, pd.DataFrame],
         key = _sheet_name(name)
         while key in out:                    # 31자로 자르다 보면 겹칠 수 있다
             key = key[:30] + "_"
-        clean = _clean(df)
+        want = formulas.get(name) or {}
+        clean = _clean(df, keep={row for row, _col in want})
         cols = [str(c) for c in clean.columns]
+        # 이름이 없던 머리글은 읽을 때 'Unnamed: 5' 로 부른다. 쓸 때는 도로
+        # 빈칸으로 -- 안 그러면 원래 비어 있던 머리글에 그 글자가 박힌다.
+        head = ["" if c == f"Unnamed: {i}" else c for i, c in enumerate(cols)]
         # 칸이 146만 개라 칸마다 부르는 함수 한 겹도 1초 가까이 된다. 격자가
         # 올려준 값은 거의 다 글자이고 나머지는 빈 칸이라, 그 둘은 바로 처리한다.
-        out[key] = ([cols] + [
+        out[key] = ([head] + [
             [_number(v) if type(v) is str else (None if v is None else _cell(v))
              for v in row]
             for row in clean.to_numpy(dtype=object).tolist()])
 
-        want = formulas.get(name)
         if not want:
             continue
-        # _clean 이 빈 줄을 빼면 그 아래 줄이 위로 당겨진다. 수식의 자리도
-        # 같이 당겨 줘야 엉뚱한 줄에 붙지 않는다.
+        # 줄 이름 -> 파일 안의 몇 번째 줄. 끝의 빈 줄만 빠지므로 자리는 그대로다.
         moved = {old: new for new, old in enumerate(clean.index)}
         at = {col: i for i, col in enumerate(cols)}
         placed = {}
@@ -867,6 +1046,8 @@ def _cell(value):
         # 격자는 모든 값을 글자로 올려보낸다. 수로 적힌 것은 수로 되돌려야
         # 엑셀에서 정렬과 합계가 되고, 다시 읽었을 때 값이 그대로다.
         return _number(value)
+    if isinstance(value, (datetime, date)):
+        return value                     # 날짜로 적는다 (_sheet_xml)
     return str(value)
 
 
@@ -893,44 +1074,38 @@ def _sheet_name(name: str) -> str:
     return clean[:31] or "Sheet1"
 
 
-def _clean(df: pd.DataFrame) -> pd.DataFrame:
+def _blank(row) -> bool:
+    return not any(v is not None and (v.strip() if type(v) is str else str(v).strip())
+                   for v in row)
+
+
+def _clean(df: pd.DataFrame, keep=frozenset()) -> pd.DataFrame:
     """엑셀로 나가기 전에 다듬는다.
 
-    - 통째로 빈 줄은 뺀다. 격자에서 '행 아래' 를 눌렀다 안 채우고 저장하면
-      빈 줄이 그대로 쌓이는데, 그걸 읽는 쪽에서는 결측 한 줄이 된다.
     - None/NaN 은 빈 칸으로 쓴다 ("nan" 이라는 글자로 저장되지 않게).
+    - **맨 끝의** 통째로 빈 줄만 뺀다 ('행 아래' 를 눌렀다 안 채운 것). 단 keep
+      에 든 줄(수식이 있는 줄 -- 수식 결과가 빈 글자면 빈 줄처럼 보인다)은
+      빼지 않는다.
+
+    가운데의 빈 줄은 두지 않고 빼던 때가 있었는데, 그러면 그 아래 줄이 한 줄씩
+    당겨지면서 수식 안의 줄 번호(=VLOOKUP(E10220,..))는 따라 바뀌지 않아, 엑셀로
+    열어 다시 계산하면 한 줄씩 어긋난 값을 끌어왔다. 원래 파일에 있던 빈 줄은
+    그 자리에 그대로 있어야 한다.
     """
     out = df.copy().where(pd.notna(df), None)
     if not len(out):
         return out
-    # 줄마다 첫 칸만 보고 끝나는 게 보통이다 (any 가 값 있는 칸에서 멈춘다).
-    # pandas 의 줄 단위 apply 는 줄마다 Series 를 하나씩 만들어서 52,000줄
-    # 이면 그것만 몇 초였다.
-    keep = [any(v is not None
-                and (v.strip() if type(v) is str else str(v).strip())
-                for v in row)
-            for row in out.to_numpy(dtype=object).tolist()]
-    return out[keep]
-
-
-def _as_text(df: pd.DataFrame, cols: list[str], rows: int) -> pd.DataFrame:
-    """값을 글자로 눕혀 같은 모양으로 맞춘다 (없는 칸은 빈 글자).
-
-    astype(object) 를 먼저 하는 것이 중요하다. 줄 수가 다른 두 표를 맞추려면
-    reindex 로 빈 줄을 채우는데, 정수 칸에 NaN 이 들어가면 pandas 가 그 칸을
-    통째로 실수로 올려서 1 이 1.0 이 된다. 그러면 손도 안 댄 칸까지
-    '바뀌었다' 로 세어져, 저장 전에 보여주는 숫자가 사람이 고친 칸 수와
-    안 맞는다.
-    """
-    out = df.set_axis([str(c) for c in df.columns], axis=1).astype(object)
-    out = out.where(pd.notna(out), "")
-    out = out.reindex(index=range(rows), columns=cols, fill_value="")
-    return out.astype(str).apply(lambda s: s.str.strip())
+    rows = out.to_numpy(dtype=object).tolist()
+    labels = list(out.index)
+    end = len(rows)
+    while end and labels[end - 1] not in keep and _blank(rows[end - 1]):
+        end -= 1
+    return out.iloc[:end]
 
 
 def _text_rows(df: pd.DataFrame | None, cols: list[str],
                rows: int | None = None) -> list[tuple[str, ...]]:
-    """_as_text 와 같은 값을, 표가 아니라 줄마다 글자 튜플로.
+    """칸 값을 글자로 눕혀(빈 칸은 빈 글자, 앞뒤 공백은 뗀다) 줄마다 튜플로.
 
     같은 일을 pandas 로 하면 칸 하나 꺼낼 때마다 pandas 를 한 겹씩 거친다.
     52,000줄 x 28칸이면 그 칸이 146만 개라, '무엇이 바뀌었나' 하나 세는 데
@@ -962,40 +1137,20 @@ def _text_rows(df: pd.DataFrame | None, cols: list[str],
     return list(zip(*columns))
 
 
-def changed_cells(before: pd.DataFrame | None, after: pd.DataFrame) -> int:
-    """두 표 사이에 값이 다른 칸이 몇 개인가.
-
-    줄이나 칸이 늘고 준 것도 센다 -- 저장 전에 사람이 확인하려는 숫자라서.
-    빈 칸과 '없는 칸' 은 같게 본다 (격자에서 행을 늘렸다 비워둔 것은 고친
-    것이 아니다).
-    """
-    after = _clean(after)
-    before = _clean(before) if before is not None else after.iloc[:0]
-    cols = list(dict.fromkeys([*map(str, before.columns), *map(str, after.columns)]))
-    rows = max(len(before), len(after))
-    if not cols or rows == 0:
-        return 0
-    a, b = _as_text(before, cols, rows), _as_text(after, cols, rows)
-    n = int((a != b).to_numpy().sum())
-
-    # 값만 견주면 '빈 칸을 새로 넣은 것' 이 0 으로 나온다 -- 없는 칸도 빈
-    # 글자로 채워 맞추기 때문이다. 그러면 열을 하나 넣고 저장을 누를 수가
-    # 없다. 내용이 있는 칸은 이미 위에서 세어졌으므로, 비어 있는 채로
-    # 생기거나 없어진 칸만 한 개씩 더한다.
-    before_cols = set(map(str, before.columns))
-    after_cols = set(map(str, after.columns))
-    for name in (after_cols - before_cols) | (before_cols - after_cols):
-        if not (b[name] if name in after_cols else a[name]).str.strip().any():
-            n += 1
-    return n
-
-
 # ----------------------------------------------------------------------
 # 무엇이 바뀌었나 -- 저장 전에 사람에게 보여 줄 것
 # ----------------------------------------------------------------------
 REV_SHEET = "REV_INFO"
 # 그 시트에 적을 칸들. 없는 칸은 건너뛰고, 있는 칸만 채운다.
 REV_DATE, REV_REMARK, REV_USER, REV_LINK = "Date", "Remark", "user", "관련"
+
+
+def _trim(rows: list[tuple]) -> list[tuple]:
+    """맨 끝의 통째로 빈 줄을 뗀다."""
+    end = len(rows)
+    while end and not any(rows[end - 1]):
+        end -= 1
+    return rows[:end]
 
 
 def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
@@ -1011,8 +1166,11 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
     """
     cols = list(dict.fromkeys([*map(str, (before.columns if before is not None else [])),
                                *map(str, after.columns)]))
-    old_rows = _text_rows(before, cols) if before is not None else []
-    new_rows = _text_rows(after, cols)
+    # 맨 끝의 빈 줄은 저장할 때 빠진다 ('행 아래' 를 눌렀다 안 채운 것). 그건
+    # 바뀐 것이 아니므로 양쪽에서 떼고 견준다. 가운데의 빈 줄은 그대로 저장
+    # 되므로(_clean) 새로 끼운 빈 줄도 '신규' 로 센다 -- 아래 줄이 밀린다.
+    old_rows = _trim(_text_rows(before, cols)) if before is not None else []
+    new_rows = _trim(_text_rows(after, cols))
 
     out: list[dict] = []
     total = 0
@@ -1034,9 +1192,6 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
             continue
         if tag in ("replace", "insert"):
             for j in range(j1, j2):
-                # 빈 줄을 새로 만들어 두고 안 채운 것은 '바뀐 것' 이 아니다
-                if tag == "insert" and not any(v.strip() for v in new_rows[j]):
-                    continue
                 add("수정" if tag == "replace" else "신규", j + 1, new_rows[j])
         if tag in ("replace", "delete"):
             for i in range(i1, i2):
@@ -1064,10 +1219,18 @@ def row_changes(before: pd.DataFrame | None, after: pd.DataFrame,
 # ----------------------------------------------------------------------
 _NOT_EVALUATED = object()
 
-_VLOOKUP_RE = re.compile(
-    r'^VLOOKUP\(\s*([^,]+?)\s*,\s*([^!,]+)!\$?([A-Za-z]{1,3})\$?\d*'
-    r':\$?([A-Za-z]{1,3})\$?\d*\s*,\s*(\d+)\s*,\s*(?:0|FALSE)\s*\)$',
+# 끌어 채운 VLOOKUP 은 찾을 칸(E2, E3, ...)만 다르고 뒤(,ET추출여부!$A:$C,3,0))는
+# 같다. 그래서 둘로 나눠 뒤쪽은 한 번만 풀어 두고 나눠 쓴다 (_Grids.spec) --
+# 수식 32,000개를 하나하나 통째로 풀면 그것만 0.4초였다.
+_VL_HEAD = re.compile(r"^\s*VLOOKUP\(\s*([^,]+?)\s*,(.*)$", re.IGNORECASE | re.DOTALL)
+_VL_TAIL = re.compile(
+    r"^\s*(?:(?P<sheet>'(?:[^']|'')+'|[^!,']+)!)?"         # 시트 이름 (없으면 제 시트)
+    r"\$?(?P<c1>[A-Za-z]{1,3})\$?(?P<r1>\d*)"               # $A 또는 $A$2
+    r":\$?(?P<c2>[A-Za-z]{1,3})\$?(?P<r2>\d*)"               # $C 또는 $C$500
+    r"\s*,\s*(?P<idx>\d+)\s*,\s*(?:0|FALSE)\s*\)\s*$",     # 정확매칭만
     re.IGNORECASE)
+# 첫 인자가 수로 적힌 것 (VLOOKUP(1001, ...))
+_NUM_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
 # 첫 인자가 같은 시트의 칸 자리를 가리키는 경우 (E10220 처럼). $ 는 있어도
 # 없어도 된다 -- 엑셀에서 상대/절대 참조 표기 차이일 뿐 우리에겐 같다.
 _CELL_REF_RE = re.compile(r'^\$?([A-Za-z]{1,3})\$?(\d+)$')
@@ -1099,7 +1262,7 @@ def refresh_formula_cache(sheets: dict[str, pd.DataFrame],
             ci, ri = where.get(col), rows_at(row)
             if ci is None or ri is None:
                 continue
-            got = _eval_vlookup(text, own, grids)
+            got = _eval_vlookup(text, own, name, grids)
             if got is _NOT_EVALUATED:
                 continue
             if touched is None:
@@ -1144,6 +1307,7 @@ class _Grids:
         self.sheets = sheets
         self._values: dict[str, object] = {}
         self._index: dict[tuple[str, int], dict[str, int]] = {}
+        self._specs: dict[tuple[str, str], tuple | None] = {}
 
     def values(self, name: str):
         got = self._values.get(name)
@@ -1151,23 +1315,48 @@ class _Grids:
             got = self._values[name] = self.sheets[name].to_numpy(dtype=object)
         return got
 
-    def lookup(self, name: str, col: int) -> dict[str, int]:
+    def lookup(self, name: str, col: int, lo: int = 0,
+               hi: int | None = None) -> dict:
         """찾을 값 -> 그 값이 처음 나온 줄. 표 하나를 한 번만 훑는다.
 
-        처음 나온 줄만 담는 것은 엑셀과 같다 -- 같은 키가 여러 줄이면
-        VLOOKUP 은 맨 위엣것을 준다.
+        lo..hi 는 수식에 적힌 줄 범위($A$2:$C$500)를 DataFrame 자리로 옮긴
+        것이다 (없으면 끝까지). 처음 나온 줄만 담는 것은 엑셀과 같다 -- 같은
+        키가 여러 줄이면 VLOOKUP 은 맨 위엣것을 준다. 빈 칸은 무엇과도 안 맞는다.
         """
-        got = self._index.get((name, col))
+        got = self._index.get((name, col, lo, hi))
         if got is None:
             got = {}
-            for row, value in enumerate(self.values(name)[:, col].tolist()):
-                text = ("" if value is None
-                        or (isinstance(value, float) and value != value)
-                        else str(value).strip())
-                if text not in got:
-                    got[text] = row
-            self._index[(name, col)] = got
+            column = self.values(name)[:, col].tolist()
+            stop = len(column) if hi is None else min(hi + 1, len(column))
+            for row in range(max(lo, 0), stop):
+                key = _lookup_norm(column[row])
+                if key is not None and key not in got:
+                    got[key] = row
+            self._index[(name, col, lo, hi)] = got
         return got
+
+    def spec(self, own_name: str, tail: str):
+        """VLOOKUP 의 뒤쪽을 푼 것: (찾을 시트, 키 칸, 값 칸, 첫 줄, 끝 줄).
+        정확매칭 꼴이 아니거나 범위가 시트 밖이면 None."""
+        key = (own_name, tail)
+        if key in self._specs:
+            return self._specs[key]
+        out = None
+        m = _VL_TAIL.match(tail)
+        if m:
+            sheet_name = _unquote_sheet(m["sheet"]) if m["sheet"] else own_name
+            target = self.sheets.get(sheet_name)
+            if target is not None:
+                width = len(target.columns)
+                start, end = col_index(m["c1"].upper()), col_index(m["c2"].upper())
+                pos = start + int(m["idx"]) - 1
+                if start <= pos <= end and pos < width:
+                    # 엑셀 줄 번호 N 은 DataFrame 의 N-2 번째 줄이다 (머리글이 1행)
+                    lo = int(m["r1"]) - 2 if m["r1"] else 0
+                    hi = int(m["r2"]) - 2 if m["r2"] else None
+                    out = (sheet_name, start, pos, lo, hi)
+        self._specs[key] = out
+        return out
 
     def forget(self, name: str) -> None:
         self._values.pop(name, None)
@@ -1175,63 +1364,104 @@ class _Grids:
             del self._index[key]
 
 
-def _eval_vlookup(formula: str, own, grids: _Grids):
+def _lookup_norm(value):
+    """엑셀의 정확매칭 VLOOKUP 이 같다고 보는 값끼리 같아지는 꼴. 빈 칸은 None.
+
+    - 글자는 대소문자를 가리지 않는다 ('ab12' 와 'AB12' 는 같다). 앞뒤 빈칸은
+      떼지 않는다 ('K1 ' 과 'K1' 은 다르다).
+    - 수와 글자는 다르다 (1001 과 '0010'). 격자가 올려준 '1001' 은 저장하면 수로
+      적히므로(_number) 수로 본다.
+    - 날짜는 엑셀처럼 수(날 수)로 본다.
+    """
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", float(value))
+    if isinstance(value, (datetime, date)):
+        return ("n", _serial(value))
+    text = value if isinstance(value, str) else str(value)
+    if text == "":
+        return None
+    number = _number(text)
+    if not isinstance(number, str):
+        return ("n", float(number))
+    return ("s", text.casefold())
+
+
+def _serial(value) -> float:
+    """날짜를 엑셀의 날 수로."""
+    if not isinstance(value, datetime):
+        value = datetime(value.year, value.month, value.day)
+    return (value.replace(tzinfo=None) - EPOCH).total_seconds() / 86400
+
+
+def _unquote_sheet(name: str) -> str:
+    name = name.strip()
+    if len(name) >= 2 and name[0] == name[-1] == "'":
+        return name[1:-1].replace("''", "'")
+    return name
+
+
+def _eval_vlookup(formula: str, own, own_name: str, grids: _Grids):
     """수식 하나를 지금 값으로. 못 하면 _NOT_EVALUATED.
 
-    own 은 이 수식이 들어 있는 시트의 값 배열이다 -- 첫 인자(찾을 값)가 칸
-    자리를 가리키면 그 시트에서 값을 가져와야 하므로, 수식을 어느 시트가
-    들고 있는지가 따로 필요하다. grids 는 VLOOKUP 이 찾아볼 대상 시트를
-    이름으로 꺼내려고 쓴다.
+    엑셀이 저장된 파일을 열어 다시 계산했을 때와 같은 값이어야 한다 --
+    pandas 로 읽는 쪽은 이 값을 그대로 가져간다. 그래서 엑셀과 다르게 될 수
+    있는 것(찾을 값이 식인 것, 와일드카드)은 계산하지 않고 둔다.
+
+    own 은 이 수식이 들어 있는 시트의 값 배열, own_name 은 그 시트 이름이다
+    (범위에 시트 이름이 없으면 제 시트에서 찾는다).
     """
-    m = _VLOOKUP_RE.match(formula.strip())
+    m = _VL_HEAD.match(formula)
     if not m:
         return _NOT_EVALUATED
-    lookup_expr, sheet_name, c1, c2, idx = m.groups()
-    sheet_name = sheet_name.strip()
-    target = grids.sheets.get(sheet_name)
-    if target is None:
+    spec = grids.spec(own_name, m.group(2))
+    if spec is None:
         return _NOT_EVALUATED
-    key = _resolve_ref(lookup_expr, own)
+    sheet_name, start, pos, lo, hi = spec
+    key = _resolve_ref(m.group(1), own)
     if key is _NOT_EVALUATED:
         return _NOT_EVALUATED
+    if isinstance(key, str) and any(ch in key for ch in "*?~"):
+        return _NOT_EVALUATED            # 엑셀은 와일드카드로 본다
+    norm = _lookup_norm(key)
+    if norm is None:
+        return "#N/A"                    # 빈 칸을 찾으면 엑셀도 #N/A
 
-    width = len(target.columns)
-    start, end = col_index(c1.upper()), col_index(c2.upper())
-    idx = int(idx)
-    if idx < 1 or idx - 1 > end - start or start >= width:
-        return _NOT_EVALUATED
-    pos = start + idx - 1
-    if pos >= width:
-        return _NOT_EVALUATED
-
-    row = grids.lookup(sheet_name, start).get(str(key).strip())
+    row = grids.lookup(sheet_name, start, lo, hi).get(norm)
     if row is None:
-        return "#N/A"                        # 엑셀도 못 찾으면 이렇게 보여준다
+        return "#N/A"                    # 엑셀도 못 찾으면 이렇게 보여준다
     found = grids.values(sheet_name)[row, pos]
-    return ("" if found is None or (isinstance(found, float) and found != found)
-            else found)
+    # 찾은 칸이 비어 있으면 엑셀은 0 을 준다
+    if found is None or found == "" or (isinstance(found, float) and found != found):
+        return 0
+    return found
 
 
 def _resolve_ref(expr: str, own):
-    """VLOOKUP 의 첫 인자를 값으로. 같은 시트의 칸 자리(E10220)면 own(그
-    시트의 값 배열)에서 그 값을 가져오고, 아니면 글자/수로 적은 값 그대로다.
+    """VLOOKUP 의 첫 인자를 값으로. 못 하면 _NOT_EVALUATED.
 
-    참조에 시트 이름이 안 붙어 있으므로(그냥 'E10220') 수식이 든 시트
-    자신을 본다 -- VLOOKUP 의 찾을 값은 대개 자기 줄의 다른 칸이다.
+    받는 것은 세 가지뿐이다: 같은 시트의 칸 자리(E10220), 따옴표 친 글자
+    ("K1"), 수(1001). 그 밖의 것(TRIM(E5), E5&F5, 다른시트!E5)은 계산하지
+    않는다 -- 예전에는 그런 식을 글자 그대로 찾아서 엉뚱하게 #N/A 를 적었다.
     """
     expr = expr.strip()
     m = _CELL_REF_RE.match(expr)
-    if not m:
-        if expr.startswith('"') and expr.endswith('"') and len(expr) >= 2:
-            return expr[1:-1]
-        return expr
-    letters, excel_row = m.groups()
-    at_row = int(excel_row) - 2          # 머리글이 엑셀 1행이므로 -2
-    c = col_index(letters.upper())
-    rows, cols = own.shape
-    if at_row < 0 or at_row >= rows or c >= cols:
-        return _NOT_EVALUATED
-    return own[at_row, c]
+    if m:
+        letters, excel_row = m.groups()
+        at_row = int(excel_row) - 2      # 머리글이 엑셀 1행이므로 -2
+        c = col_index(letters.upper())
+        rows, cols = own.shape
+        if at_row < 0 or at_row >= rows or c >= cols:
+            return _NOT_EVALUATED
+        return own[at_row, c]
+    if len(expr) >= 2 and expr[0] == expr[-1] == '"' and '"' not in expr[1:-1].replace('""', ""):
+        return expr[1:-1].replace('""', '"')
+    if _NUM_RE.match(expr):
+        return float(expr)
+    return _NOT_EVALUATED
 
 
 @_no_gc
@@ -1507,8 +1737,60 @@ def to_frames(payload: dict,
                 raise ValueError(f"'{orig}' 시트의 내용을 찾지 못했습니다.")
             out[name] = kept[orig]
         else:
-            out[name] = _to_frame(sheet)
+            base = kept.get(str(sheet.get("orig") or name))
+            out[name] = _restore_types(_to_frame(sheet), base)
     return out
+
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$")
+
+
+def _restore_types(df: pd.DataFrame, base: pd.DataFrame | None) -> pd.DataFrame:
+    """격자는 모든 값을 글자로 돌려준다. 원래 날짜·참거짓이던 칸은 그 꼴로.
+
+    안 그러면 한 번 저장할 때마다 날짜 칸이 글자 칸이 되어, 그 파일을
+    pandas 로 읽는 쪽에서 형이 바뀐다. 원래 표(base)에서 날짜가 하나라도
+    있던 칸만, 날짜 꼴('2026-09-20', '2026-09-20 13:45:00')인 글자만 되돌린다
+    -- 날짜가 없던 칸에 사람이 '2026-09-20' 이라고 친 것은 글자로 둔다.
+    """
+    if base is None or not len(df):
+        return df
+    base_cols = {str(c): c for c in base.columns}
+    out = None
+    for col in df.columns:
+        src = base_cols.get(str(col))
+        if src is None:
+            continue
+        seen = {type(v) for v in base[src].tolist()
+                if v is not None and not (isinstance(v, float) and v != v)}
+        has_date = any(issubclass(t, date) for t in seen)
+        has_bool = bool in seen
+        if not (has_date or has_bool):
+            continue
+        values = df[col].tolist()
+        fixed = [_typed(v, has_date, has_bool) for v in values]
+        if fixed != values:
+            if out is None:
+                out = df.copy()
+            out[col] = pd.Series(fixed, index=df.index, dtype=object)
+    return df if out is None else out
+
+
+def _typed(v, dates: bool, bools: bool):
+    if type(v) is not str:
+        return v
+    if dates:
+        try:
+            if _ISO_DATE.match(v):
+                return date.fromisoformat(v)
+            if _ISO_DATETIME.match(v):
+                return datetime.fromisoformat(v)
+        except ValueError:
+            return v
+    if bools and v in ("True", "False"):
+        return v == "True"
+    return v
 
 
 def _to_frame(sheet: dict) -> pd.DataFrame:
@@ -1670,18 +1952,33 @@ def show_input_manage() -> None:
     # 화면 밖으로 나가서, 저장하려고 스크롤을 해야 한다.
     c_book, c_reset, c_down, c_up, c_save, _gap = st.columns(
         [1, 1, 1, 1, 1, 1.6])
+    # 고친 것이 있는 동안은 파일을 못 바꾼다. 파일을 바꾸면 고친 것을 들고 가지
+    # 않는데(시트 이름이 겹치면 엉뚱한 표에 얹힌다), 고르개를 한 번 잘못 누른
+    # 것만으로 고친 것이 말없이 사라졌다. 격자가 마지막에 알려 온 것을 본다.
+    last = st.session_state.get("im_grid")
+    unsaved = (bool(st.session_state.get(S_UPLOADED))
+               or (isinstance(last, dict) and bool(last.get("dirty"))
+                   and st.session_state.get(S_BOOK) is not None))
     with c_book:
         _row_label("관리 파일")
-        book = st.selectbox("관리 파일", books, key="im_book_pick", **_NO_LABEL)
+        book = st.selectbox(
+            "관리 파일", books, key="im_book_pick", disabled=unsaved, **_NO_LABEL,
+            help="저장하지 않은 수정이 있습니다 — 저장하거나 초기화한 뒤 바꿀 수 있습니다"
+            if unsaved else None)
     with c_reset:
         _row_label()
         reload_now = st.button("초기화", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
-    # 파일을 바꿔 고르면 그 파일을 새로 읽는다. 이전 파일의 미저장 수정은
-    # 들고 가지 않는다 -- 시트 이름이 겹칠 때 엉뚱한 표에 얹히기 때문이다.
+    # 파일을 바꿔 고르면 그 파일을 새로 읽는다.
     if reload_now or st.session_state.get(S_BOOK) != book:
-        _load(book)
+        try:
+            _load(book)
+        except Exception as err:
+            st.error(f"'{book}' 을(를) S3 에서 읽지 못했습니다: {err}")
+            st.caption("잠시 뒤 초기화를 눌러 다시 해 보세요. 계속되면 S3 연결"
+                       "(AWS_ACCESS_KEY, AWS_SECRET_KEY, 권한)을 확인하세요.")
+            return
         if reload_now:
             st.rerun()
 
