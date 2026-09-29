@@ -27,6 +27,9 @@ import json
 import io
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import threading
 import zipfile
 from datetime import date, datetime, time, timedelta, timezone
@@ -58,6 +61,21 @@ FOLDER_PATH = os.getenv("INPUT_S3_PREFIX", "2GAPU/input").strip("/")
 S3_ENDPOINT = os.getenv("INPUT_S3_ENDPOINT", "http://s3.dataplatform.samsungds.net:9020")
 # 저장할 때마다 사본을 쌓아 두는 폴더 (기준 정보 폴더 바로 아래)
 HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
+# 저장이 끝날 때마다 뒤에서 돌리는 raw data 반영 코드와, 그게 print 한 것을
+# 쌓는 곳. 너무 오래 돌면(멈춰 버렸다고 보고) 끊고 실패로 알린다.
+AFTER_SAVE_SCRIPT = Path(os.getenv("INPUT_AFTER_SAVE_SCRIPT")
+                         or Path(__file__).with_name("after_save.py"))
+AFTER_SAVE_LOG = Path(os.getenv("INPUT_AFTER_SAVE_LOG")
+                      or Path(tempfile.gettempdir()) / "input_manage_after_save.log")
+AFTER_SAVE_TIMEOUT = float(os.getenv("INPUT_AFTER_SAVE_TIMEOUT", "7200"))   # 초
+# 저장 완료 창에 적는 말 (한 줄씩)
+AFTER_SAVE_NOTE = ("약 20분 후에 raw data에 반영이 완료됩니다.",
+                   "반영이 완료되면 메신저로 알려드리겠습니다.")
+# 반영이 끝나면 저장한 사람에게 보내는 메신저. 토큰은 환경변수에서만 읽는다.
+KNOX_TOKEN = os.getenv("KNOX_MESSENGER_TOKEN")
+KNOX_SYSTEM_ID = os.getenv("KNOX_MESSENGER_SYSTEM_ID")
+KNOX_PRODUCTION = os.getenv("KNOX_MESSENGER_PRODUCTION", "1") != "0"
+KNOX_ROOM_TITLE = os.getenv("KNOX_MESSENGER_ROOM_TITLE", "기준 정보 관리")
 
 _client_lock = threading.Lock()
 _client = None
@@ -980,6 +998,174 @@ def _safe(text: str) -> str:
     """
     kept = "".join(c for c in str(text or "") if c.isalnum() or c in "-_.")
     return kept.strip(".")[:40] or "unknown"
+
+
+# ----------------------------------------------------------------------
+# 저장이 끝난 뒤 after_save.py (raw data 반영) 를 뒤에서 돌리고, 끝나면
+# 저장한 사람에게 메신저로 알린다.
+#
+# 그 코드는 20분쯤 걸린다. 화면에서 기다리면 그동안 아무것도 못 하므로 따로
+# 띄우고(subprocess) 곧바로 돌아온다. 같은 프로세스의 스레드로 돌리면 20분
+# 동안 포털이 다 같이 느려진다.
+#
+# 같은 파일을 연달아 저장하면 두 개가 겹쳐 돌면서 같은 raw data 를 동시에 쓸
+# 수 있다. 그래서 파일마다 하나씩만 돌리고, 도는 중에 또 저장하면 '끝나면 한
+# 번 더' 만 적어 둔다. 그 사이 몇 번을 저장했든 한 번이고, 가장 최근 저장한
+# 판으로 돈다 -- 그 한 번이 가장 최근 값을 반영한다. 메신저는 그 판에 담긴
+# 저장을 한 사람마다 한 번씩 간다 (같은 사람이 두 번 저장했으면 한 번).
+# 돌고 있던 판에 담기지 못한 저장은 그 판이 끝나도 알리지 않는다 -- 아직
+# 반영이 안 됐으니까. 다음 판이 끝날 때 알린다.
+#
+# 반영 코드가 오류로 끝나면(종료 코드가 0이 아니면) 기다리던 사람에게 실패를
+# 알린다. 안 알리면 오지 않을 메신저를 계속 기다린다.
+#
+# 이 셈은 서버 안에만 있다. 서버가 다시 뜨면 '한 번 더' 와 메신저 보낼 사람을
+# 잊는다.
+# ----------------------------------------------------------------------
+_after_lock = threading.Lock()
+# 파일 -> {"proc": 도는 것, "users": 그 판이 끝나면 알릴 사람 {사람: 저장한 때},
+#          "next": 다음에 돌 인자, "waiting": 다음 판이 끝나면 알릴 사람}
+_after: dict[str, dict] = {}
+
+
+def run_after_save(book: str, user: str, stamp: str) -> None:
+    """저장이 끝났다고 알린다. after_save.py 를 뒤에서 돌리고 기다리지 않는다.
+
+    못 띄우면 OSError 를 던진다 (저장 자체는 이미 끝났다).
+    """
+    args = (book, _key(f"{book}.xlsx"), user, stamp)
+    now = datetime.now(KST)
+    with _after_lock:
+        slot = _after.setdefault(book, {"proc": None, "users": {},
+                                        "next": None, "waiting": {}})
+        if slot["proc"] is not None:
+            slot["next"] = args          # 도는 중이다. 끝나면 이걸로 한 번 더.
+            slot["waiting"][user] = now
+            return
+        slot["proc"] = _spawn_after(args)
+        slot["users"] = {user: now}
+    threading.Thread(target=_watch_after, args=(book,), daemon=True).start()
+
+
+def _after_log(line: str) -> None:
+    try:
+        with open(AFTER_SAVE_LOG, "a", encoding="utf-8") as log:
+            log.write(f"===== {datetime.now(KST):%Y-%m-%d %H:%M:%S} {line}\n")
+    except OSError:
+        pass
+
+
+def _spawn_after(args: tuple) -> subprocess.Popen:
+    _after_log("시작 " + " ".join(map(str, args)))
+    log = open(AFTER_SAVE_LOG, "a", encoding="utf-8")
+    extra = {}
+    if os.name == "nt":                  # 윈도우에서 까만 창이 뜨지 않게
+        extra["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        return subprocess.Popen(
+            [sys.executable, str(AFTER_SAVE_SCRIPT), *map(str, args)],
+            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **extra)
+    finally:
+        log.close()                      # 자식이 제 것을 들고 있다
+
+
+def _finished(proc: subprocess.Popen) -> bool:
+    """끝나기를 기다린다. 오류 없이 끝났으면 True. 너무 오래 돌면 끊는다."""
+    try:
+        proc.wait(timeout=AFTER_SAVE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        _after_log(f"{AFTER_SAVE_TIMEOUT:.0f}초가 넘어 끊었습니다")
+        return False
+    return proc.returncode == 0
+
+
+def _watch_after(book: str) -> None:
+    """돌던 것이 끝나면 알리고, 그 사이 저장이 또 있었으면 한 번 더."""
+    while True:
+        with _after_lock:
+            proc = _after[book]["proc"]
+        ok = _finished(proc)
+        _after_log(f"끝 {book} {'성공' if ok else f'실패 (종료 코드 {proc.returncode})'}")
+        with _after_lock:
+            slot = _after[book]
+            done_users, slot["users"] = slot["users"], {}
+            args, slot["next"] = slot["next"], None
+            waiting, slot["waiting"] = slot["waiting"], {}
+            slot["proc"] = None
+            if args is not None:
+                try:
+                    slot["proc"] = _spawn_after(args)
+                    slot["users"] = waiting
+                except OSError as err:
+                    _after_log(f"다음 판을 띄우지 못했습니다: {err}")
+            started = slot["proc"] is not None
+        # 다음 판을 먼저 띄우고 알린다. 메신저가 늦게 답해도 반영은 안 늦게.
+        _notify_all(book, done_users, ok)
+        if args is None:
+            return
+        if not started:
+            _notify_all(book, waiting, False)
+            return
+
+
+def _notify_all(book: str, users: dict[str, datetime], ok: bool) -> None:
+    for user, saved_at in users.items():
+        if ok:
+            text = (f"[기준 정보 관리] {book}\n"
+                    f"{saved_at:%m-%d %H:%M} 에 저장하신 내용이 raw data에 반영되었습니다.")
+        else:
+            text = (f"[기준 정보 관리] {book}\n"
+                    f"{saved_at:%m-%d %H:%M} 에 저장하신 내용을 raw data에 반영하다 "
+                    f"오류가 났습니다. 저장한 값은 그대로 있습니다. 담당자에게 알려 주세요.")
+        try:
+            send_messenger(user, text)
+            _after_log(f"메신저 {user} {'성공' if ok else '실패'} 알림 보냄")
+        except Exception as err:
+            _after_log(f"메신저 {user} 에게 못 보냈습니다: {err}")
+
+
+def _knox_api():
+    """knoxMessengerApi 는 이 파일 옆(src/input_manage/knoxMessengerApi/)에 둔다.
+
+    포털은 이 파일을 src.input_manage.input_manage 로 읽으므로 그 폴더가
+    `import knoxMessengerApi` 로는 안 보인다. 그 패키지 안쪽도 제 이름
+    (knoxMessengerApi.xxx)으로 서로를 부를 수 있어서, 상대 임포트 대신 이
+    폴더를 찾을 곳 맨 뒤에 붙인다 -- 맨 뒤라 다른 것을 가리지 않는다.
+    """
+    try:
+        from knoxMessengerApi import KnoxMessengerApi
+    except ModuleNotFoundError as err:
+        if err.name != "knoxMessengerApi":
+            raise                        # 패키지는 있는데 그 안에서 빠진 것
+        here = str(_KNOX_DIR)
+        if here not in sys.path:
+            sys.path.append(here)
+        from knoxMessengerApi import KnoxMessengerApi
+    return KnoxMessengerApi
+
+
+_KNOX_DIR = Path(__file__).resolve().parent
+
+
+def send_messenger(knox_id: str, text: str) -> None:
+    """녹스 메신저로 한 사람에게 보낸다. 못 보내면 까닭을 담아 던진다."""
+    if not knox_id or knox_id == "unknown":
+        raise ValueError("보낼 사람(knox id)을 모릅니다")
+    if not (KNOX_TOKEN and KNOX_SYSTEM_ID):
+        raise RuntimeError("환경변수 KNOX_MESSENGER_TOKEN / "
+                           "KNOX_MESSENGER_SYSTEM_ID 가 없습니다")
+    KnoxMessengerApi = _knox_api()
+    api = KnoxMessengerApi(token=KNOX_TOKEN, system_id=KNOX_SYSTEM_ID,
+                           isProduction=KNOX_PRODUCTION, api_version="2")
+    room = api.message.create_room(knox_id, KNOX_ROOM_TITLE, isGroup=False)
+    if not isinstance(room, dict) or "chatroomId" not in room:
+        raise RuntimeError(f"채팅방을 못 열었습니다: {room}")
+    got = api.message.send_message(text, room["chatroomId"], msgtype=0)
+    if not isinstance(got, dict) or (got.get("result") or {}).get("code") != 1000:
+        raise RuntimeError(f"메시지를 못 보냈습니다: {got}")
 
 
 def to_xlsx(sheets: dict[str, pd.DataFrame],
@@ -2358,7 +2544,15 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):
         st.session_state.pop(key, None)
-    st.session_state[S_TOAST] = {"book": book, "user": user_id}
+    # raw data 반영 코드를 뒤에서 돌린다. 못 띄워도 저장은 이미 끝났으므로
+    # 저장 완료는 그대로 알리고, 못 띄운 것을 같이 적는다.
+    try:
+        run_after_save(book, user_id, done.stamp)
+        after_err = ""
+    except Exception as err:
+        after_err = str(err)
+    st.session_state[S_TOAST] = {"book": book, "user": user_id,
+                                 "after_err": after_err}
     st.rerun()
 
 
@@ -2383,6 +2577,13 @@ def _forget_saved() -> None:
 
 
 def _saved_body(done: dict) -> None:
+    if done.get("after_err"):
+        st.warning("raw data 반영 코드를 띄우지 못했습니다 -- 반영되지 않습니다.\n\n"
+                   f"{done['after_err']}")
+    else:
+        st.markdown("  \n".join(AFTER_SAVE_NOTE))
+        if done.get("user") in ("", None, "unknown"):
+            st.caption("로그인한 사람을 몰라 메신저는 보내지 못합니다.")
     st.caption(f"{done['book']} · {done['user']}")
     if _HAS_DIALOG and st.button("확인", type="primary", **_WIDE):
         _forget_saved()

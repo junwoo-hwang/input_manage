@@ -66,7 +66,10 @@ G-DVC / 2GAPU/input /
 - 저장하면 S3 의 그 엑셀이 바로 바뀌고, **창에서 본 변경내용이 그대로**
   `REV_INFO` 의 `관련` 칸에 들어간다 (사람이 적은 것 먼저, 그 아래에)
 - 같은 값으로 **`이력/` 폴더에 사본 한 벌**이 들어간다 (되돌릴 때 쓴다)
-- 저장이 끝나면 **`저장 완료!` 창**이 뜬다 (확인·X·Esc 로 닫는다)
+- 저장이 끝나면 **`저장 완료!` 창**이 뜬다 (확인·X·Esc 로 닫는다) —
+  `약 20분 후에 raw data에 반영이 완료됩니다.` / `반영이 완료되면 메신저로
+  알려드리겠습니다.` 그리고 뒤에서 **`after_save.py`** 가 돈다 — 아래
+  '저장 뒤에 도는 코드'
 
 ### 수식 (`VLOOKUP` 같은 것)
 
@@ -163,6 +166,32 @@ openpyxl 의 Translator 와 같은지 검사로 맞춰 둔다. 배열 수식(`{=
 - S3 가 권한 오류나 잠깐의 탈을 내면 그대로 알린다. 예전에는 '파일 없음' 으로
   삼켜서 엉뚱하게 '다른 사람이 먼저 저장했다' 가 뜨거나 다음 저장이 막혔다.
 
+## 저장 뒤에 도는 코드 (`after_save.py`) 와 메신저
+
+`src/input_manage/after_save.py` 의 `main(book, s3_key, user, stamp)` 안에
+raw data 반영 코드를 넣는다. 저장이 S3 에 다 올라간 뒤 이 파일을 **따로 띄워**
+돌린다 (`python after_save.py 파일이름 S3경로 저장한사람 ETag`). 화면은 기다리지
+않는다 -- 20분이 걸려도 `저장 완료!` 는 바로 뜬다.
+
+- **끝나면 저장한 사람에게만 녹스 메신저가 간다.** 받는 사람은 저장할 때
+  `REV_INFO` 의 `user` 칸에 들어가는 그 id(`st.session_state["user_id"]`)다.
+  1:1 방을 열어(`create_room(id, "기준 정보 관리", isGroup=False)`) 보낸다.
+- 반영 코드가 **오류로 끝나면**(예외가 밖으로 나오거나 `sys.exit(1)`) '반영 중
+  오류' 메신저가 간다. **2시간**(`INPUT_AFTER_SAVE_TIMEOUT`)이 넘도록 안 끝나면
+  끊고 오류로 알린다.
+- **겹쳐 돌지 않는다.** 같은 파일을 도는 중에 또 저장하면 지금 것이 끝난 뒤
+  **한 번 더** 돈다. 그 사이 몇 번을 저장했든 한 번이고, 가장 최근 저장 기준이다.
+  메신저는 **자기 저장이 담긴 판이 끝났을 때** 사람마다 한 번 간다. 다른 파일끼리는
+  따로 돈다.
+- print 한 것과 오류, 메신저를 보냈는지는 `INPUT_AFTER_SAVE_LOG` 파일에 쌓인다.
+- 환경변수(AWS 키 등)는 포털 것을 그대로 물려받는다.
+- 이 셈은 서버 안에만 있다. 돌던 중에 서버가 다시 뜨면 '한 번 더' 와 메신저 보낼
+  사람을 잊는다.
+- 띄우지 못하면(파일이 없다 등) 저장은 그대로 되고, `저장 완료!` 창에 반영이 안
+  된다고 적는다.
+- 1시간마다 따로 도는 반영 작업이 아직 있으면, 그것과 포털이 띄운 것이 겹칠 수
+  있다 (포털은 제가 띄운 것끼리만 줄 세운다).
+
 ## 포털에 붙이기
 
 `portal.py` 에 세 줄:
@@ -189,7 +218,17 @@ INPUT_S3_BUCKET       기본 G-DVC
 INPUT_S3_PREFIX       기본 2GAPU/input
 INPUT_S3_ENDPOINT     기본 http://s3.dataplatform.samsungds.net:9020
 INPUT_S3_HISTORY_DIR  기본 이력
+INPUT_AFTER_SAVE_SCRIPT   기본 src/input_manage/after_save.py
+INPUT_AFTER_SAVE_LOG      기본 임시폴더/input_manage_after_save.log
+INPUT_AFTER_SAVE_TIMEOUT  기본 7200 (초)
+KNOX_MESSENGER_TOKEN      필수 (메신저) developers.samsung.net 에서 받은 토큰
+KNOX_MESSENGER_SYSTEM_ID  필수 (메신저) 연계계정 system_id (예: KCC10BOT00000)
+KNOX_MESSENGER_PRODUCTION 기본 1 (운영). 0 이면 스테이지
+KNOX_MESSENGER_ROOM_TITLE 기본 기준 정보 관리
 ```
+
+메신저 패키지 `knoxMessengerApi` 폴더는 `src/input_manage/` 안(`input_manage.py` 옆)에
+둔다. pip 로 깔려 있으면 그것을 먼저 쓴다. 이 저장소에는 넣지 않는다.
 
 ## 구조
 
@@ -197,7 +236,7 @@ INPUT_S3_HISTORY_DIR  기본 이력
 |---|---|
 | `src/input_manage/input_manage.py` | 전부. S3 · 엑셀 읽기쓰기 · 화면. 포털이 부르는 것은 `show_input_manage()` 하나 |
 | `src/input_manage/sheet_grid/frontend/index.html` | 격자. streamlit 컴포넌트라 이 파일만 따로일 수밖에 없다 |
-| `src/input_manage/after_save.py` | raw data 반영 코드 자리. 포털은 실행하지 않는다 (따로 1시간마다 돈다) |
+| `src/input_manage/after_save.py` | 저장이 끝날 때마다 뒤에서 도는 코드 (raw data 반영). `main()` 안에 넣는다 |
 
 `input_manage.py` 안에서 S3 에 닿는 것은 위쪽 다섯 함수(`s3` 묶음)뿐이다.
 테스트는 그것만 가짜로 갈아끼워서 S3 없이 돌고, 사내 헬퍼로 바꿔 끼울 때도
@@ -351,7 +390,7 @@ render / setComponentValue)만 직접 지킨다.
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 playwright install chromium
-pytest -q            # 273개
+pytest -q            # 286개
 ```
 
 - `tests/test_storage.py` — 저장이 조용히 덮어써지거나 반쯤 되다 말지 않는가
