@@ -63,19 +63,19 @@ S3_ENDPOINT = os.getenv("INPUT_S3_ENDPOINT", "http://s3.dataplatform.samsungds.n
 HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
 # 저장이 끝날 때마다 뒤에서 돌리는 raw data 반영 코드와, 그게 print 한 것을
 # 쌓는 곳. 너무 오래 돌면(멈춰 버렸다고 보고) 끊고 실패로 알린다.
-AFTER_SAVE_SCRIPT = Path(os.getenv("INPUT_AFTER_SAVE_SCRIPT")
-                         or Path(__file__).with_name("after_save.py"))
-AFTER_SAVE_LOG = Path(os.getenv("INPUT_AFTER_SAVE_LOG")
-                      or Path(tempfile.gettempdir()) / "input_manage_after_save.log")
-AFTER_SAVE_TIMEOUT = float(os.getenv("INPUT_AFTER_SAVE_TIMEOUT", "7200"))   # 초
+INPUT_AFTER_SAVE_SCRIPT = Path(os.getenv("INPUT_AFTER_SAVE_SCRIPT")
+                               or Path(__file__).with_name("after_save.py"))
+INPUT_AFTER_SAVE_LOG = Path(os.getenv("INPUT_AFTER_SAVE_LOG")
+                            or Path(tempfile.gettempdir()) / "input_manage_after_save.log")
+INPUT_AFTER_SAVE_TIMEOUT = float(os.getenv("INPUT_AFTER_SAVE_TIMEOUT", "7200"))   # 초
 # 저장 완료 창에 적는 말 (한 줄씩)
 AFTER_SAVE_NOTE = ("약 20분 후에 raw data에 반영이 완료됩니다.",
                    "반영이 완료되면 메신저로 알려드리겠습니다.")
 # 반영이 끝나면 저장한 사람에게 보내는 메신저. 토큰은 환경변수에서만 읽는다.
-KNOX_TOKEN = os.getenv("KNOX_MESSENGER_TOKEN")
-KNOX_SYSTEM_ID = os.getenv("KNOX_MESSENGER_SYSTEM_ID")
-KNOX_PRODUCTION = os.getenv("KNOX_MESSENGER_PRODUCTION", "1") != "0"
-KNOX_ROOM_TITLE = os.getenv("KNOX_MESSENGER_ROOM_TITLE", "기준 정보 관리")
+KNOX_MESSENGER_TOKEN = os.getenv("KNOX_MESSENGER_TOKEN")
+KNOX_MESSENGER_SYSTEM_ID = os.getenv("KNOX_MESSENGER_SYSTEM_ID")
+KNOX_MESSENGER_PRODUCTION = os.getenv("KNOX_MESSENGER_PRODUCTION", "1") != "0"
+KNOX_MESSENGER_ROOM_TITLE = os.getenv("KNOX_MESSENGER_ROOM_TITLE", "기준 정보 관리")
 
 _client_lock = threading.Lock()
 _client = None
@@ -1049,7 +1049,7 @@ def run_after_save(book: str, user: str, stamp: str) -> None:
 
 def _after_log(line: str) -> None:
     try:
-        with open(AFTER_SAVE_LOG, "a", encoding="utf-8") as log:
+        with open(INPUT_AFTER_SAVE_LOG, "a", encoding="utf-8") as log:
             log.write(f"===== {datetime.now(KST):%Y-%m-%d %H:%M:%S} {line}\n")
     except OSError:
         pass
@@ -1057,13 +1057,13 @@ def _after_log(line: str) -> None:
 
 def _spawn_after(args: tuple) -> subprocess.Popen:
     _after_log("시작 " + " ".join(map(str, args)))
-    log = open(AFTER_SAVE_LOG, "a", encoding="utf-8")
+    log = open(INPUT_AFTER_SAVE_LOG, "a", encoding="utf-8")
     extra = {}
     if os.name == "nt":                  # 윈도우에서 까만 창이 뜨지 않게
         extra["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         return subprocess.Popen(
-            [sys.executable, str(AFTER_SAVE_SCRIPT), *map(str, args)],
+            [sys.executable, str(INPUT_AFTER_SAVE_SCRIPT), *map(str, args)],
             stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **extra)
     finally:
@@ -1073,11 +1073,11 @@ def _spawn_after(args: tuple) -> subprocess.Popen:
 def _finished(proc: subprocess.Popen) -> bool:
     """끝나기를 기다린다. 오류 없이 끝났으면 True. 너무 오래 돌면 끊는다."""
     try:
-        proc.wait(timeout=AFTER_SAVE_TIMEOUT)
+        proc.wait(timeout=INPUT_AFTER_SAVE_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        _after_log(f"{AFTER_SAVE_TIMEOUT:.0f}초가 넘어 끊었습니다")
+        _after_log(f"{INPUT_AFTER_SAVE_TIMEOUT:.0f}초가 넘어 끊었습니다")
         return False
     return proc.returncode == 0
 
@@ -1154,13 +1154,15 @@ def send_messenger(knox_id: str, text: str) -> None:
     """녹스 메신저로 한 사람에게 보낸다. 못 보내면 까닭을 담아 던진다."""
     if not knox_id or knox_id == "unknown":
         raise ValueError("보낼 사람(knox id)을 모릅니다")
-    if not (KNOX_TOKEN and KNOX_SYSTEM_ID):
+    if not (KNOX_MESSENGER_TOKEN and KNOX_MESSENGER_SYSTEM_ID):
         raise RuntimeError("환경변수 KNOX_MESSENGER_TOKEN / "
                            "KNOX_MESSENGER_SYSTEM_ID 가 없습니다")
     KnoxMessengerApi = _knox_api()
-    api = KnoxMessengerApi(token=KNOX_TOKEN, system_id=KNOX_SYSTEM_ID,
-                           isProduction=KNOX_PRODUCTION, api_version="2")
-    room = api.message.create_room(knox_id, KNOX_ROOM_TITLE, isGroup=False)
+    api = KnoxMessengerApi(token=KNOX_MESSENGER_TOKEN,
+                           system_id=KNOX_MESSENGER_SYSTEM_ID,
+                           isProduction=KNOX_MESSENGER_PRODUCTION,
+                           api_version="2")
+    room = api.message.create_room(knox_id, KNOX_MESSENGER_ROOM_TITLE, isGroup=False)
     if not isinstance(room, dict) or "chatroomId" not in room:
         raise RuntimeError(f"채팅방을 못 열었습니다: {room}")
     got = api.message.send_message(text, room["chatroomId"], msgtype=0)

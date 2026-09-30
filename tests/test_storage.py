@@ -876,8 +876,8 @@ def after_script(tmp_path, monkeypatch):
         "time.sleep(float(os.environ.get('AFTER_SLEEP', '0')))\n"
         "if os.environ.get('AFTER_FAIL'): raise SystemExit('반영 실패')\n",
         encoding="utf-8")
-    monkeypatch.setattr(im, "AFTER_SAVE_SCRIPT", script)
-    monkeypatch.setattr(im, "AFTER_SAVE_LOG", tmp_path / "after.log")
+    monkeypatch.setattr(im, "INPUT_AFTER_SAVE_SCRIPT", script)
+    monkeypatch.setattr(im, "INPUT_AFTER_SAVE_LOG", tmp_path / "after.log")
     sent = []
     monkeypatch.setattr(im, "send_messenger", lambda who, text: sent.append((who, text)))
     im._after.clear()
@@ -969,7 +969,7 @@ def test_a_failed_job_tells_the_saver_it_failed(after_script, monkeypatch):
 def test_a_job_that_hangs_is_cut_off_and_reported(after_script, monkeypatch):
     ran, sent = after_script
     monkeypatch.setenv("AFTER_SLEEP", "30")
-    monkeypatch.setattr(im, "AFTER_SAVE_TIMEOUT", 1.0)
+    monkeypatch.setattr(im, "INPUT_AFTER_SAVE_TIMEOUT", 1.0)
     im.run_after_save("A", "hong", "etag1")
     _wait_done("A", limit=15)
     assert [who for who, _ in sent] == ["hong"]
@@ -1036,8 +1036,8 @@ def fake_knox(monkeypatch):
     mod = types.ModuleType("knoxMessengerApi")
     mod.KnoxMessengerApi = KnoxMessengerApi
     monkeypatch.setitem(sys.modules, "knoxMessengerApi", mod)
-    monkeypatch.setattr(im, "KNOX_TOKEN", "tok")
-    monkeypatch.setattr(im, "KNOX_SYSTEM_ID", "KCC10BOT00000")
+    monkeypatch.setattr(im, "KNOX_MESSENGER_TOKEN", "tok")
+    monkeypatch.setattr(im, "KNOX_MESSENGER_SYSTEM_ID", "KCC10BOT00000")
     return calls, Message
 
 
@@ -1046,7 +1046,7 @@ def test_the_messenger_opens_a_one_to_one_room_with_the_saver_and_sends(fake_kno
     im.send_messenger("hong.gd", "반영 완료")
     assert calls == [
         ("init", "tok", "KCC10BOT00000", True, "2"),
-        ("create_room", "hong.gd", im.KNOX_ROOM_TITLE, False),
+        ("create_room", "hong.gd", im.KNOX_MESSENGER_ROOM_TITLE, False),
         ("send_message", "반영 완료", 179432127084430336, 0),
     ]
 
@@ -1083,7 +1083,7 @@ def test_the_messenger_needs_its_token_and_a_person(fake_knox, monkeypatch):
     calls, _ = fake_knox
     with pytest.raises(ValueError):
         im.send_messenger("unknown", "x")
-    monkeypatch.setattr(im, "KNOX_TOKEN", None)
+    monkeypatch.setattr(im, "KNOX_MESSENGER_TOKEN", None)
     with pytest.raises(RuntimeError, match="KNOX_MESSENGER_TOKEN"):
         im.send_messenger("hong.gd", "x")
     assert calls == []
