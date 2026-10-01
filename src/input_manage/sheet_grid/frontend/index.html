@@ -811,6 +811,7 @@ let answered = "";      // 마지막으로 응답한 '통째로 달라' 표
 let asked = null;       // 표 없이 온 판에 대해 '없다' 고 이미 알렸는가
 
 function publish(immediate) {
+  noteChange();                          // 임시 저장은 고칠 때마다 (몇 초 모아서)
   // 한 번만 알린다. 파이썬이 편집 중에 알아야 하는 것은 '고친 게 있다' 하나
   // 뿐인데, 그건 한 번 참이 되면 저장하거나 초기화할 때까지 계속 참이다.
   // 칸마다 알리면 그때마다 streamlit 이 스크립트를 다시 돌려서, 칸 하나
@@ -1631,7 +1632,10 @@ window.addEventListener("message", (event) => {
   maxHeight = args.max_height || 520;
   lastWant = args.want_full || "";
   armBeat(args.beat_ms ?? 60000);
-  unsavedFromPython = !!args.unsaved;
+  if (!leaving) unsavedFromPython = !!args.unsaved;
+  backupMs = args.backup_ms ?? 10000;
+  if (backupMs && backupPending) { backupPending = false; noteChange(); }
+  if (leaveToken && args.left === leaveToken && leaveTarget) goOn();
   if ((args.readonly || "") !== bookLock) {
     bookLock = args.readonly || "";
     if (bookLock) endEdit(false);        // 고치던 칸은 접는다
@@ -1645,6 +1649,7 @@ window.addEventListener("message", (event) => {
     // 판은 그대로다. 파이썬이 '표를 통째로 달라' 고 했으면 그것만 해 준다.
     const want = args.want_full || "";
     if (want && want !== answered) publishFull(want);
+    maybeRestore(args.restore);
     syncHeight();
     return;
   }
@@ -1685,8 +1690,12 @@ window.addEventListener("message", (event) => {
   dirty = false;
   answered = "";
   clearTimeout(publishTimer);
+  lastBackup = null;
+  clearTimeout(backupTimer);
+  backupTimer = null;
   // have: 이 판을 받았다. 파이썬은 이걸 보고 다음부터 표를 안 딸려 보낸다.
   setValue({ rev: ++rev, dirty: false, full: false, have: version });
+  maybeRestore(args.restore);
 });
 
 // 파일을 띄워 두고 있으면 1분마다 '아직 여기 있다' 를 알린다. 파이썬은 그때
@@ -1707,9 +1716,97 @@ function armBeat(ms) {
   if (!ms) return;                       // 파이썬 쪽에 창이 떠 있다: 쉰다
   beatTimer = setInterval(() => {
     if (!lastWant && version !== null) {
-      setValue({ rev: ++rev, dirty: dirty, full: false, have: version, beat: Date.now() });
+      setValue({ rev: ++rev, dirty: dirty, full: false, have: version, beat: Date.now(),
+                 backup: dirty ? lastBackup : null });
     }
   }, beatMs);
+}
+
+// ===================================================================
+// 임시 저장
+//
+// 고친 것이 있으면 몇 초(backupMs) 모았다가 '바뀐 줄' 을 파이썬에 올린다
+// (저장할 때 올리는 것과 같은 꼴이라 몇 KB). 파이썬이 S3 에 적어 두고, 화면이
+// 날아간 뒤 같은 사람이 다시 들어오면 '복구하시겠습니까?' 를 묻는다. 파이썬
+// 쪽에 창이 떠 있는 동안은(backupMs 가 0) 미뤘다가 창이 닫히면 보낸다.
+// ===================================================================
+let backupMs = 10000;
+let backupTimer = null;
+let backupPending = false;
+let backupSeq = 0;
+let lastBackup = null;
+
+function noteChange() {
+  if (backupTimer || leaving) return;
+  backupTimer = setTimeout(sendBackup, backupMs || 1000);
+}
+
+function makeBackup() {
+  return { id: `${Date.now()}-${++backupSeq}`, sheets: sheets.map(sheetForPython) };
+}
+
+function sendBackup() {
+  backupTimer = null;
+  if (!dirty || bookLock || leaving || version === null) return;
+  if (!backupMs) { backupPending = true; return; }
+  if (lastWant) { noteChange(); return; }   // 표를 달라고 해 둔 사이에는 덮어쓰지 않는다
+  lastBackup = makeBackup();
+  setValue({ rev: ++rev, dirty: true, full: false, have: version, backup: lastBackup });
+}
+
+// 파이썬이 '이걸로 되살려 달라' 고 보냈다: 임시 저장한 바뀐 줄들. 받은 표
+// 위에 얹는다 -- 줄 객체를 그대로 다시 쓰므로, 되살린 뒤에 또 고쳐도 '바뀐
+// 줄만' 이 그대로 통한다. 되살린 것도 되돌리기(Ctrl+Z)로 물릴 수 있다.
+let restored = "";
+function maybeRestore(r) {
+  if (!r || r.token === restored || r.version !== version) return;
+  restored = r.token;
+  try {
+    const byOrig = new Map(sheets.map(s => [s.orig, s]));
+    const out = [];
+    for (const it of r.sheets || []) {
+      if (it.keep !== undefined) {
+        const src = byOrig.get(String(it.keep));
+        if (!src) throw new Error(it.keep);
+        out.push(Object.assign(copySheet(src), { name: String(it.name) }));
+        continue;
+      }
+      const src = it.orig !== undefined && it.orig !== null ? byOrig.get(String(it.orig)) : null;
+      let rs;
+      if (it.diff) {
+        if (!src) throw new Error(it.orig);
+        loadRows(src);
+        const base = src.base;
+        rs = [];
+        for (const d of it.diff) {
+          if (Array.isArray(d)) { rs.push(d.map(String)); continue; }
+          const [a, n] = d.k;
+          if (a < 0 || n < 0 || a + n > base.length) throw new Error("범위");
+          for (let i = a; i < a + n; i++) rs.push(base[i]);
+        }
+      } else {
+        rs = (it.rows || []).map(row => row.map(String));
+      }
+      const cs = (it.cols || []).map(String);
+      if (!rs.length) rs.push(new Array(cs.length).fill(""));
+      out.push({ name: String(it.name), orig: src ? src.orig : undefined, touched: true,
+                 locked: src ? src.locked : false, cols: cs, rows: rs, raw: null,
+                 n: rs.length, base: src ? src.base : undefined });
+    }
+    if (!out.length) throw new Error("빈 것");
+    pushUndo();
+    sheets = out;
+    active = 0;
+    clampSelection();
+    renderAll();
+  } catch (err) {
+    window.alert("임시 저장된 내용을 되살리지 못했습니다. 지금 화면은 그대로입니다.");
+    setValue({ rev: ++rev, dirty: dirty, full: false, have: version, restored: r.token,
+               restore_failed: true });
+    return;
+  }
+  dirty = true;
+  setValue({ rev: ++rev, dirty: true, full: false, have: version, restored: r.token });
 }
 
 // ===================================================================
@@ -1726,18 +1823,45 @@ let unsavedFromPython = false;           // 엑셀을 올려 둔 것도 저장 �
 const unsaved = () => dirty || unsavedFromPython;
 const hooked = new Set();                // 귀를 단 문서들
 
+//
+// 누름은 일단 늘 막는다. '확인' 이면 파이썬에 먼저 알리고(고치던 것을 5분 동안
+// 임시 저장, 잠금도 그때까지), 그다음 우리가 그 메뉴를 다시 눌러 준다.
+// 누름을 그대로 흘려보내던 때는 사내 포털에서 확인을 몇 번씩 눌러야 넘어갔다
+// -- 창이 떠 있는 사이 메뉴 쪽이 그 누름을 놓친다. 다시 눌러 준 것도 메뉴가
+// 안 받으면, 사람이 한 번 더 누를 때는 묻지 않고 그대로 보낸다.
+let leaving = false;
+let leaveTarget = null;
+let leaveToken = "";
+
 function onLeaveClick(e) {
   // 이 격자가 이미 치워졌으면(벗어나기로 했다) 아무것도 안 한다
-  if (!window.frameElement || !window.frameElement.isConnected || !unsaved()) return;
+  if (leaving || !window.frameElement || !window.frameElement.isConnected || !unsaved()) return;
   // instanceof Element 는 못 쓴다: 바깥 문서·다른 틀의 요소는 그쪽 창의
   // Element 로 만들어져서, 이 틀의 Element 로 견주면 늘 false 다.
   const t = e.target && e.target.nodeType === 1 ? e.target : null;
   if (!t || !t.closest("a, button, li, label, input, select, [role], .nav-link")) return;
   const doc = t.ownerDocument;
   if (doc === window.parent.document && !t.closest('[data-testid="stSidebar"]')) return;
-  if (window.confirm(LEAVE_MSG)) return;
   e.preventDefault();
   e.stopImmediatePropagation();
+  if (!window.confirm(LEAVE_MSG)) return;
+  leaving = true;
+  leaveTarget = t;
+  leaveToken = "leave-" + Date.now();
+  const bk = dirty ? makeBackup() : null;
+  dirty = false;                         // 이제 묻지 않는다 (창 닫기 물음도)
+  unsavedFromPython = false;
+  clearTimeout(backupTimer);
+  backupTimer = null;
+  setValue({ rev: ++rev, dirty: false, full: false, have: version,
+             leave: leaveToken, backup: bk });
+  setTimeout(goOn, 4000);                // 파이썬이 답이 없어도 간다
+}
+
+function goOn() {
+  const t = leaveTarget;
+  leaveTarget = null;
+  if (t && t.isConnected) t.click();
 }
 
 function onBeforeUnload(e) {

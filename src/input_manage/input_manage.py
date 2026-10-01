@@ -62,6 +62,11 @@ HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
 # 사람의 화면이 이만큼(분) 소식이 없으면 잠금을 푸는 시간
 INPUT_S3_LOCK_DIR = os.getenv("INPUT_S3_LOCK_DIR", "잠금")
 INPUT_LOCK_MINUTES = float(os.getenv("INPUT_LOCK_MINUTES", "10"))
+# 고치던 것을 임시로 적어 두는 폴더 (기준 정보 폴더/임시저장/파일이름/사람.json).
+# 고친 채로 다른 메뉴로 가겠다고 하면 이만큼(분) 들고 있다가 버린다 -- 실수로
+# 확인을 눌렀어도 그 안에 돌아오면 되살릴 수 있게. 그동안은 잠금도 그대로다.
+INPUT_S3_BACKUP_DIR = os.getenv("INPUT_S3_BACKUP_DIR", "임시저장")
+INPUT_LEAVE_KEEP_MINUTES = float(os.getenv("INPUT_LEAVE_KEEP_MINUTES", "5"))
 
 _client_lock = threading.Lock()
 _client = None
@@ -1005,18 +1010,37 @@ def _lock_key(book: str) -> str:
 
 
 def edit_lock(book: str) -> dict | None:
-    """지금 걸려 있는 잠금 {"user", "since", "beat"}. 없거나 끊긴 지 오래면 None."""
+    """지금 걸려 있는 잠금 {"user", "since", "beat"[, "until"]}. 없거나 지났으면 None.
+
+    "until" 이 있으면 그때까지다 (고친 채로 다른 메뉴로 간 사람의 잠금 -- 그
+    사람의 화면은 이미 없어서 heartbeat 가 안 온다). 없으면 마지막 heartbeat
+    로부터 INPUT_LOCK_MINUTES 분까지다.
+    """
     got = s3.get_object(_lock_key(book))
     if got is None:
         return None
+    now = datetime.now(timezone.utc)
     try:
         lock = json.loads(got[0].decode("utf-8"))
-        beat = datetime.fromisoformat(lock["beat"])
-    except (ValueError, KeyError, TypeError):
+        if lock.get("until"):
+            alive = now < datetime.fromisoformat(lock["until"])
+        else:
+            alive = now - datetime.fromisoformat(lock["beat"]) <= timedelta(
+                minutes=INPUT_LOCK_MINUTES)
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None                        # 망가진 잠금은 없는 것으로
-    if datetime.now(timezone.utc) - beat > timedelta(minutes=INPUT_LOCK_MINUTES):
-        return None
-    return lock
+    return lock if alive else None
+
+
+def keep_lock_until(book: str, user: str, until: datetime) -> None:
+    """내 잠금을 heartbeat 없이 until 까지 둔다 (화면을 떠난 뒤에)."""
+    cur = edit_lock(book)
+    if cur and cur.get("user") != user:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    s3.put_object(_lock_key(book), json.dumps(
+        {"user": user, "since": cur.get("since", now) if cur else now, "beat": now,
+         "until": until.isoformat()}, ensure_ascii=False).encode("utf-8"))
 
 
 def hold_lock(book: str, user: str) -> str | None:
@@ -1039,6 +1063,51 @@ def release_lock(book: str, user: str) -> None:
     cur = edit_lock(book)
     if cur and cur.get("user") == user:
         s3.delete_object(_lock_key(book))
+
+
+# ----------------------------------------------------------------------
+# 임시 저장. 고치는 동안 격자가 몇 초마다 '바뀐 줄' 을 올려 주고, 그걸 S3 에
+# 적어 둔다. 화면이 날아가거나(세션이 끊김, 창을 닫음) 고친 채로 다른 메뉴로
+# 갔다가 같은 사람이 다시 들어오면 '임시 저장된 내용이 있습니다' 를 묻는다.
+#
+# 적는 것은 바뀐 줄과 '원래 표의 몇 번째 줄' 이다 (저장할 때 올리는 것과 같은
+# 꼴). 원래 표가 어느 판이었는지(stamp)도 같이 적는다 -- 그 사이 누가 저장해
+# 판이 바뀌었으면 그 위에 얹을 수 없다 (엉뚱한 줄에 얹힌다).
+# ----------------------------------------------------------------------
+def _backup_key(book: str, user: str) -> str:
+    return _key(INPUT_S3_BACKUP_DIR, book, f"{_safe(user)}.json")
+
+
+def write_backup(book: str, user: str, stamp: str, sheets: list,
+                 until: datetime | None = None) -> None:
+    body = {"user": user, "stamp": stamp, "sheets": sheets,
+            "at": datetime.now(timezone.utc).isoformat()}
+    if until is not None:
+        body["until"] = until.isoformat()
+    s3.put_object(_backup_key(book, user),
+                  json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def read_backup(book: str, user: str) -> dict | None:
+    """그 사람의 임시 저장. 없거나, 버릴 때가 지났거나, 망가졌으면 None."""
+    key = _backup_key(book, user)
+    got = s3.get_object(key)
+    if got is None:
+        return None
+    try:
+        body = json.loads(got[0].decode("utf-8"))
+        if not isinstance(body.get("sheets"), list):
+            raise ValueError
+        if body.get("until") and datetime.now(timezone.utc) >= datetime.fromisoformat(body["until"]):
+            s3.delete_object(key)          # 5분이 지났다
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return body
+
+
+def drop_backup(book: str, user: str) -> None:
+    s3.delete_object(_backup_key(book, user))
 
 
 def to_xlsx(sheets: dict[str, pd.DataFrame],
@@ -1715,7 +1784,8 @@ _grid = components.declare_component("input_manage_sheet_grid", path=str(_FRONTE
 
 def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
                max_height: int = 520, want_full: str = "",
-               readonly: str = "", beat: float = 0, unsaved: bool = False) -> dict:
+               readonly: str = "", beat: float = 0, unsaved: bool = False,
+               backup: float = 0, restore: dict | None = None, left: str = "") -> dict:
     """격자를 그리고, 격자가 올려준 것을 그대로 돌려준다.
 
     돌려주는 것: {"rev": n, "dirty": bool} 이고, 표를 달라고 했을 때만
@@ -1742,7 +1812,9 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
 
     got = _grid(sheets=data, version=version, max_height=max_height,
                 want_full=want_full, readonly=readonly,
-                beat_ms=int(beat * 1000), unsaved=unsaved, key=key, default=None)
+                beat_ms=int(beat * 1000), unsaved=unsaved,
+                backup_ms=int(backup * 1000), restore=restore, left=left,
+                key=key, default=None)
     return got or {}
 
 
@@ -1963,6 +2035,17 @@ S_FRESH = "_im_fresh"         # 남이 저장한 새 판을 읽어 왔다는 한
 LOCK_BEAT_SECONDS = 60
 # 남의 잠금을 이만큼(초)은 다시 안 읽는다. 다시 그릴 때마다 S3 에 묻지 않게.
 LOCK_PEEK_SECONDS = 15
+# 임시 저장. 격자가 고친 것을 이만큼(초) 모았다가 올린다. 0 이면 임시 저장을
+# 안 한다 (고친 채로 떠나면 잠금도 바로 푼다).
+BACKUP_SECONDS = 10
+S_BACKUP_SEEN = "_im_backup_seen"    # 마지막으로 S3 에 적은 임시 저장의 번호
+S_BACKUP_OFFER = "_im_backup_offer"  # 파일을 띄울 때 찾은 임시 저장 {"key", "backup"}
+S_RESTORE = "_im_restore"            # 격자에 '이걸로 되살려라' 고 보내는 중인 것
+S_LEFT = "_im_left"                  # 처리한 '다른 메뉴로 간다' 표
+# 마지막으로 고른 파일. 다른 메뉴에 다녀오면 streamlit 이 고르개의 값을 잊어서
+# (화면에 없던 위젯의 값은 버린다) 목록의 첫 파일로 돌아간다. 고치던 파일로
+# 돌아와야 '임시 저장된 내용' 도 물을 수 있다.
+S_LAST_BOOK = "_im_last_book"
 
 
 # 칸 너비를 꽉 채우라고 말하는 법이 streamlit 버전마다 다르다. 새 버전은
@@ -2100,6 +2183,119 @@ def _locked_popup(book: str, other: str) -> None:
             body()
 
 
+def _take_backup(got: dict, book: str, version: str, user: str) -> None:
+    """격자가 올린 임시 저장을 S3 에 적는다. 같은 것은 한 번만."""
+    bk = got.get("backup")
+    if (not isinstance(bk, dict) or got.get("leave") or user == "unknown"
+            or bk.get("id") == st.session_state.get(S_BACKUP_SEEN)
+            or got.get("have") != version
+            # 엑셀을 올려 둔 것은 S3 에 있는 판 위의 '바뀐 줄' 로 적을 수 없다
+            or st.session_state.get(S_UPLOADED)):
+        return
+    st.session_state[S_BACKUP_SEEN] = bk.get("id")
+    try:
+        write_backup(book, user, st.session_state[S_STAMP], bk.get("sheets") or [])
+    except Exception:
+        pass                               # 임시 저장을 못 했다고 고치기를 막지 않는다
+
+
+def _forget_backup(book: str, user: str) -> None:
+    st.session_state.pop(S_BACKUP_OFFER, None)
+    if user == "unknown":
+        return
+    try:
+        drop_backup(book, user)
+    except Exception:
+        pass
+
+
+def _leave(book: str, user: str, version: str, got: dict) -> None:
+    """고친 채로 다른 메뉴로 간다. 고친 것은 5분 동안 임시 저장해 두고(실수로
+    확인을 눌렀어도 돌아오면 되살릴 수 있게), 잠금도 그때까지 둔다. 그 뒤로는
+    둘 다 사라져서 다른 사람이 고칠 수 있다. 이 화면은 처음으로 돌아간다."""
+    st.session_state[S_LEFT] = got["leave"]
+    st.session_state.pop(S_LOCK, None)
+    st.session_state.pop(S_LOCKED_BY, None)
+    uploaded = st.session_state.pop(S_UPLOADED, None)
+    st.session_state.pop(S_BOOK, None)     # 돌아오면 S3 에서 새로 읽는다
+    until = datetime.now(timezone.utc) + timedelta(minutes=INPUT_LEAVE_KEEP_MINUTES)
+    bk = got.get("backup")
+    try:
+        if (BACKUP_SECONDS > 0 and user != "unknown" and not uploaded
+                and isinstance(bk, dict) and got.get("have") == version):
+            write_backup(book, user, st.session_state[S_STAMP], bk.get("sheets") or [], until)
+            keep_lock_until(book, user, until)
+        else:
+            release_lock(book, user)
+    except Exception:
+        pass
+
+
+def _backup_offer(book: str, user: str) -> dict | None:
+    """이 파일을 띄울 때 그 사람의 임시 저장이 있었으면 그것. 띄울 때 한 번만 본다."""
+    if user == "unknown":
+        return None
+    key = (book, st.session_state.get(S_NONCE))
+    held = st.session_state.get(S_BACKUP_OFFER)
+    if not held or held.get("key") != key:
+        try:
+            found = read_backup(book, user)
+        except Exception:
+            found = None
+        held = {"key": key, "backup": found}
+        st.session_state[S_BACKUP_OFFER] = held
+    return held.get("backup")
+
+
+def _backup_popup(book: str, user: str, version: str, bk: dict) -> None:
+    """'임시 저장된 내용이 있습니다. 복구하시겠습니까?'"""
+    def later() -> None:                   # X: 이번에는 묻지 않는다
+        held = st.session_state.get(S_BACKUP_OFFER)
+        if held:
+            held["backup"] = None
+
+    def body() -> None:
+        try:
+            at = datetime.fromisoformat(bk["at"]).astimezone(KST)
+            when = f"{at:%m-%d %H:%M} 에 고치던 내용입니다."
+        except (KeyError, ValueError, TypeError):
+            when = ""
+        st.markdown("**임시 저장된 내용이 있습니다. 복구하시겠습니까?**")
+        if when:
+            st.caption(when)
+        stale = bk.get("stamp") != st.session_state[S_STAMP]
+        if stale:
+            st.warning("그 사이 다른 사람이 이 파일을 저장해서 그 위에 되살릴 수 없습니다. "
+                       "엉뚱한 줄에 얹힐 수 있어서입니다.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("복구", type="primary", disabled=stale, **_WIDE):
+                st.session_state[S_RESTORE] = {
+                    "token": f"r-{_now()}", "version": version, "sheets": bk["sheets"]}
+                later()
+                try:                       # 되살린 것은 5분 뒤에 사라지면 안 된다
+                    write_backup(book, user, st.session_state[S_STAMP], bk["sheets"])
+                except Exception:
+                    pass
+                st.rerun()
+        with c2:
+            if st.button("버리기", **_WIDE):
+                _forget_backup(book, user)
+                try:                       # 떠나며 남겨 둔 잠금도 이제 푼다
+                    release_lock(book, user)
+                except Exception:
+                    pass
+                st.rerun()
+
+    if _HAS_DIALOG:
+        kw = ({"on_dismiss": later}
+              if "on_dismiss" in inspect.signature(st.dialog).parameters else {})
+        st.dialog("임시 저장", **kw)(body)()
+    else:
+        with st.container(border=True):
+            body()
+
+
 def show_input_manage() -> None:
     st.markdown('<div class="pretendard-area"><h2>기준 정보 관리</h2></div>',
                 unsafe_allow_html=True)
@@ -2138,10 +2334,12 @@ def show_input_manage() -> None:
     unsaved = (bool(st.session_state.get(S_UPLOADED))
                or (isinstance(last, dict) and bool(last.get("dirty"))
                    and st.session_state.get(S_BOOK) is not None))
+    last_book = st.session_state.get(S_LAST_BOOK)
     with c_book:
         _row_label("관리 파일")
         book = st.selectbox(
             "관리 파일", books, key="im_book_pick", disabled=unsaved, **_NO_LABEL,
+            index=books.index(last_book) if last_book in books else 0,
             help="저장하지 않은 수정이 있습니다 — 저장하거나 초기화한 뒤 바꿀 수 있습니다"
             if unsaved else None)
     with c_reset:
@@ -2149,11 +2347,14 @@ def show_input_manage() -> None:
         reload_now = st.button("초기화", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
+    st.session_state[S_LAST_BOOK] = book
     user_id = st.session_state.get("user_id") or "unknown"
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다.
     if reload_now or st.session_state.get(S_BOOK) != book:
         # 고친 것을 버리니 잠금도 놓는다
         _drop_lock(user_id, book if reload_now else None)
+        if reload_now:
+            _forget_backup(book, user_id)
         try:
             _load(book)
         except Exception as err:
@@ -2172,6 +2373,10 @@ def show_input_manage() -> None:
     status = st.container()
 
     version = f"{book}|{st.session_state[S_STAMP]}|{st.session_state[S_NONCE]}"
+    # 고친 채로 다른 메뉴로 가겠다고 했다 (격자가 확인을 받았다).
+    if (isinstance(last, dict) and last.get("leave")
+            and last["leave"] != st.session_state.get(S_LEFT)):
+        _leave(book, user_id, version, last)
     # 내가 지금 이 판을 고치는 중인가. 격자가 마지막에 알려 온 것이 이 판의
     # 것이어야 한다 -- 저장한 직후에는 격자가 아직 지난 판의 '고침' 을 들고 있다.
     editing = (bool(st.session_state.get(S_UPLOADED))
@@ -2194,8 +2399,9 @@ def show_input_manage() -> None:
             st.rerun()
     # 창이 떠 있는 동안은 격자가 '아직 여기 있다' 를 안 보낸다. 그때마다
     # 다시 그리면서 창 안의 단추가 새로 만들어져, 누르려던 것이 빗나간다.
+    offer = _backup_offer(book, user_id) if not (editing or other) else None
     popup = bool(st.session_state.get(S_REVIEW) or st.session_state.get(S_UPLOAD)
-                 or st.session_state.get(S_TOAST)
+                 or st.session_state.get(S_TOAST) or offer
                  or (other and st.session_state.get(S_LOCK_TOLD) != (book, other)))
     got = sheet_grid(
         shown,
@@ -2205,7 +2411,14 @@ def show_input_manage() -> None:
         readonly=f"{other}님이 수정중입니다." if other else "",
         beat=0 if popup else LOCK_BEAT_SECONDS,
         unsaved=bool(st.session_state.get(S_UPLOADED)),
+        backup=0 if popup else BACKUP_SECONDS,
+        restore=st.session_state.get(S_RESTORE),
+        left=st.session_state.get(S_LEFT, ""),
     )
+    restoring = st.session_state.get(S_RESTORE)
+    if restoring and got.get("restored") == restoring["token"]:
+        st.session_state.pop(S_RESTORE, None)
+    _take_backup(got, book, version, user_id)
     # 업로드한 내용도 '아직 저장 안 한 수정' 이다. 격자는 새로 받은 판을
     # 깨끗한 것으로 치므로 그것만 보면 저장 단추가 안 켜진다.
     uploaded = bool(st.session_state.get(S_UPLOADED))
@@ -2248,6 +2461,8 @@ def show_input_manage() -> None:
                        "— 그때까지는 보기·복사·다운로드만 됩니다.")
         elif st.session_state.get(S_WANT):
             st.caption("표를 받아오는 중입니다...")
+        elif restoring:
+            st.caption("임시 저장된 내용을 되살리는 중입니다...")
         elif uploaded:
             st.info("올린 엑셀의 내용이 화면에 들어왔습니다. 아직 저장 전입니다 "
                     "— 저장을 누르면 무엇이 바뀌는지 먼저 보여 드립니다.")
@@ -2261,6 +2476,8 @@ def show_input_manage() -> None:
     if (other and st.session_state.get(S_LOCK_TOLD) != (book, other)
             and not st.session_state.get(S_TOAST)):
         _locked_popup(book, other)
+    if offer and not st.session_state.get(S_TOAST):
+        _backup_popup(book, user_id, version, offer)
     if st.session_state.get(S_UPLOAD) and not other:
         _upload(book)
     if st.session_state.get(S_REVIEW):
@@ -2594,6 +2811,7 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
     # 그 put 이 돌려준 것이라, 이어서 또 저장할 때도 맞는 판을 짚는다.
     _seed(book, done.body, done.sheets, formulas or {}, done.stamp)
     _drop_lock(user_id, book)              # 저장했으니 다른 사람도 고칠 수 있다
+    _forget_backup(book, user_id)          # 저장했으니 임시 저장은 필요 없다
     # 다음 저장 때 지난번 사유가 그대로 남아 있으면, 그걸 못 보고 그대로
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):

@@ -37,7 +37,10 @@ def server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # 임시 저장은 끈다: 앞 검사가 고쳐 둔 채로 다음 검사가 페이지를 새로 열면
+        # '복구하시겠습니까?' 창이 떠서 격자를 가린다. 임시 저장은 backup_server 에서 본다.
+        env=dict(os.environ, IM_LOCAL_BACKUP="0"))
     url = f"http://localhost:{port}/"
     for _ in range(120):
         try:
@@ -956,7 +959,7 @@ def big_server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, env=dict(os.environ, IM_LOCAL_ROWS="3000"),
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_ROWS="3000", IM_LOCAL_BACKUP="0"),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(120):
         try:
@@ -1175,7 +1178,7 @@ def slow_server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, env=dict(os.environ, IM_LOCAL_SLOW_SAVE="3"),
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_SLOW_SAVE="3", IM_LOCAL_BACKUP="0"),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(120):
         try:
@@ -1471,7 +1474,7 @@ def lock_server():
         [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
          "--server.port", str(port), "--server.headless", "true",
          "--browser.gatherUsageStats", "false"],
-        cwd=ROOT, env=dict(os.environ, IM_LOCAL_BEAT="2"),
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_BEAT="2", IM_LOCAL_BACKUP="0"),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(120):
         try:
@@ -1488,10 +1491,10 @@ def lock_server():
     proc.wait(timeout=20)
 
 
-def _open_as(page, url, user):
+def _open_as(page, url, user, menu=""):
     """그 사람으로 새 탭을 열고 검사할 파일을 고른다 (탭마다 세션이 따로다)."""
     pg = page.context.new_page()
-    pg.goto(f"{url}?user={user}")
+    pg.goto(f"{url}?user={user}" + (f"&menu={menu}" if menu else ""))
     pg.wait_for_timeout(4000)
     pg.get_by_role("combobox").click()
     pg.wait_for_timeout(600)
@@ -1807,3 +1810,211 @@ def test_backspace_in_the_formula_bar_edits_the_text(page):
     page.wait_for_timeout(300)
     assert box.input_value() == before[0][2][:-2]
     assert table(page)["rows"] == before, "칸이 지워졌습니다"
+
+
+# ------------------------------------------------------------- 임시 저장
+#
+# 고치는 동안 몇 초마다 S3 에 임시로 적어 둔다. 화면이 날아간 뒤 같은 사람이
+# 다시 들어오면 '임시 저장된 내용이 있습니다. 복구하시겠습니까?' 를 묻는다.
+# 고친 채로 다른 메뉴로 가겠다고 하면 5분(검사에서는 18초) 동안만 들고 있고,
+# 그동안은 잠금도 그대로다. 그 뒤로는 둘 다 사라져 다른 사람이 고칠 수 있다.
+
+RESTORE_Q = "임시 저장된 내용이 있습니다. 복구하시겠습니까?"
+KEEP_SECONDS = 18
+
+
+@pytest.fixture(scope="module")
+def backup_server():
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", str(ROOT / "app_local.py"),
+         "--server.port", str(port), "--server.headless", "true",
+         "--browser.gatherUsageStats", "false"],
+        cwd=ROOT, env=dict(os.environ, IM_LOCAL_BEAT="2", IM_LOCAL_BACKUP="1",
+                           IM_LOCAL_LEAVE_KEEP=str(KEEP_SECONDS / 60)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(120):
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        proc.terminate()
+        pytest.fail("streamlit 이 안 떴습니다")
+    time.sleep(3)
+    yield f"http://localhost:{port}/"
+    proc.terminate()
+    proc.wait(timeout=20)
+
+
+def _answer(pg, button):
+    """창의 단추를 누른다. 창이 막 뜬 참에는 파일을 바꿔 읽는 몇 판이 창을 다시
+    그려서 단추가 자리를 못 잡는다 -- 한 박자 기다렸다 누른다."""
+    _says(pg, RESTORE_Q)
+    pg.wait_for_timeout(1500)
+    try:
+        pg.get_by_role("button", name=button).click(timeout=15000)
+    except Exception:
+        pg.screenshot(path="/tmp/claude-0/-home-user-dc-ocap-code/2a01401e-db5d-5432-aecf-9b0e63c99f54/scratchpad/answer_fail.png")
+        print("BODY:", pg.inner_text("body")[:1500])
+        raise
+
+
+def _drop_tab(pg):
+    """창이 날아간 것처럼 닫는다 (묻지 않고)."""
+    _forget_edits(pg)
+    pg.close()
+
+
+def _edit_and_wait_backup(pg, r, c, text):
+    _edit(pg, r, c, text)
+    wait_dirty(pg)
+    pg.wait_for_timeout(4000)                 # 1초 모았다가 올리고, S3 에 적는다
+
+
+def test_after_losing_the_page_the_same_person_can_restore(backup_server, page):
+    hong = _open_as(page, backup_server, "hong")
+    settle(hong)
+    _edit_and_wait_backup(hong, 0, 2, "날아갈뻔")
+    _drop_tab(hong)
+
+    # 다른 사람에게는 안 묻는다
+    kim = _open_as(page, backup_server, "kim")
+    kim.wait_for_timeout(1500)
+    assert RESTORE_Q not in kim.inner_text("body")
+    kim.close()
+
+    hong = _open_as(page, backup_server, "hong")
+    try:
+        _answer(hong, "복구")
+        wait_dirty(hong)
+        hong.wait_for_timeout(800)
+        assert table(hong)["rows"][0][2] == "날아갈뻔"
+        # 되살린 것도 여느 때처럼 저장된다. 저장하면 임시 저장은 사라진다.
+        confirm_save(hong)
+        assert table(hong)["rows"][0][2] == "날아갈뻔"
+    finally:
+        hong.close()
+    hong = _open_as(page, backup_server, "hong")
+    try:
+        hong.wait_for_timeout(2000)
+        assert RESTORE_Q not in hong.inner_text("body"), "저장했는데 또 묻습니다"
+    finally:
+        hong.close()
+
+
+def test_discarding_a_temporary_save_forgets_it(backup_server, page):
+    hong = _open_as(page, backup_server, "hong")
+    settle(hong)
+    before = table(hong)["rows"]
+    _edit_and_wait_backup(hong, 1, 2, "버릴것")
+    _drop_tab(hong)
+    hong = _open_as(page, backup_server, "hong")
+    try:
+        _answer(hong, "버리기")
+        settle(hong)
+        assert table(hong)["rows"] == before
+    finally:
+        hong.close()
+    hong = _open_as(page, backup_server, "hong")
+    try:
+        hong.wait_for_timeout(2000)
+        assert RESTORE_Q not in hong.inner_text("body")
+    finally:
+        hong.close()
+
+
+def _leave_to_home(pg):
+    """메뉴의 Home 을 누르고 '벗어나겠습니까?' 에 확인. 한 번에 넘어가야 한다."""
+    asked = []
+    pg.once("dialog", lambda d: (asked.append(d.message), d.accept()))
+    pg.get_by_text("Home", exact=True).click()
+    pg.wait_for_function("() => document.body.innerText.includes('홈 화면')", timeout=15000)
+    assert asked == [LEAVE_MSG]
+
+
+def test_leaving_keeps_the_edits_and_the_lock_for_a_while(backup_server, page):
+    hong = _open_as(page, backup_server, "hong", menu="1")
+    kim = None
+    try:
+        settle(hong)
+        _edit(hong, 0, 3, "실수로나감")
+        wait_dirty(hong)
+        _leave_to_home(hong)
+        assert hong.locator("[role='dialog']").count() == 0
+
+        # 그동안은 다른 사람이 못 고친다
+        kim = _open_as(page, backup_server, "kim")
+        _says(kim, "hong님이 수정중입니다.")
+        kim.close()
+        kim = None
+
+        # 돌아오면 묻는다 -- 실수로 확인을 눌렀어도 되살릴 수 있다
+        hong.get_by_text("기준 정보 관리", exact=True).click()
+        _answer(hong, "복구")
+        wait_dirty(hong)
+        hong.wait_for_timeout(800)
+        assert table(hong)["rows"][0][3] == "실수로나감"
+        hong.get_by_role("button", name="초기화").click()   # 뒷정리: 잠금·임시 저장 풀기
+        settle(hong)
+    finally:
+        _forget_edits(hong)
+        hong.close()
+        if kim:
+            kim.close()
+
+
+def test_after_the_wait_the_edits_are_gone_and_others_can_edit(backup_server, page):
+    hong = _open_as(page, backup_server, "hong", menu="1")
+    try:
+        settle(hong)
+        before = table(hong)["rows"]
+        _edit(hong, 0, 4, "곧사라짐")
+        wait_dirty(hong)
+        _leave_to_home(hong)
+        hong.wait_for_timeout((KEEP_SECONDS + 3) * 1000)
+
+        kim = _open_as(page, backup_server, "kim")
+        try:
+            kim.wait_for_timeout(1500)
+            assert "수정중입니다" not in kim.inner_text("body"), "시간이 지났는데 잠겨 있습니다"
+            settle(kim)
+        finally:
+            kim.close()
+
+        hong.get_by_text("기준 정보 관리", exact=True).click()
+        settle(hong)
+        hong.wait_for_timeout(1500)
+        assert RESTORE_Q not in hong.inner_text("body"), "시간이 지났는데 또 묻습니다"
+        assert table(hong)["rows"] == before
+    finally:
+        hong.close()
+
+
+@pytest.mark.parametrize("menu", ["sac", "option"])
+def test_leaving_through_the_portal_menu_takes_one_confirm(backup_server, page, menu):
+    """포털이 쓰는 메뉴 컴포넌트 그대로. 확인 한 번에 넘어가야 한다."""
+    pytest.importorskip({"sac": "streamlit_antd_components",
+                         "option": "streamlit_option_menu"}[menu])
+    hong = _open_as(page, backup_server, "hong", menu=menu)
+    try:
+        settle(hong)
+        _edit(hong, 1, 3, "메뉴시험")
+        wait_dirty(hong)
+        asked = []
+        hong.once("dialog", lambda d: (asked.append(d.message), d.accept()))
+        hong.frame_locator("[data-testid='stSidebar'] iframe").first \
+            .get_by_text("Home", exact=True).click()
+        hong.wait_for_function("() => document.body.innerText.includes('홈 화면')",
+                               timeout=15000)
+        assert asked == [LEAVE_MSG]
+    finally:
+        hong.close()
+    # 뒷정리: 남겨 둔 잠금과 임시 저장을 푼다
+    hong = _open_as(page, backup_server, "hong")
+    try:
+        _answer(hong, "버리기")
+        settle(hong)
+    finally:
+        hong.close()

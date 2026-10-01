@@ -103,14 +103,32 @@ _beat = __import__("os").environ.get("IM_LOCAL_BEAT")
 if _beat:
     im.LOCK_BEAT_SECONDS = float(_beat)
     im.LOCK_PEEK_SECONDS = min(im.LOCK_PEEK_SECONDS, float(_beat))
+# 임시 저장 간격(초)과, 고친 채 떠난 것을 들고 있는 시간(분)을 검사에서 줄일 때
+_bk = __import__("os").environ.get("IM_LOCAL_BACKUP")
+if _bk:
+    im.BACKUP_SECONDS = float(_bk)
+_keep = __import__("os").environ.get("IM_LOCAL_LEAVE_KEEP")
+if _keep:
+    im.INPUT_LEAVE_KEEP_MINUTES = float(_keep)
 # 포털 메뉴 흉내 (?menu=1). 사이드바의 streamlit 위젯과, 메뉴 컴포넌트처럼
 # 따로 뜨는 틀 안의 링크 둘 다. 고치다가 메뉴를 누르면 묻는지 본다.
-if st.query_params.get("menu"):
+# ?menu=sac / ?menu=option 이면 포털이 쓰는 그 메뉴 컴포넌트로 (깔려 있을 때만).
+_menu = st.query_params.get("menu")
+if _menu:
     import streamlit.components.v1 as components
     with st.sidebar:
-        where = st.radio("메뉴", ["기준 정보 관리", "Home"], key="menu_pick")
-        components.html('<a href="#" id="menu-link" '
-                        'onclick="document.body.dataset.clicked=1">다른 메뉴</a>', height=40)
+        if _menu == "sac":
+            import streamlit_antd_components as sac
+            pick = sac.menu([sac.MenuItem("기준 정보 관리"), sac.MenuItem("Home")],
+                            index=0, key="menu_sac", size="sm", variant="subtle")
+            where = pick or "기준 정보 관리"
+        elif _menu == "option":
+            from streamlit_option_menu import option_menu
+            where = option_menu("메뉴", ["기준 정보 관리", "Home"], key="menu_opt")
+        else:
+            where = st.radio("메뉴", ["기준 정보 관리", "Home"], key="menu_pick")
+            components.html('<a href="#" id="menu-link" '
+                            'onclick="document.body.dataset.clicked=1">다른 메뉴</a>', height=40)
     if where == "Home":
         st.write("홈 화면")
         st.stop()

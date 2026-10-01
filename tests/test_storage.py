@@ -1042,3 +1042,53 @@ def test_the_lock_file_is_not_listed_as_a_workbook():
     im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
     im.hold_lock("A", "hong")
     assert im.list_workbooks() == ["A"]
+
+
+# ------------------------------------------------------------- 임시 저장
+
+def test_a_temporary_save_is_kept_per_person():
+    im.write_backup("A", "hong", "etag1", [{"name": "S", "keep": "S"}])
+    got = im.read_backup("A", "hong")
+    assert got["stamp"] == "etag1" and got["sheets"] == [{"name": "S", "keep": "S"}]
+    assert im.read_backup("A", "kim") is None
+    im.drop_backup("A", "hong")
+    assert im.read_backup("A", "hong") is None
+
+
+def test_a_temporary_save_left_behind_runs_out():
+    """고친 채로 떠난 것은 5분만 들고 있다."""
+    from datetime import datetime, timedelta, timezone
+    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    im.write_backup("A", "hong", "etag1", [], until=past)
+    assert im.read_backup("A", "hong") is None
+    assert not any("임시저장" in k for k in fake_s3.STORE), "지난 것은 지운다"
+    soon = datetime.now(timezone.utc) + timedelta(minutes=5)
+    im.write_backup("A", "hong", "etag1", [], until=soon)
+    assert im.read_backup("A", "hong") is not None
+
+
+def test_a_broken_temporary_save_is_ignored():
+    fake_s3.put_object(im._backup_key("A", "hong"), b"{broken")
+    assert im.read_backup("A", "hong") is None
+
+
+def test_the_temporary_save_folder_is_not_listed_as_a_workbook():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    im.write_backup("A", "hong", "etag1", [])
+    assert im.list_workbooks() == ["A"]
+
+
+def test_a_lock_kept_after_leaving_holds_until_its_time():
+    from datetime import datetime, timedelta, timezone
+    im.hold_lock("A", "hong")
+    im.keep_lock_until("A", "hong", datetime.now(timezone.utc) + timedelta(minutes=5))
+    assert im.hold_lock("A", "kim") == "hong", "떠난 뒤 5분 동안은 잠겨 있어야 합니다"
+    im.keep_lock_until("A", "hong", datetime.now(timezone.utc) - timedelta(seconds=1))
+    assert im.hold_lock("A", "kim") is None, "시간이 지나면 풀려야 합니다"
+
+
+def test_coming_back_turns_a_kept_lock_into_a_normal_one():
+    from datetime import datetime, timedelta, timezone
+    im.keep_lock_until("A", "hong", datetime.now(timezone.utc) + timedelta(seconds=30))
+    im.hold_lock("A", "hong")                 # 돌아와서 다시 고친다
+    assert "until" not in im.edit_lock("A")
