@@ -58,6 +58,10 @@ FOLDER_PATH = os.getenv("INPUT_S3_PREFIX", "2GAPU/input").strip("/")
 S3_ENDPOINT = os.getenv("INPUT_S3_ENDPOINT", "http://s3.dataplatform.samsungds.net:9020")
 # 저장할 때마다 사본을 쌓아 두는 폴더 (기준 정보 폴더 바로 아래)
 HISTORY_DIR = os.getenv("INPUT_S3_HISTORY_DIR", "이력")
+# 누가 고치는 중인지 적어 두는 폴더 (기준 정보 폴더 바로 아래)와, 고치는
+# 사람의 화면이 이만큼(분) 소식이 없으면 잠금을 푸는 시간
+INPUT_S3_LOCK_DIR = os.getenv("INPUT_S3_LOCK_DIR", "잠금")
+INPUT_LOCK_MINUTES = float(os.getenv("INPUT_LOCK_MINUTES", "10"))
 
 _client_lock = threading.Lock()
 _client = None
@@ -982,6 +986,61 @@ def _safe(text: str) -> str:
     return kept.strip(".")[:40] or "unknown"
 
 
+# ----------------------------------------------------------------------
+# 수정 잠금. 누가 고치기 시작해서 저장 단추가 켜진 동안에는 다른 사람이 그
+# 파일을 못 고친다 (보기와 복사는 된다).
+#
+# 잠금은 S3 에 둔다 (기준 정보 폴더/잠금/파일이름.json). 포털이 여러 대로
+# 떠 있어도 다 같이 본다. 고치는 사람의 화면이 1분마다 '아직 고치는 중' 을
+# 알리고(heartbeat), 그게 INPUT_LOCK_MINUTES 분 동안 끊기면 잠금은 저절로
+# 풀린다 -- 저장 안 하고 창을 닫아 버린 사람 때문에 파일이 영영 잠기지 않게.
+# 저장하거나 초기화하면 바로 풀린다.
+#
+# S3 에는 '없을 때만 쓰기' 가 없어서, 쓰고 나서 다시 읽어 내 것인지 본다.
+# 둘이 같은 순간에 시작하면 한쪽은 잠깐 제가 잡은 줄 알 수 있지만, 그래도
+# 저장할 때 버전표를 맞춰 보므로 남의 저장을 덮어쓰지는 않는다.
+# ----------------------------------------------------------------------
+def _lock_key(book: str) -> str:
+    return _key(INPUT_S3_LOCK_DIR, f"{book}.json")
+
+
+def edit_lock(book: str) -> dict | None:
+    """지금 걸려 있는 잠금 {"user", "since", "beat"}. 없거나 끊긴 지 오래면 None."""
+    got = s3.get_object(_lock_key(book))
+    if got is None:
+        return None
+    try:
+        lock = json.loads(got[0].decode("utf-8"))
+        beat = datetime.fromisoformat(lock["beat"])
+    except (ValueError, KeyError, TypeError):
+        return None                        # 망가진 잠금은 없는 것으로
+    if datetime.now(timezone.utc) - beat > timedelta(minutes=INPUT_LOCK_MINUTES):
+        return None
+    return lock
+
+
+def hold_lock(book: str, user: str) -> str | None:
+    """잠금을 잡거나 이어 간다. 다른 사람이 잡고 있으면 그 사람 이름을 준다."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = edit_lock(book)
+    if cur and cur.get("user") != user:
+        return str(cur.get("user"))
+    since = cur.get("since", now) if cur else now
+    s3.put_object(_lock_key(book), json.dumps(
+        {"user": user, "since": since, "beat": now}, ensure_ascii=False).encode("utf-8"))
+    back = edit_lock(book)
+    if back and back.get("user") != user:
+        return str(back.get("user"))      # 같은 순간에 남이 먼저 썼다
+    return None
+
+
+def release_lock(book: str, user: str) -> None:
+    """내 잠금이면 푼다. 남의 것은 건드리지 않는다."""
+    cur = edit_lock(book)
+    if cur and cur.get("user") == user:
+        s3.delete_object(_lock_key(book))
+
+
 def to_xlsx(sheets: dict[str, pd.DataFrame],
             formulas: dict | None = None) -> bytes:
     """시트들을 엑셀 파일 한 벌로."""
@@ -1655,7 +1714,8 @@ _grid = components.declare_component("input_manage_sheet_grid", path=str(_FRONTE
 
 
 def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
-               max_height: int = 520, want_full: str = "") -> dict:
+               max_height: int = 520, want_full: str = "",
+               readonly: str = "", beat: float = 0, unsaved: bool = False) -> dict:
     """격자를 그리고, 격자가 올려준 것을 그대로 돌려준다.
 
     돌려주는 것: {"rev": n, "dirty": bool} 이고, 표를 달라고 했을 때만
@@ -1681,7 +1741,8 @@ def sheet_grid(sheets: dict[str, pd.DataFrame], version: str, key: str,
     data = None if have == version else _grid_payload(sheets, version, key)
 
     got = _grid(sheets=data, version=version, max_height=max_height,
-                want_full=want_full, key=key, default=None)
+                want_full=want_full, readonly=readonly,
+                beat_ms=int(beat * 1000), unsaved=unsaved, key=key, default=None)
     return got or {}
 
 
@@ -1701,11 +1762,7 @@ def _grid_payload(sheets: dict[str, pd.DataFrame], version: str,
     payload = []
     for name, df in sheets.items():
         cols = [str(c) for c in df.columns]
-        arr = df.to_numpy(dtype=object)
-        blank = pd.isna(arr)
-        rows = [["" if gone else (v if type(v) is str else str(v))
-                 for v, gone in zip(row, holes)]
-                for row, holes in zip(arr.tolist(), blank.tolist())]
+        rows = _grid_rows(df)
         payload.append({"name": str(name), "cols": cols, "n": len(rows),
                         "locked": str(name) == REV_SHEET,
                         "rows_json": json.dumps(rows, ensure_ascii=False,
@@ -1738,8 +1795,40 @@ def to_frames(payload: dict,
             out[name] = kept[orig]
         else:
             base = kept.get(str(sheet.get("orig") or name))
+            if "diff" in sheet:
+                if base is None:
+                    raise ValueError(f"'{sheet.get('orig')}' 시트의 원래 내용을 찾지 못했습니다.")
+                sheet = {**sheet, "rows": _expand_diff(sheet["diff"], _grid_rows(base))}
             out[name] = _restore_types(_to_frame(sheet), base)
     return out
+
+
+def _grid_rows(df: pd.DataFrame) -> list[list[str]]:
+    """격자에 내려보내는 꼴의 줄들. 모든 값이 글자이고 빈 칸은 ""."""
+    arr = df.to_numpy(dtype=object)
+    blank = pd.isna(arr)
+    return [["" if gone else (v if type(v) is str else str(v))
+             for v, gone in zip(row, holes)]
+            for row, holes in zip(arr.tolist(), blank.tolist())]
+
+
+def _expand_diff(diff: list, base_rows: list[list[str]]) -> list:
+    """격자가 바뀐 줄만 보낸 것을 온 줄들로 편다.
+
+    diff 의 한 칸은 새 줄(글자 목록)이거나, 받은 표의 몇 번째부터 몇 줄을
+    그대로 쓰라는 {"k": [시작, 개수]} 다.
+    """
+    rows: list = []
+    for item in diff:
+        if isinstance(item, dict):
+            start, count = (int(x) for x in item["k"])
+            if start < 0 or count < 0 or start + count > len(base_rows):
+                # 격자가 다른 판을 보고 있다. 엉뚱한 줄로 채워 저장하면 안 된다.
+                raise ValueError("화면의 표와 원래 표가 맞지 않습니다.")
+            rows.extend(base_rows[start:start + count])
+        else:
+            rows.append(item)
+    return rows
 
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -1863,6 +1952,17 @@ S_SAVE_ERR = "_im_save_err"  # 저장이 실패한 까닭. 창을 다시 켜서 
 # 파일을 띄웠을 때 그 안에 있던 수식들. 격자는 값만 다루므로, 이걸 안 들고
 # 있으면 저장할 때 VLOOKUP 이 걸려 있던 칸이 마지막 계산값으로 굳어 버린다.
 S_FORMULAS = "_im_formulas"
+# 수정 잠금. 내가 잡은 것 {"book", "at": S3 에 마지막으로 적은 때},
+# 남이 잡고 있는 것을 마지막으로 본 결과 (파일, 누구 또는 None, 본 때),
+# '누가 수정중' 창을 닫은 (파일, 누구). 닫은 것은 다시 안 띄운다.
+S_LOCK = "_im_lock"
+S_LOCKED_BY = "_im_locked_by"
+S_LOCK_TOLD = "_im_lock_told"
+S_FRESH = "_im_fresh"         # 남이 저장한 새 판을 읽어 왔다는 한 줄과 그 때
+# 잠금을 이어 가는 간격(초). 격자도 이 간격으로 '아직 여기 있다' 를 알린다.
+LOCK_BEAT_SECONDS = 60
+# 남의 잠금을 이만큼(초)은 다시 안 읽는다. 다시 그릴 때마다 S3 에 묻지 않게.
+LOCK_PEEK_SECONDS = 15
 
 
 # 칸 너비를 꽉 채우라고 말하는 법이 streamlit 버전마다 다르다. 새 버전은
@@ -1921,6 +2021,85 @@ def _seed(book: str, raw: bytes, sheets: dict[str, pd.DataFrame],
         st.session_state.pop(key, None)
 
 
+def _now() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _sync_lock(book: str, user: str, editing: bool) -> str | None:
+    """수정 잠금을 지금 상태에 맞춘다. 남이 고치는 중이면 그 사람을 준다.
+
+    고친 것이 있으면 잠금을 잡거나 이어 가고(1분에 한 번만 S3 에 적는다),
+    없으면 내가 잡고 있던 것을 놓고 남의 잠금이 있는지 본다. S3 가 잠깐 탈이
+    나서 잠금을 못 읽으면 막지 않는다 -- 남의 저장을 덮어쓰는 것은 저장할 때
+    버전표를 맞춰 보는 것이 따로 막는다.
+    """
+    now = _now()
+    mine = st.session_state.get(S_LOCK)
+    try:
+        if editing:
+            if mine and mine["book"] == book and now - mine["at"] < LOCK_BEAT_SECONDS:
+                return None
+            other = hold_lock(book, user)
+            if other:
+                st.session_state.pop(S_LOCK, None)
+                st.session_state[S_LOCKED_BY] = (book, other, now)
+                return other
+            st.session_state[S_LOCK] = {"book": book, "at": now}
+            st.session_state[S_LOCKED_BY] = (book, None, now)
+            return None
+        if mine:
+            _drop_lock(user)
+        seen = st.session_state.get(S_LOCKED_BY)
+        if seen and seen[0] == book and now - seen[2] < LOCK_PEEK_SECONDS:
+            return seen[1]
+        cur = edit_lock(book)
+        other = str(cur["user"]) if cur and cur.get("user") != user else None
+        st.session_state[S_LOCKED_BY] = (book, other, now)
+        return other
+    except Exception:
+        return None
+
+
+def _drop_lock(user: str, book: str | None = None) -> None:
+    """내가 잡은 잠금을 푼다 (저장했거나 초기화했다).
+
+    book 을 주면 그 파일에 걸린 내 잠금도 푼다 -- 이 세션이 잡은 것이 아니어도.
+    고치다가 화면이 날아가 새로 들어온 사람이 초기화를 누르면, 날아간 세션이
+    잡아 둔 잠금 때문에 남들이 몇 분씩 기다리지 않게.
+    """
+    mine = st.session_state.pop(S_LOCK, None)
+    st.session_state.pop(S_LOCKED_BY, None)
+    for name in {mine["book"] if mine else None, book} - {None}:
+        try:
+            release_lock(name, user)
+        except Exception:
+            pass                           # 못 풀어도 몇 분 뒤 저절로 풀린다
+
+
+def _locked_popup(book: str, other: str) -> None:
+    """'누가 수정중입니다.' 창. 확인이나 X 로 닫으면 그 사람·파일로는 다시 안 띄운다."""
+    told = (book, other)
+
+    def forget() -> None:
+        st.session_state[S_LOCK_TOLD] = told
+
+    def body() -> None:
+        st.markdown(f"**{other}님이 수정중입니다.**")
+        st.caption("저장하거나 초기화하면 풀립니다. 그때까지는 보기·복사·다운로드만 됩니다.")
+        if _HAS_DIALOG and st.button("확인", type="primary", **_WIDE):
+            forget()
+            st.rerun()
+
+    if _HAS_DIALOG:
+        kw = ({"on_dismiss": forget}
+              if "on_dismiss" in inspect.signature(st.dialog).parameters else {})
+        st.dialog("수정 중", **kw)(body)()
+    else:
+        forget()
+        with st.container(border=True):
+            body()
+
+
 def show_input_manage() -> None:
     st.markdown('<div class="pretendard-area"><h2>기준 정보 관리</h2></div>',
                 unsafe_allow_html=True)
@@ -1970,8 +2149,11 @@ def show_input_manage() -> None:
         reload_now = st.button("초기화", **_WIDE,
                                help="저장하지 않은 수정을 버리고 S3 의 지금 값을 다시 읽습니다")
 
+    user_id = st.session_state.get("user_id") or "unknown"
     # 파일을 바꿔 고르면 그 파일을 새로 읽는다.
     if reload_now or st.session_state.get(S_BOOK) != book:
+        # 고친 것을 버리니 잠금도 놓는다
+        _drop_lock(user_id, book if reload_now else None)
         try:
             _load(book)
         except Exception as err:
@@ -1989,18 +2171,46 @@ def show_input_manage() -> None:
 
     status = st.container()
 
-    user_id = st.session_state.get("user_id") or "unknown"
+    version = f"{book}|{st.session_state[S_STAMP]}|{st.session_state[S_NONCE]}"
+    # 내가 지금 이 판을 고치는 중인가. 격자가 마지막에 알려 온 것이 이 판의
+    # 것이어야 한다 -- 저장한 직후에는 격자가 아직 지난 판의 '고침' 을 들고 있다.
+    editing = (bool(st.session_state.get(S_UPLOADED))
+               or (isinstance(last, dict) and bool(last.get("dirty"))
+                   and last.get("have") == version))
+    seen = st.session_state.get(S_LOCKED_BY)
+    other = _sync_lock(book, user_id, editing)
+    # 기다리던 잠금이 풀렸다. 그 사람이 저장했으면 화면은 지난 판이다 -- 그대로
+    # 고치면 저장할 때 '다른 사람이 먼저 저장했다' 로 막힌다. 새 판을 읽어 온다.
+    if seen and seen[0] == book and seen[1] and not other and not editing:
+        try:
+            moved = s3.head_etag(_key(f"{book}.xlsx")) != st.session_state[S_STAMP]
+            if moved:
+                _load(book)
+        except Exception:
+            moved = False
+        if moved:
+            st.session_state[S_FRESH] = (f"{seen[1]}님이 저장한 최신 내용을 불러왔습니다.",
+                                         _now())
+            st.rerun()
+    # 창이 떠 있는 동안은 격자가 '아직 여기 있다' 를 안 보낸다. 그때마다
+    # 다시 그리면서 창 안의 단추가 새로 만들어져, 누르려던 것이 빗나간다.
+    popup = bool(st.session_state.get(S_REVIEW) or st.session_state.get(S_UPLOAD)
+                 or st.session_state.get(S_TOAST)
+                 or (other and st.session_state.get(S_LOCK_TOLD) != (book, other)))
     got = sheet_grid(
         shown,
-        version=f"{book}|{st.session_state[S_STAMP]}|{st.session_state[S_NONCE]}",
+        version=version,
         key="im_grid",
         want_full=st.session_state.get(S_WANT, ""),
+        readonly=f"{other}님이 수정중입니다." if other else "",
+        beat=0 if popup else LOCK_BEAT_SECONDS,
+        unsaved=bool(st.session_state.get(S_UPLOADED)),
     )
     # 업로드한 내용도 '아직 저장 안 한 수정' 이다. 격자는 새로 받은 판을
     # 깨끗한 것으로 치므로 그것만 보면 저장 단추가 안 켜진다.
     uploaded = bool(st.session_state.get(S_UPLOADED))
     dirty = bool(got.get("dirty")) or uploaded
-    _take_full(got, book)
+    _take_full(got, book, version)
 
     with c_down:
         _row_label()
@@ -2012,7 +2222,7 @@ def show_input_manage() -> None:
                  "spreadsheetml.sheet")
     with c_up:
         _row_label()
-        if st.button("엑셀 업로드", **_WIDE,
+        if st.button("엑셀 업로드", disabled=bool(other), **_WIDE,
                      help="많은 내용을 한 번에 바꿀 때. 내려받아 고친 엑셀을 "
                           "올리면 화면이 그 내용으로 바뀝니다. 저장을 눌러야 "
                           "S3 에 들어갑니다"):
@@ -2020,13 +2230,23 @@ def show_input_manage() -> None:
             st.rerun()
     with c_save:
         _row_label()
-        if st.button("저장", type="primary", disabled=not dirty, **_WIDE,
-                     help=("S3 의 이 엑셀을 지금 화면의 값으로 바꿉니다"
+        if st.button("저장", type="primary", disabled=not dirty or bool(other), **_WIDE,
+                     help=(f"{other}님이 수정중입니다" if other
+                           else "S3 의 이 엑셀을 지금 화면의 값으로 바꿉니다"
                            if dirty else "고친 것이 있어야 켜집니다")):
             _ask_full("save")
 
     with status:
-        if st.session_state.get(S_WANT):
+        # 몇 초는 남겨 둔다. 한 판만 그리면 곧이은 다시 그리기에 바로 지워진다.
+        fresh = st.session_state.get(S_FRESH)
+        if fresh and _now() - fresh[1] < 15:
+            st.success(fresh[0])
+        elif fresh:
+            st.session_state.pop(S_FRESH, None)
+        if other:
+            st.warning(f"🔒 {other}님이 수정중입니다. 저장하거나 초기화하면 풀립니다 "
+                       "— 그때까지는 보기·복사·다운로드만 됩니다.")
+        elif st.session_state.get(S_WANT):
             st.caption("표를 받아오는 중입니다...")
         elif uploaded:
             st.info("올린 엑셀의 내용이 화면에 들어왔습니다. 아직 저장 전입니다 "
@@ -2037,7 +2257,11 @@ def show_input_manage() -> None:
         else:
             st.caption("고친 것 없음 — 칸을 고치면 저장 단추가 켜집니다")
 
-    if st.session_state.get(S_UPLOAD):
+    # 창은 한 번에 하나만 뜬다. 저장 완료 창이 떠 있으면 그게 닫힌 뒤에.
+    if (other and st.session_state.get(S_LOCK_TOLD) != (book, other)
+            and not st.session_state.get(S_TOAST)):
+        _locked_popup(book, other)
+    if st.session_state.get(S_UPLOAD) and not other:
         _upload(book)
     if st.session_state.get(S_REVIEW):
         _review(book, user_id)
@@ -2063,7 +2287,7 @@ def _ask_full(what: str) -> None:
     st.rerun()
 
 
-def _take_full(got: dict, book: str) -> None:
+def _take_full(got: dict, book: str, version: str) -> None:
     """격자가 올려준 표를 받아 두고, 달라고 한 이유대로 처리한다.
 
     토큰을 맞춰 보는 이유는 streamlit 이 컴포넌트가 마지막에 올린 값을
@@ -2075,6 +2299,10 @@ def _take_full(got: dict, book: str) -> None:
         return
     st.session_state.pop(S_WANT, None)
     try:
+        # 격자는 바뀐 줄만 보내고 나머지는 '받은 표의 몇 번째 줄' 로 짚는다.
+        # 그 '받은 표' 가 지금 파이썬이 들고 있는 표와 같은 판이어야 맞다.
+        if got.get("have") != version:
+            raise ValueError("화면의 표가 지금 판이 아닙니다.")
         edited = pin_rev_info(to_frames(got, st.session_state.get(S_SHOWN)),
                               st.session_state[S_SHEETS])
     except ValueError as err:
@@ -2334,6 +2562,17 @@ def _review_body(book: str, user_id: str) -> None:
 
 def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
           formulas: dict | None = None) -> None:
+    # 그 사이 잠금을 남에게 넘겼으면(내 화면이 오래 소식이 없어 풀렸다) 저장하지
+    # 않는다. 그 사람이 고치는 중인 파일이다.
+    try:
+        other = hold_lock(book, user_id)
+    except Exception:
+        other = None                       # 못 읽었으면 버전표 확인에 맡긴다
+    if other:
+        st.session_state[S_SAVE_ERR] = (
+            f"{other}님이 수정중입니다. 그 사람이 저장하거나 초기화한 뒤에 "
+            f"다시 해 주세요. 고친 내용은 화면에 남아 있습니다.")
+        st.rerun()
     try:
         done = save_workbook(book, edited, user_id,
                              base_stamp=st.session_state[S_STAMP],
@@ -2354,6 +2593,7 @@ def _save(book: str, edited: dict[str, pd.DataFrame], user_id: str,
     # 방금 우리가 올린 바이트가 곧 지금 S3 에 있는 바이트다. 버전표까지
     # 그 put 이 돌려준 것이라, 이어서 또 저장할 때도 맞는 판을 짚는다.
     _seed(book, done.body, done.sheets, formulas or {}, done.stamp)
+    _drop_lock(user_id, book)              # 저장했으니 다른 사람도 고칠 수 있다
     # 다음 저장 때 지난번 사유가 그대로 남아 있으면, 그걸 못 보고 그대로
     # 눌러 버린다. 사유는 매번 새로 받는 것이 맞다.
     for key in ("im_rev_remark", "im_rev_link"):

@@ -993,3 +993,52 @@ def test_the_history_name_is_found_without_listing_the_whole_folder(monkeypatch)
     im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
     hist_asks = [p for p in asked if "/이력/" in p]
     assert hist_asks and all(p.rsplit("/", 1)[-1].endswith("_A_hong") for p in hist_asks), asked
+
+
+# ------------------------------------------------------------- 수정 잠금
+
+def test_a_lock_is_held_by_one_person_at_a_time():
+    assert im.hold_lock("A", "hong") is None
+    assert im.edit_lock("A")["user"] == "hong"
+    assert im.hold_lock("A", "kim") == "hong", "남이 고치는 중인데 잡았습니다"
+    assert im.hold_lock("A", "hong") is None, "내 잠금은 이어 갈 수 있어야 합니다"
+    assert im.hold_lock("B", "kim") is None, "다른 파일은 따로입니다"
+
+
+def test_only_the_holder_can_release_a_lock():
+    im.hold_lock("A", "hong")
+    im.release_lock("A", "kim")
+    assert im.edit_lock("A")["user"] == "hong"
+    im.release_lock("A", "hong")
+    assert im.edit_lock("A") is None
+    assert im.hold_lock("A", "kim") is None
+
+
+def test_keeping_a_lock_keeps_when_it_started():
+    im.hold_lock("A", "hong")
+    since = im.edit_lock("A")["since"]
+    im.hold_lock("A", "hong")
+    assert im.edit_lock("A")["since"] == since
+
+
+def test_a_lock_nobody_keeps_alive_runs_out(monkeypatch):
+    """저장 안 하고 창을 닫아 버리면 파일이 영영 잠기면 안 된다."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(minutes=im.INPUT_LOCK_MINUTES + 1)).isoformat()
+    fake_s3.put_object(im._lock_key("A"), json.dumps(
+        {"user": "hong", "since": old, "beat": old}).encode())
+    assert im.edit_lock("A") is None
+    assert im.hold_lock("A", "kim") is None
+
+
+def test_a_broken_lock_file_does_not_lock_anyone_out():
+    fake_s3.put_object(im._lock_key("A"), b"{not json")
+    assert im.edit_lock("A") is None
+    assert im.hold_lock("A", "kim") is None
+
+
+def test_the_lock_file_is_not_listed_as_a_workbook():
+    im.save_workbook("A", sheets(S=[{"a": 1}]), "hong")
+    im.hold_lock("A", "hong")
+    assert im.list_workbooks() == ["A"]

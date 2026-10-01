@@ -96,5 +96,22 @@ if not fake_s3.STORE:
 from src.input_manage.input_manage import show_input_manage
 
 st.set_page_config(page_title="기준 정보 관리", layout="wide")
-st.session_state.setdefault("user_id", "hong")
+# 두 사람을 흉내 낼 때:  http://localhost:8501/?user=kim
+st.session_state.setdefault("user_id", st.query_params.get("user", "hong"))
+# 잠금 heartbeat 를 검사에서 빨리 돌릴 때 (초):  IM_LOCAL_BEAT=2
+_beat = __import__("os").environ.get("IM_LOCAL_BEAT")
+if _beat:
+    im.LOCK_BEAT_SECONDS = float(_beat)
+    im.LOCK_PEEK_SECONDS = min(im.LOCK_PEEK_SECONDS, float(_beat))
+# 포털 메뉴 흉내 (?menu=1). 사이드바의 streamlit 위젯과, 메뉴 컴포넌트처럼
+# 따로 뜨는 틀 안의 링크 둘 다. 고치다가 메뉴를 누르면 묻는지 본다.
+if st.query_params.get("menu"):
+    import streamlit.components.v1 as components
+    with st.sidebar:
+        where = st.radio("메뉴", ["기준 정보 관리", "Home"], key="menu_pick")
+        components.html('<a href="#" id="menu-link" '
+                        'onclick="document.body.dataset.clicked=1">다른 메뉴</a>', height=40)
+    if where == "Home":
+        st.write("홈 화면")
+        st.stop()
 show_input_manage()

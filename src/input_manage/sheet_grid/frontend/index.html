@@ -337,6 +337,9 @@ function loadRows(s) {
   for (let i = 0; i < rs.length; i++) {
     if (rs[i].length < w) rs[i] = rs[i].concat(new Array(w - rs[i].length).fill(""));
   }
+  // 받은 줄들의 목록. 저장할 때 '안 바뀐 줄' 을 알아보는 데 쓴다 (줄을
+  // 고치면 늘 새 줄로 갈아 끼우므로, 같은 객체면 안 바뀐 것이다).
+  s.base = rs.slice();
   if (!rs.length) rs.push(new Array(w).fill(""));
   s.rows = rs;
   s.raw = null;
@@ -365,16 +368,35 @@ const rowCount = (s) => (s.rows ? s.rows.length : s.n || 0);
 // 잠긴 시트(REV_INFO)는 고칠 수 없다. 저장할 때 파이썬이 한 줄씩 붙여 적는
 // 시트라, 여기서 고치면 기록이 기록이 아니게 된다. (파이썬도 저장할 때 이
 // 시트는 S3 에 있는 그대로 쓴다 -- 여기서 막는 것은 헛수고를 막는 것이다.)
-const lockedNow = () => !!(sheets[active] && sheets[active].locked);
+//
+// 파일 전체가 잠길 때도 있다: 다른 사람이 이 파일을 고치는 중이면 파이썬이
+// "홍길동님이 수정중입니다." 를 내려보내고(readonly), 그동안은 보기·복사만 된다.
+let bookLock = "";
+const lockedNow = () => !!bookLock || !!(sheets[active] && sheets[active].locked);
 const lockNote = document.getElementById("locknote");
+const SHEET_LOCK_NOTE = lockNote.textContent;
 let flashTimer = null;
+let alertQuietUntil = 0;
+
+function showLock() {
+  lockNote.textContent = bookLock
+    ? `🔒 ${bookLock} 저장하거나 초기화하면 풀립니다. 그때까지는 보기·복사만 됩니다.`
+    : SHEET_LOCK_NOTE;
+  document.body.classList.toggle("locked", lockedNow());
+}
 
 // 잠긴 시트면 막고 안내 줄을 한 번 반짝인다. 막았으면 true.
+// 남이 고치는 중인 파일이면 그 말을 창으로도 띄운다 (자판을 칠 때마다
+// 뜨지 않게 몇 초에 한 번만).
 function refuse() {
   if (!lockedNow()) return false;
   lockNote.classList.add("flash");
   clearTimeout(flashTimer);
   flashTimer = setTimeout(() => lockNote.classList.remove("flash"), 600);
+  if (bookLock && performance.now() > alertQuietUntil) {
+    window.alert(bookLock);
+    alertQuietUntil = performance.now() + 3000;
+  }
   return true;
 }
 const cols = () => sheet().cols;
@@ -393,7 +415,7 @@ const rows = () => sheet().rows;
 const copySheet = (s) => ({ name: s.name, orig: s.orig, touched: s.touched,
                             locked: s.locked,
                             cols: s.cols.slice(), rows: s.rows ? s.rows.slice() : null,
-                            raw: s.raw, n: s.n });
+                            raw: s.raw, n: s.n, base: s.base });
 
 function snapshot() {
   return { active, sheets: sheets.map(copySheet) };
@@ -486,7 +508,7 @@ function clampSelection() {
 // ===================================================================
 // 표의 뼈대(줄 수, 칸 수, 시트)가 바뀌었을 때만 통째로 다시 만든다.
 function renderAll() {
-  document.body.classList.toggle("locked", lockedNow());
+  showLock();
   renderGrid();
   renderSheetBar();
   renderFormula();
@@ -690,13 +712,28 @@ function renderFormula() {
 }
 
 // 수식 입력줄에서 고치기. 칸을 눌러 고치는 것과 같은 결과여야 한다.
+// 한글 조합 중 Enter 는 칸에서와 같이 조합이 끝난 뒤에 처리한다 (아래 '자판').
+function formulaEnter() {
+  commitFormula();
+  anchor = focus = { r: Math.min(anchor.r + 1, rows().length - 1), c: anchor.c };
+  // 아래 칸 값으로 먼저 바꿔 둔다. 입력줄은 초점이 있는 동안 새 칸 값으로
+  // 안 바뀌는데(renderFormula), 그대로 초점을 빼면 blur 가 방금 친 글자를
+  // 아래 칸에 한 번 더 써 넣는다.
+  valBox.value = cell(anchor.r, anchor.c);
+  repaintSelection();
+  armGhost();
+}
+valBox.addEventListener("compositionend", () => afterComposition(formulaEnter));
 valBox.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
+  if (isEcho(e)) return;
+  if (composing(e)) {
+    if (isEnter(e)) imeKey = "Enter";
+    return;
+  }
+  if (isEnter(e)) {
     e.preventDefault();
-    commitFormula();
-    anchor = focus = { r: Math.min(anchor.r + 1, rows().length - 1), c: anchor.c };
-    repaintSelection();
-    armGhost();
+    imeKey = null;
+    formulaEnter();
   } else if (e.key === "Escape") {
     e.preventDefault();
     valBox.value = cell(anchor.r, anchor.c);
@@ -794,14 +831,43 @@ function publish(immediate) {
 // 이것' 만 알려 주면 파이썬이 제 것을 쓴다. 다섯 장 중 한 장을 고쳤으면
 // 14MB 대신 그 한 장만 올라간다. 시트 순서와 이름 바꾼 것은 이 목록으로
 // 그대로 전해진다.
+//
+// 손댄 시트도 통째로 올리지 않는다. 16,000줄 시트에서 4칸을 고쳤으면 바뀐
+// 줄만 보내고, 나머지는 '받은 표의 몇 번째부터 몇 줄' 로 짚는다
+// ({k: [시작, 개수]}). 통째로 올리면 그 시트 하나가 4.6MB 인데, streamlit
+// 은 이 값을 다음 판마다 또 올린다 -- 저장 한 번에 몇 번씩. 그 큰 덩어리가
+// 회사 망을 지나다 끊기면 세션이 새로 시작되어 화면이 처음으로 돌아갔다.
+function rowsDiff(s) {
+  const rs = loadRows(s), base = s.base;
+  if (!base) return null;
+  const at = new Map();
+  for (let i = 0; i < base.length; i++) at.set(base[i], i);
+  const out = [];
+  let run = null;
+  for (const row of rs) {
+    const i = at.get(row);
+    if (i === undefined) { run = null; out.push(row); continue; }
+    if (run && run.k[0] + run.k[1] === i) { run.k[1]++; continue; }
+    run = { k: [i, 1] };
+    out.push(run);
+  }
+  return out;
+}
+
+function sheetForPython(s) {
+  if (!(s.touched || s.orig === undefined)) return { name: s.name, keep: s.orig };
+  const diff = s.orig === undefined ? null : rowsDiff(s);
+  return diff
+    ? { name: s.name, orig: s.orig, cols: s.cols.slice(), diff: diff }
+    : { name: s.name, orig: s.orig, cols: s.cols.slice(), rows: loadRows(s) };
+}
+
 function publishFull(token) {
   clearTimeout(publishTimer);
   answered = token;
   setValue({
     rev: ++rev, dirty: dirty, full: true, token: token, have: version,
-    sheets: sheets.map(s => (s.touched || s.orig === undefined
-      ? { name: s.name, orig: s.orig, cols: s.cols.slice(), rows: loadRows(s) }
-      : { name: s.name, keep: s.orig })),
+    sheets: sheets.map(sheetForPython),
   });
 }
 
@@ -993,6 +1059,7 @@ sheetbar.addEventListener("dblclick", (e) => {
   const tab = e.target.closest(".tab");
   if (!tab) return;
   const i = Number(tab.dataset.i);
+  if (bookLock) { window.alert(bookLock); return; }
   if (sheets[i].locked) {
     window.alert(`'${sheets[i].name}' 은(는) 저장할 때 자동으로 적히는 시트라 이름을 바꿀 수 없습니다.`);
     return;
@@ -1014,23 +1081,85 @@ sheetbar.addEventListener("dblclick", (e) => {
 // ===================================================================
 // 자판
 // ===================================================================
+// 한글을 치다가 Enter 를 누르면, 그 순간 마지막 글자는 아직 조합 중이다.
+// 이때 바로 칸을 닫고 아래로 내려가면 IME 가 마지막 글자(때로는 칸 전체)를
+// 새로 초점이 간 아래 칸에 확정해 넣는다 -- 아래 칸 값이 위 칸 글자로
+// 덮인다. 그래서 조합 중의 Enter/Tab 은 적어만 두고, 조합이 끝난 뒤에 한
+// 번 처리한다. 브라우저에 따라 조합이 끝난 뒤 Enter 가 한 번 더 오는데
+// (조합 중 것 + 진짜 것), 그건 두 번 내려가지 않게 버린다.
+const isEnter = (e) => e.key === "Enter" || e.code === "Enter" || e.code === "NumpadEnter";
+const isTab = (e) => e.key === "Tab" || e.code === "Tab";
+const composing = (e) => e.isComposing || e.keyCode === 229;
+let imeKey = null;        // 조합 중에 눌러 둔 "Enter" / "Tab"
+let imeEchoUntil = 0;     // 이때까지 오는 Enter/Tab 은 방금 처리한 것의 메아리
+
+// 조합이 끝났을 때 눌러 둔 키를 처리한다. 진짜 keydown 이 곧바로 뒤따르는
+// 브라우저에서는 그쪽이 먼저 처리하므로 한 박자 기다린다.
+function afterComposition(run) {
+  setTimeout(() => {
+    const key = imeKey;
+    if (!key) return;                  // 뒤따른 keydown 이 이미 처리했다
+    imeKey = null;
+    run(key);
+    imeEchoUntil = performance.now() + 250;
+  }, 0);
+}
+
+function isEcho(e) {
+  if (!(isEnter(e) || isTab(e)) || performance.now() > imeEchoUntil) return false;
+  imeEchoUntil = 0;
+  e.preventDefault();
+  return true;
+}
+
+function editKey(key, shift) {
+  const { r, c } = editingCell;
+  endEdit(true);
+  anchor = focus = key === "Tab"
+    ? { r, c: Math.min(c + 1, cols().length - 1) }
+    : { r: Math.min(r + 1, rows().length - 1), c };
+  repaintSelection();
+}
+
+document.addEventListener("compositionend", (e) => {
+  if (e.target === valBox || !editingCell) return;
+  afterComposition((key) => { if (editingCell) editKey(key); });
+}, true);
+
+// 검색칸이나 수식 입력줄에서 친 키는 그 칸의 것이다. 격자 단축키로 받으면
+// 검색어를 지우려고 누른 Backspace 가 골라 둔 칸을 지우고, Enter 가 칸을
+// 고치기 시작하고, 붙여넣기가 격자에 퍼진다. (숨은 입력칸은 격자의 것이다.)
+function typingInBox(e) {
+  const t = e.target;
+  return t !== ghost && t instanceof Element && t.matches("input, textarea, select");
+}
+
 document.addEventListener("keydown", (e) => {
+  if (typingInBox(e)) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();               // 브라우저 찾기 대신 우리 검색칸
+      openFind();
+    }
+    return;
+  }
+  if (isEcho(e)) return;
   if (editingCell) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (composing(e)) {
+      if (isEnter(e) && !e.shiftKey) imeKey = "Enter";
+      else if (isTab(e)) { imeKey = "Tab"; e.preventDefault(); }   // 초점이 빠져나가지 않게
+      return;                          // 조합이 끝나면 compositionend 에서
+    }
+    if (isEnter(e) && !e.shiftKey) {
       e.preventDefault();
-      const { r, c } = editingCell;
-      endEdit(true);
-      anchor = focus = { r: Math.min(r + 1, rows().length - 1), c };
-      repaintSelection();
+      imeKey = null;
+      editKey("Enter");
     } else if (e.key === "Escape") {
       e.preventDefault();
       endEdit(false);
-    } else if (e.key === "Tab") {
+    } else if (isTab(e)) {
       e.preventDefault();
-      const { r, c } = editingCell;
-      endEdit(true);
-      anchor = focus = { r, c: Math.min(c + 1, cols().length - 1) };
-      repaintSelection();
+      imeKey = null;
+      editKey("Tab");
     }
     return;
   }
@@ -1038,8 +1167,18 @@ document.addEventListener("keydown", (e) => {
   if (!cols().length) return;
 
   const mod = e.ctrlKey || e.metaKey;
-  if (mod && e.key.toLowerCase() === "c") { copySelection(); e.preventDefault(); return; }
-  if (mod && e.key.toLowerCase() === "x") { copySelection(); clearSelection(); e.preventDefault(); return; }
+  // 복사·잘라내기는 브라우저의 copy/cut 이벤트에서 한다 (아래 '클립보드').
+  // 여기서 막으면 그 이벤트가 안 온다. 혹시 안 오면 한 박자 뒤에 직접 한다.
+  if (mod && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "x")) {
+    const cut = e.key.toLowerCase() === "x";
+    copiedByEvent = false;
+    setTimeout(() => {
+      if (copiedByEvent) return;
+      copySelection();
+      if (cut) clearSelection();
+    }, 0);
+    return;
+  }
   if (mod && e.key.toLowerCase() === "z") { undo(); e.preventDefault(); return; }
   if (mod && e.key.toLowerCase() === "y") { redo(); e.preventDefault(); return; }
   if (mod && e.key.toLowerCase() === "f") { openFind(); e.preventDefault(); return; }
@@ -1191,9 +1330,36 @@ function fallbackCopy(text) {
   armGhost();
 }
 
+// Ctrl+C / Ctrl+X 는 브라우저가 주는 copy/cut 이벤트에 글자를 실어 보낸다.
+// navigator.clipboard 는 https 에서만 있어서, 사내 http 포털에서는 없다 --
+// 그때 쓰던 우회로(execCommand)는 비동기로 실패를 확인한 뒤라 가끔 빗나갔다.
+// 이 이벤트는 어디서나 바로 된다. 글자(탭/줄바꿈)만 싣는다: 엑셀이나
+// 메신저에 붙여도 서식 없이 글자만 들어간다.
+let copiedByEvent = false;
+function onCopy(e, cut) {
+  if (typingInBox(e) || editingCell || !cols().length) return;
+  e.preventDefault();
+  e.clipboardData.setData("text/plain", selectionAsTsv());
+  copiedByEvent = true;
+  if (cut) clearSelection();
+}
+document.addEventListener("copy", (e) => onCopy(e, false));
+document.addEventListener("cut", (e) => onCopy(e, true));
+
 document.addEventListener("paste", (e) => {
-  if (editingCell) return;                     // 칸 안에 붙여넣는 중이면 그대로 둔다
+  if (typingInBox(e)) return;                  // 검색칸·수식 입력줄에 붙여넣는 중
   const text = (e.clipboardData || window.clipboardData).getData("text");
+  if (editingCell) {
+    // 칸을 고치는 중이어도 서식(굵게, 색, 엑셀의 표 모양)은 안 받는다 --
+    // 칸 안에 그대로 붙으면 여러 칸 값이 한 칸에 붙어 버린다. 여러 칸을
+    // 복사해 왔으면 고치기를 마치고 그 칸부터 칸칸이 펼친다.
+    e.preventDefault();
+    if (!text) return;
+    const one = text.replace(/\r?\n$/, "");
+    if (/[\t\n]/.test(one)) { endEdit(true); pasteTsv(text); }
+    else document.execCommand("insertText", false, one);
+    return;
+  }
   if (!text) return;
   e.preventDefault();
   pasteTsv(text);
@@ -1463,6 +1629,14 @@ window.addEventListener("message", (event) => {
   // 검사에서 센다 -- 저장 창에서 사유를 치는 동안에는 안 돌아야 한다.
   window.__rendered = (window.__rendered || 0) + 1;
   maxHeight = args.max_height || 520;
+  lastWant = args.want_full || "";
+  armBeat(args.beat_ms ?? 60000);
+  unsavedFromPython = !!args.unsaved;
+  if ((args.readonly || "") !== bookLock) {
+    bookLock = args.readonly || "";
+    if (bookLock) endEdit(false);        // 고치던 칸은 접는다
+    showLock();
+  }
 
   // 판 번호가 그대로면 건드리지 않는다. 값을 올려보낼 때마다 streamlit 이
   // 스크립트를 다시 돌리면서 이 자리로 같은 데이터가 되돌아오는데, 그때마다
@@ -1514,6 +1688,97 @@ window.addEventListener("message", (event) => {
   // have: 이 판을 받았다. 파이썬은 이걸 보고 다음부터 표를 안 딸려 보낸다.
   setValue({ rev: ++rev, dirty: false, full: false, have: version });
 });
+
+// 파일을 띄워 두고 있으면 1분마다 '아직 여기 있다' 를 알린다. 파이썬은 그때
+// 내 수정 잠금을 이어 가고(고친 것이 있을 때), 남이 고치기 시작했는지·끝냈는지
+// 본다. 고친 것이 없는 사람도 보내야 한다 -- 안 그러면 내가 먼저 열어 둔
+// 파일을 남이 고치기 시작해도 내가 칸을 칠 때까지 모른다. 그 사이 오가는
+// 것이 있어서 오래 가만히 둔 화면의 연결이 끊기는 일도 줄어든다.
+// 파이썬이 표를 달라고 해 놓은 동안은 건너뛴다 -- 그 사이 값을 바꾸면 보낸
+// 표를 덮어쓴다.
+let beatMs = 60000;
+let beatTimer = null;
+let lastWant = "";
+function armBeat(ms) {
+  if (ms === beatMs && (beatTimer || !ms)) return;
+  beatMs = ms;
+  clearInterval(beatTimer);
+  beatTimer = null;
+  if (!ms) return;                       // 파이썬 쪽에 창이 떠 있다: 쉰다
+  beatTimer = setInterval(() => {
+    if (!lastWant && version !== null) {
+      setValue({ rev: ++rev, dirty: dirty, full: false, have: version, beat: Date.now() });
+    }
+  }, beatMs);
+}
+
+// ===================================================================
+// 고친 것이 있는데 다른 곳으로 가려 하면 묻는다
+//
+// 포털 메뉴(왼쪽 사이드바, 또는 그 안의 메뉴 컴포넌트 틀)를 누르면 streamlit
+// 이 다른 화면을 그리면서 이 격자를 통째로 치운다 -- 고친 것도 같이 사라진다.
+// 메뉴는 이 격자 밖(같은 출처의 바깥 문서와 다른 틀)에 있으므로, 거기에
+// 누름을 먼저 받는 귀를 단다. 창을 닫거나 새로 고칠 때는 브라우저가 제 말로
+// 묻는다 (요즘 브라우저는 우리 문구를 안 띄운다).
+// ===================================================================
+const LEAVE_MSG = "페이지를 벗어나면 수정 사항이 사라집니다. 벗어나겠습니까?";
+let unsavedFromPython = false;           // 엑셀을 올려 둔 것도 저장 안 한 수정이다
+const unsaved = () => dirty || unsavedFromPython;
+const hooked = new Set();                // 귀를 단 문서들
+
+function onLeaveClick(e) {
+  // 이 격자가 이미 치워졌으면(벗어나기로 했다) 아무것도 안 한다
+  if (!window.frameElement || !window.frameElement.isConnected || !unsaved()) return;
+  // instanceof Element 는 못 쓴다: 바깥 문서·다른 틀의 요소는 그쪽 창의
+  // Element 로 만들어져서, 이 틀의 Element 로 견주면 늘 false 다.
+  const t = e.target && e.target.nodeType === 1 ? e.target : null;
+  if (!t || !t.closest("a, button, li, label, input, select, [role], .nav-link")) return;
+  const doc = t.ownerDocument;
+  if (doc === window.parent.document && !t.closest('[data-testid="stSidebar"]')) return;
+  if (window.confirm(LEAVE_MSG)) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+
+function onBeforeUnload(e) {
+  if (!unsaved()) return;
+  e.preventDefault();
+  e.returnValue = LEAVE_MSG;
+  return LEAVE_MSG;
+}
+
+function hookLeave() {
+  let top;
+  try { top = window.parent.document; } catch (err) { return; }   // 출처가 다르면 못 단다
+  const docs = [top];
+  for (const f of top.querySelectorAll("iframe")) {
+    if (f === window.frameElement) continue;
+    try { if (f.contentDocument) docs.push(f.contentDocument); } catch (err) { /* 다른 출처 */ }
+  }
+  for (const d of docs) {
+    if (hooked.has(d)) continue;
+    d.addEventListener("click", onLeaveClick, true);
+    hooked.add(d);
+  }
+  if (!hooked.has(window.parent)) {
+    window.parent.addEventListener("beforeunload", onBeforeUnload);
+    hooked.add(window.parent);
+  }
+}
+
+function unhookLeave() {
+  for (const d of hooked) {
+    try {
+      d.removeEventListener("click", onLeaveClick, true);
+      d.removeEventListener("beforeunload", onBeforeUnload);
+    } catch (err) { /* 이미 사라진 문서 */ }
+  }
+  hooked.clear();
+}
+// 메뉴 틀은 늦게 뜨거나 새로 만들어지기도 해서 몇 초마다 다시 훑는다
+setInterval(hookLeave, 2000);
+hookLeave();
+window.addEventListener("pagehide", unhookLeave);
 
 send({ type: "streamlit:componentReady", apiVersion: 1 });
 syncHeight();

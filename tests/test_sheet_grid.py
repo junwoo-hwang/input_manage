@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.input_manage.input_manage import to_frames
@@ -122,3 +123,55 @@ def test_an_untouched_sheet_is_not_diffed_and_keeps_every_formula():
     formulas = {"STEP": {(0, "a"): "VLOOKUP(B2,X!$A:$B,2,0)"}}
     kept, lost = im.surviving_formulas(before, after, formulas)
     assert kept == formulas and not lost
+
+
+# ------------------------------------------------ 바뀐 줄만 올리기
+#
+# 격자는 손댄 시트도 통째로 올리지 않는다. 바뀐 줄만 보내고 나머지는 '받은
+# 표의 몇 번째부터 몇 줄' ({"k": [시작, 개수]}) 로 짚는다. 펼친 결과는 통째로
+# 보냈을 때와 똑같아야 한다.
+
+def _base():
+    return pd.DataFrame({"a": ["1", "2", "3", "4"], "b": ["x", None, "z", "w"]},
+                        dtype=object)
+
+
+def _full(rows):
+    return to_frames({"sheets": [{"name": "S", "orig": "S", "cols": ["a", "b"],
+                                  "rows": rows}]}, {"S": _base()})["S"]
+
+
+def _diff(diff):
+    return to_frames({"sheets": [{"name": "S", "orig": "S", "cols": ["a", "b"],
+                                  "diff": diff}]}, {"S": _base()})["S"]
+
+
+def test_a_diff_with_one_changed_row_equals_the_full_upload():
+    got = _diff([{"k": [0, 1]}, ["2", "고침"], {"k": [2, 2]}])
+    want = _full([["1", "x"], ["2", "고침"], ["3", "z"], ["4", "w"]])
+    assert got.equals(want)
+
+
+def test_a_diff_keeps_inserted_deleted_and_moved_rows():
+    # 1번 줄을 지우고, 맨 앞에 새 줄을 넣고, 마지막 두 줄 순서를 바꿨다
+    got = _diff([["새", ""], {"k": [0, 1]}, {"k": [3, 1]}, {"k": [2, 1]}])
+    want = _full([["새", ""], ["1", "x"], ["4", "w"], ["3", "z"]])
+    assert got.equals(want)
+
+
+def test_blank_cells_come_back_blank_through_a_diff():
+    got = _diff([{"k": [0, 4]}])
+    assert got.equals(_full([["1", "x"], ["2", ""], ["3", "z"], ["4", "w"]]))
+
+
+@pytest.mark.parametrize("bad", [[{"k": [3, 2]}], [{"k": [-1, 1]}], [{"k": [0, -1]}]])
+def test_a_diff_pointing_outside_the_table_is_refused(bad):
+    """격자가 다른 판을 보고 있다는 뜻이다. 엉뚱한 줄로 채워 저장하면 안 된다."""
+    with pytest.raises(ValueError):
+        _diff(bad)
+
+
+def test_a_diff_without_its_original_sheet_is_refused():
+    with pytest.raises(ValueError):
+        to_frames({"sheets": [{"name": "S", "orig": "없음", "cols": ["a"],
+                               "diff": [{"k": [0, 1]}]}]}, {"S": _base()})
