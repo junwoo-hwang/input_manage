@@ -81,6 +81,16 @@ def seed():
                  "ppid": "P-TTS-01", "사용": "Y"},
             ]),
         },
+        # 시트 탭(끌어서 순서 바꾸기, 오른쪽 클릭 차림표) 검사용. 이름이 목록
+        # 맨 뒤라 다른 검사가 처음 고르는 파일과 겹치지 않는다.
+        "ZZ_TAB_TEST": {
+            "A": pd.DataFrame([{"k": "a1", "v": "1"}, {"k": "a2", "v": "2"}]),
+            "B": pd.DataFrame([{"k": "b1", "v": "3"}]),
+            "C": pd.DataFrame([{"k": "c1", "v": "4"}]),
+            "REV_INFO": pd.DataFrame([
+                {"Date": "2026-09-01", "Remark": "최초 등록", "user": "홍길동", "관련": ""},
+            ]),
+        },
     }
     for name, sheets in books.items():
         fake_s3.put_object(f"2GAPU/input/{name}.xlsx", im.to_xlsx(sheets))

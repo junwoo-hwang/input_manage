@@ -1593,9 +1593,78 @@ def _resolve_ref(expr: str, own):
 
 
 @_no_gc
+def _lineage(after_names, origins: dict | None) -> tuple[dict, dict]:
+    """시트들의 내력. (지금 이름 -> 원래 이름 또는 None, 원래 이름 -> 그 시트를
+    이어받은 지금 이름).
+
+    원래 시트를 이어받는 것은 하나뿐이다: 같은 이름이 남아 있으면 그것,
+    아니면 처음 나오는 것(이름을 바꾼 것). 나머지는 복사본이다. 아무도
+    이어받지 않은 원래 시트는 지운 것이다. origins 가 없으면 이름이 곧 내력이다.
+    """
+    src_of = {n: (origins[n] if origins is not None and n in origins else n)
+              for n in after_names}
+    primary: dict = {}
+    for n, src in src_of.items():
+        if src is not None and src == n:
+            primary[src] = n
+    for n, src in src_of.items():
+        if src is not None and src not in primary:
+            primary[src] = n
+    return src_of, primary
+
+
+# 수식 안에서 시트를 가리키는 자리: 'Probe Card'!A1 또는 ET추출여부!$A:$C.
+# "..." 안의 글자는 시트 이름이 아니므로 먼저 걸러낸다 (_retarget).
+_F_STRING = re.compile(r'"(?:[^"]|"")*"')
+_F_SHEET = re.compile(r"'((?:[^']|'')+)'!|(?<![\w.\]])([^\W\d][\w.]*)!")
+
+
+class _GoneSheet(ValueError):
+    """지운 시트를 가리킨다 (엑셀이면 #REF!)."""
+
+
+def _retarget(text: str, renames: dict, gone: set):
+    """수식 속 시트 이름을 바뀐 이름으로. 지운 시트를 가리키면 None.
+
+    엑셀은 시트 이름을 바꾸면 그 시트를 가리키는 수식을 따라 고쳐 준다.
+    우리가 안 고치면 저장한 파일을 열 때 '다른 파일을 찾는다' 는 창이 뜨거나
+    #REF! 가 된다. 시트 이름은 엑셀처럼 대소문자를 가리지 않는다.
+    """
+    if not renames and not gone:
+        return text
+    lower_renames = {k.lower(): v for k, v in renames.items()}
+    lower_gone = {g.lower() for g in gone}
+
+    def one(m: re.Match) -> str:
+        name = m.group(1).replace("''", "'") if m.group(1) is not None else m.group(2)
+        if name.lower() in lower_gone:
+            raise _GoneSheet(name)
+        new = lower_renames.get(name.lower())
+        return m.group(0) if new is None else "'" + new.replace("'", "''") + "'!"
+
+    out, pos = [], 0
+    try:
+        for lit in _F_STRING.finditer(text):
+            out.append(_F_SHEET.sub(one, text[pos:lit.start()]))
+            out.append(lit.group(0))
+            pos = lit.end()
+        out.append(_F_SHEET.sub(one, text[pos:]))
+    except _GoneSheet:
+        return None
+    new_text = "".join(out)
+    if new_text == text:
+        return text
+    if isinstance(text, ArrayFormula):     # 배열 수식은 배열 수식으로 남긴다
+        arr = ArrayFormula(new_text)
+        arr.span = text.span
+        return arr
+    return new_text
+
+
 def surviving_formulas(before: dict[str, pd.DataFrame],
                        after: dict[str, pd.DataFrame],
-                       formulas: dict) -> tuple[dict, dict[str, int]]:
+                       formulas: dict,
+                       origins: dict | None = None) -> tuple[dict, dict[str, int]]:
     """아직 믿을 수 있는 수식만 남긴다. (남은 것, {시트: 버린 개수})
 
     수식은 제가 앉은 자리를 기준으로 옆 칸을 가리킨다 -- 5번 줄의
@@ -1606,39 +1675,66 @@ def surviving_formulas(before: dict[str, pd.DataFrame],
     틀린 수식을 남겨 두는 것보다 버리는 쪽이 낫다: 남기면 조용히 엉뚱한
     값을 끌어오지만, 버리면 마지막으로 계산된 값이 그대로 보이고 저장
     전에 몇 개를 버리는지 알려 줄 수 있다.
+
+    origins(to_frames 가 채운 것)를 주면 시트 이름을 바꾸거나 복사한 것도
+    따라간다: 이름을 바꾼 시트는 제 수식을 그대로 갖고, 다른 시트의 수식이
+    옛 이름을 가리키면 새 이름으로 고친다. 복사본은 원본의 수식을 갖는다.
+    지운 시트를 가리키는 수식은 버린다 (엑셀이면 #REF!).
     """
+    src_of, primary = _lineage(list(after), origins)
+    renames = {src: n for src, n in primary.items() if src != n}
+    gone = {n for n in [*before, *formulas] if n not in primary}
     kept: dict[str, dict] = {}
     lost: dict[str, int] = {}
-    for name, want in formulas.items():
-        old, new = before.get(name), after.get(name)
-        if old is None or new is None:
+    used = set()
+    for name, new in after.items():
+        src = src_of[name]
+        want = formulas.get(src) if src is not None else None
+        if not want:
+            continue
+        used.add(src)
+        old = before.get(src)
+        if old is None:
             lost[name] = len(want)
             continue
-        if old is new:
-            kept[name] = dict(want)  # 손대지 않은 시트: 수식도 전부 제자리다
-            continue
-        cols = list(dict.fromkeys([*map(str, old.columns), *map(str, new.columns)]))
-        old_rows = _text_rows(old, cols)
-        new_rows = _text_rows(new, cols)
-        same = (range(len(old_rows)) if old_rows == new_rows
-                else _rows_in_place(old_rows, new_rows))
-        at = {c: i for i, c in enumerate(cols)}
-        new_cols = set(map(str, new.columns))
-        live = {}
-        for (row, col), text in want.items():
-            if row not in same or col not in new_cols:
-                continue
-            # 그 칸을 사람이 직접 고쳤으면 사람이 적은 값이 이긴다
-            i = at[col]
-            if (row < len(old_rows) and row < len(new_rows)
-                    and old_rows[row][i] != new_rows[row][i]):
-                continue
-            live[(row, col)] = text
-        if live:
-            kept[name] = live
-        if len(live) < len(want):
-            lost[name] = len(want) - len(live)
+        live = _sheet_formulas(old, new, want)
+        fixed = {}
+        for at, text in live.items():
+            text = _retarget(text, renames, gone)
+            if text is not None:
+                fixed[at] = text
+        if fixed:
+            kept[name] = fixed
+        if len(fixed) < len(want):
+            lost[name] = len(want) - len(fixed)
+    for src, want in formulas.items():
+        if src not in used and want:
+            lost[src] = len(want)            # 시트를 지웠다
     return kept, lost
+
+
+def _sheet_formulas(old: pd.DataFrame, new: pd.DataFrame, want: dict) -> dict:
+    """한 시트의 수식 중 아직 제자리에 있는 것들."""
+    if old is new:
+        return dict(want)        # 손대지 않은 시트: 수식도 전부 제자리다
+    cols = list(dict.fromkeys([*map(str, old.columns), *map(str, new.columns)]))
+    old_rows = _text_rows(old, cols)
+    new_rows = _text_rows(new, cols)
+    same = (range(len(old_rows)) if old_rows == new_rows
+            else _rows_in_place(old_rows, new_rows))
+    at = {c: i for i, c in enumerate(cols)}
+    new_cols = set(map(str, new.columns))
+    live = {}
+    for (row, col), text in want.items():
+        if row not in same or col not in new_cols:
+            continue
+        # 그 칸을 사람이 직접 고쳤으면 사람이 적은 값이 이긴다
+        i = at[col]
+        if (row < len(old_rows) and row < len(new_rows)
+                and old_rows[row][i] != new_rows[row][i]):
+            continue
+        live[(row, col)] = text
+    return live
 
 
 def _rows_in_place(old: list, new: list) -> set[int]:
@@ -1659,15 +1755,30 @@ def _rows_in_place(old: list, new: list) -> set[int]:
 
 @_no_gc
 def workbook_changes(before: dict[str, pd.DataFrame],
-                     after: dict[str, pd.DataFrame]) -> dict:
-    """{시트이름: {"rows": [...], "total": n, "note": "..."}}. 안 바뀐 시트는 뺀다."""
+                     after: dict[str, pd.DataFrame],
+                     origins: dict | None = None) -> dict:
+    """{시트이름: {"rows": [...], "total": n, "note": "..."}}. 안 바뀐 시트는 뺀다.
+
+    origins(to_frames 가 채운 것)를 주면 이름을 바꾼 시트는 '이름 변경', 복사한
+    시트는 '복사' 로 원래 시트와 견준다 -- 안 주면 이름만 보고 견주어서, 이름을
+    바꾼 시트가 '새 시트' 와 '시트 삭제' 둘로 보인다. 시트 순서가 바뀌었으면
+    '시트 순서' 한 줄을 더한다 (순서만 바꿔도 저장할 것이 있다).
+    """
+    src_of, primary = _lineage(list(after), origins)
     out: dict[str, dict] = {}
     for name, df in after.items():
-        old = before.get(name)
-        if old is df:
-            continue                 # 격자가 손대지 않은 시트는 같은 표 그대로 온다
-        rows, total = row_changes(old, df)
+        src = src_of[name]
+        old = before.get(src) if src is not None else None
         notes = []
+        if old is not None and src != name:
+            notes.append(f"이름 변경: {src} → {name}" if primary.get(src) == name
+                         else f"'{src}' 복사")
+        if old is df:
+            # 격자가 손대지 않은 시트는 같은 표 그대로 온다
+            if notes:
+                out[name] = {"rows": [], "total": 0, "note": " · ".join(notes)}
+            continue
+        rows, total = row_changes(old, df)
         if old is None:
             notes.append("새 시트")
         else:
@@ -1680,9 +1791,18 @@ def workbook_changes(before: dict[str, pd.DataFrame],
         if total or notes:
             out[name] = {"rows": rows, "total": total, "note": " · ".join(notes)}
     for name in before:
-        if name not in after:
+        if name not in primary:
             out[name] = {"rows": [], "total": 0, "note": "시트 삭제"}
+    # 남은 원래 시트들의 차례가 바뀌었나 (새로 생긴 것·복사본은 빼고 본다)
+    was = [n for n in before if n in primary]
+    now = [src_of[n] for n in after if src_of[n] in before and primary.get(src_of[n]) == n]
+    if was != now:
+        out[SHEET_ORDER] = {"rows": [], "total": 0, "note": " → ".join(after)}
     return out
+
+
+# 변경 내역에서 시트 순서가 바뀐 것을 적는 줄의 이름
+SHEET_ORDER = "시트 순서"
 
 
 # 엑셀 칸 하나에 들어가는 글자 수 한계. 넘기면 엑셀이 파일을 못 연다.
@@ -1845,12 +1965,17 @@ def _grid_payload(sheets: dict[str, pd.DataFrame], version: str,
 
 @_no_gc
 def to_frames(payload: dict,
-              kept: dict[str, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
+              kept: dict[str, pd.DataFrame] | None = None,
+              origins: dict | None = None) -> dict[str, pd.DataFrame]:
     """격자가 올려준 것을 {시트이름: DataFrame} 으로.
 
     격자는 손대지 않은 시트는 내용 없이 {"name", "keep": 원래이름} 만 올린다.
     그 시트는 kept(격자에 내려보냈던 표)에서 그대로 꺼낸다 -- 같은 객체를
     그대로 쓰므로, 뒤에서 '무엇이 바뀌었나' 를 셀 때 한눈에 안 바뀐 줄 안다.
+
+    origins 를 주면 {지금 이름: 원래 시트 이름 또는 None(새 시트)} 을 채운다.
+    이름을 바꾸거나 복사한 시트를 원래 시트와 이어 주는 데 쓴다 (수식, 변경
+    내역).
     """
     kept = kept or {}
     out: dict[str, pd.DataFrame] = {}
@@ -1865,7 +1990,11 @@ def to_frames(payload: dict,
                 # 빈 시트로 채워 저장하면 그 시트가 통째로 지워지므로 멈춘다.
                 raise ValueError(f"'{orig}' 시트의 내용을 찾지 못했습니다.")
             out[name] = kept[orig]
+            if origins is not None:
+                origins[name] = orig
         else:
+            if origins is not None:
+                origins[name] = None if sheet.get("orig") is None else str(sheet["orig"])
             base = kept.get(str(sheet.get("orig") or name))
             if "diff" in sheet:
                 if base is None:
@@ -2520,7 +2649,8 @@ def _take_full(got: dict, book: str, version: str) -> None:
         # 그 '받은 표' 가 지금 파이썬이 들고 있는 표와 같은 판이어야 맞다.
         if got.get("have") != version:
             raise ValueError("화면의 표가 지금 판이 아닙니다.")
-        edited = pin_rev_info(to_frames(got, st.session_state.get(S_SHOWN)),
+        origins: dict = {}
+        edited = pin_rev_info(to_frames(got, st.session_state.get(S_SHOWN), origins),
                               st.session_state[S_SHEETS])
     except ValueError as err:
         st.session_state.pop(S_PENDING, None)
@@ -2531,12 +2661,12 @@ def _take_full(got: dict, book: str, version: str) -> None:
         # 여기서 한 번만 센다. 창이 떠 있는 동안 streamlit 이 스크립트를
         # 다시 돌 때마다 또 세면, 15,000행에서는 그때마다 0.4초씩 얼어붙는다.
         st.session_state[S_REVIEW] = workbook_changes(
-            st.session_state[S_SHEETS], edited)
+            st.session_state[S_SHEETS], edited, origins)
         # 수식의 자리는 '화면에 띄운 판' 기준이다 (엑셀을 올렸으면 그 판).
         # 무엇이 바뀌었나는 'S3 에 있는 판' 기준이고, 둘은 다를 수 있다.
         st.session_state[S_KEPT] = surviving_formulas(
             st.session_state[S_SHOWN], edited,
-            st.session_state.get(S_FORMULAS, {}))
+            st.session_state.get(S_FORMULAS, {}), origins)
     st.rerun()
 
 
@@ -2671,6 +2801,9 @@ def _review_body(book: str, user_id: str) -> None:
         return
 
     for name, info in changes.items():
+        if name == SHEET_ORDER and not info["rows"]:
+            st.markdown(f"**{SHEET_ORDER}** — {info['note']}")
+            continue
         head = f"**sheet : {name}** — {info['total']}줄"
         if info["note"]:
             head += f" · {info['note']}"
@@ -2690,7 +2823,8 @@ def _review_body(book: str, user_id: str) -> None:
         st.warning(
             "**수식이 사라집니다** — "
             + ", ".join(f"{n} {c}개" for n, c in lost.items())
-            + "\n\n수식은 제가 앉은 자리를 기준으로 옆 칸을 가리킵니다"
+            + "\n\n지운 시트를 가리키던 수식이거나, 자리가 밀린 수식입니다."
+              " 수식은 제가 앉은 자리를 기준으로 옆 칸을 가리킵니다"
               " (5번 줄의 `=VLOOKUP(B5,...)`). 줄을 넣거나 빼서 자리가"
               " 밀리면 그 수식은 더 이상 맞지 않는데, 엑셀처럼 자리를 따라"
               " 고쳐 주지는 못합니다. 그래서 틀린 수식을 남기는 대신"

@@ -2018,3 +2018,184 @@ def test_leaving_through_the_portal_menu_takes_one_confirm(backup_server, page, 
         settle(hong)
     finally:
         hong.close()
+
+
+# --------------------------------------- 시트 탭: 끌어서 순서, 오른쪽 클릭 차림표
+#
+# 엑셀처럼 탭을 끌어서 순서를 바꾸고, 오른쪽 클릭으로 새 시트 삽입 · 복사본
+# 만들기 · 이름 바꾸기 · 삭제 · 왼쪽/오른쪽으로 이동. 검사용 파일 ZZ_TAB_TEST 는
+# A, B, C, REV_INFO 네 장이다 (다른 검사가 쓰는 파일과 따로).
+
+TAB_BOOK = "ZZ_TAB_TEST"
+
+
+def _open_tab_book(page):
+    _forget_edits(page)
+    page.goto(page.url.split("?")[0])
+    page.wait_for_timeout(4000)
+    page.get_by_role("combobox").click()
+    page.wait_for_timeout(600)
+    page.get_by_text(TAB_BOOK, exact=True).click()
+    settle(page)
+
+
+def _tab_names(page):
+    return grid(page).locator(".sheetbar .tab").all_inner_texts()
+
+
+def _tab(page, name):
+    import re
+    return grid(page).locator(".sheetbar .tab").filter(
+        has_text=re.compile("^" + re.escape(name) + "$"))
+
+
+def _active_tab(page):
+    return grid(page).locator(".sheetbar .tab.on").inner_text()
+
+
+def _tab_menu(page, name, item, answer=None):
+    """탭을 오른쪽 클릭해 차림표의 그 항목을 누른다. 창(prompt/confirm)이 뜨면 answer 로."""
+    _tab(page, name).click(button="right")
+    page.wait_for_timeout(300)
+    if answer is not None:
+        page.once("dialog", lambda d: d.accept(answer) if d.type == "prompt" else d.accept())
+    grid(page).locator("#tabmenu .item", has_text=item).click()
+    page.wait_for_timeout(600)
+
+
+def _drag_tab(page, name, onto, side):
+    """name 탭을 onto 탭의 왼쪽(side='left')이나 오른쪽 끝으로 끌어다 놓는다."""
+    a = _tab(page, name).bounding_box()
+    b = _tab(page, onto).bounding_box()
+    page.mouse.move(a["x"] + a["width"] / 2, a["y"] + a["height"] / 2)
+    page.mouse.down()
+    x = b["x"] + 3 if side == "left" else b["x"] + b["width"] - 3
+    page.mouse.move(x, b["y"] + b["height"] / 2, steps=8)
+    page.mouse.up()
+    page.wait_for_timeout(600)
+
+
+def test_dragging_a_tab_moves_the_sheet(page):
+    _open_tab_book(page)
+    assert _tab_names(page) == ["A", "B", "C", "REV_INFO"]
+    _drag_tab(page, "A", "C", "right")
+    assert _tab_names(page) == ["B", "C", "A", "REV_INFO"]
+    assert _active_tab(page) == "A", "옮긴 시트를 골라야 합니다 (엑셀처럼)"
+    assert table(page)["rows"][0][0] == "a1"
+    wait_dirty(page)
+    _drag_tab(page, "A", "B", "left")
+    assert _tab_names(page) == ["A", "B", "C", "REV_INFO"]
+
+
+def test_a_plain_click_on_a_tab_does_not_move_it(page):
+    _open_tab_book(page)
+    _tab(page, "B").click()
+    page.wait_for_timeout(500)
+    assert _tab_names(page) == ["A", "B", "C", "REV_INFO"]
+    assert _active_tab(page) == "B"
+    assert "고친 것 없음" in page.inner_text("body")
+
+
+def test_a_new_sheet_order_is_saved_and_shown_in_the_review(page):
+    _open_tab_book(page)
+    _drag_tab(page, "C", "A", "left")
+    wait_dirty(page)
+    open_review(page, table=False)
+    body = review_text(page)
+    assert "시트 순서" in body and "C → A → B → REV_INFO" in body, body[:400]
+    page.get_by_label("Remark — 사유").fill("순서")
+    page.get_by_role("button", name="저장", exact=True).last.click()
+    wait_saved(page)
+    _open_tab_book(page)
+    assert _tab_names(page) == ["C", "A", "B", "REV_INFO"]
+    # 뒷정리: 원래 순서로
+    _drag_tab(page, "C", "B", "right")
+    confirm_save(page, "되돌림")
+    _open_tab_book(page)
+    assert _tab_names(page) == ["A", "B", "C", "REV_INFO"]
+
+
+def test_the_tab_menu_copies_a_sheet_next_to_it(page):
+    _open_tab_book(page)
+    _tab_menu(page, "A", "복사본 만들기")
+    assert _tab_names(page) == ["A", "A (2)", "B", "C", "REV_INFO"]
+    assert _active_tab(page) == "A (2)"
+    assert table(page)["rows"] == [["a1", "1"], ["a2", "2"]]
+    # 복사본을 고쳐도 원본은 그대로다
+    _edit(page, 0, 1, "복사본만")
+    wait_dirty(page)
+    _tab(page, "A").click()
+    page.wait_for_timeout(500)
+    assert table(page)["rows"][0][1] == "1"
+    open_review(page, table=False)
+    assert "'A' 복사" in review_text(page)
+    page.get_by_role("button", name="취소").click()
+
+
+def test_the_tab_menu_renames_and_refuses_names_excel_would_refuse(page):
+    _open_tab_book(page)
+    said = []
+    answers = iter(["B", "a/b", "새이름"])        # 겹침, 못 쓰는 글자, 그다음 맞는 이름
+
+    def on_dialog(d):
+        said.append(d.message)
+        d.accept(next(answers)) if d.type == "prompt" else d.accept()
+    page.on("dialog", on_dialog)
+    try:
+        _tab(page, "A").click(button="right")
+        page.wait_for_timeout(300)
+        grid(page).locator("#tabmenu .item", has_text="이름 바꾸기").click()
+        for _ in range(50):
+            if "새이름" in _tab_names(page):
+                break
+            page.wait_for_timeout(100)
+    finally:
+        page.remove_listener("dialog", on_dialog)
+    assert _tab_names(page) == ["새이름", "B", "C", "REV_INFO"]
+    assert any("이미 있는 시트 이름" in m for m in said), said
+    assert any("쓸 수 없습니다" in m for m in said), said
+    wait_dirty(page)
+    open_review(page, table=False)
+    assert "이름 변경: A → 새이름" in review_text(page)
+    page.get_by_role("button", name="취소").click()
+
+
+def test_the_tab_menu_deletes_a_sheet_after_asking(page):
+    _open_tab_book(page)
+    page.once("dialog", lambda d: d.dismiss())    # 아니오
+    _tab(page, "B").click(button="right")
+    page.wait_for_timeout(300)
+    grid(page).locator("#tabmenu .item", has_text="삭제").click()
+    page.wait_for_timeout(500)
+    assert "B" in _tab_names(page)
+    _tab_menu(page, "B", "삭제", answer=True)
+    assert _tab_names(page) == ["A", "C", "REV_INFO"]
+    page.keyboard.press("Control+z")              # 저장 전에는 살릴 수 있다
+    page.wait_for_timeout(500)
+    assert _tab_names(page) == ["A", "B", "C", "REV_INFO"]
+
+
+def test_the_tab_menu_inserts_and_moves_left_and_right(page):
+    _open_tab_book(page)
+    _tab_menu(page, "B", "새 시트 삽입")
+    names = _tab_names(page)
+    assert names[0] == "A" and names[2] == "B" and len(names) == 5
+    new = names[1]
+    assert _active_tab(page) == new
+    _tab_menu(page, new, "오른쪽으로 이동")
+    assert _tab_names(page)[:3] == ["A", "B", new]
+    _tab_menu(page, new, "왼쪽으로 이동")
+    assert _tab_names(page)[:3] == ["A", new, "B"]
+
+
+def test_rev_info_can_only_be_moved(page):
+    _open_tab_book(page)
+    _tab(page, "REV_INFO").click(button="right")
+    page.wait_for_timeout(300)
+    items = grid(page).locator("#tabmenu .item")
+    off = {items.nth(i).inner_text().split("\n")[0]: "off" in (items.nth(i).get_attribute("class") or "")
+           for i in range(items.count())}
+    assert off["복사본 만들기"] and off["이름 바꾸기"] and off["삭제"], off
+    assert not off["왼쪽으로 이동"] and not off["새 시트 삽입"], off
+    assert off["오른쪽으로 이동"], "맨 오른쪽이라 더 못 갑니다"
+    page.keyboard.press("Escape")

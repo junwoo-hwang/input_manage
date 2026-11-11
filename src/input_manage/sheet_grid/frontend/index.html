@@ -139,6 +139,11 @@
                    border-radius: 0 0 4px 4px; background: var(--head);
                    color: #5f6368; white-space: nowrap; user-select: none; }
   .sheetbar .tab:hover { background: #eef3f0; }
+  /* 끌어서 옮길 때 놓일 자리 (그 탭의 왼쪽/오른쪽 끝에 초록 선) */
+  .sheetbar .tab.drop-before { box-shadow: inset 3px 0 0 var(--accent); }
+  .sheetbar .tab.drop-after { box-shadow: inset -3px 0 0 var(--accent); }
+  .sheetbar .tab.lifted { opacity: .55; }
+  body.tab-dragging, body.tab-dragging .sheetbar .tab { cursor: grabbing; }
   .sheetbar .tab.on { background: #fff; color: var(--accent); font-weight: 600;
                       border-top: 2px solid var(--accent); padding-top: 3px; }
   .sheetbar .add { flex: 0 0 auto; padding: 4px 10px; cursor: pointer;
@@ -270,6 +275,18 @@
   <div class="item edit" data-act="col-del">열 삭제</div>
   <div class="line"></div>
   <div class="item edit" data-act="clear">내용 지우기<span class="key">Delete</span></div>
+</div>
+
+<!-- 아래 시트 탭의 오른쪽 클릭 차림표 (엑셀과 같은 자리, 같은 일). 탭은
+     누른 채 옆으로 끌어서 순서를 바꿀 수도 있다. -->
+<div class="menu" id="tabmenu">
+  <div class="item" data-tab="insert">새 시트 삽입</div>
+  <div class="item" data-tab="copy">복사본 만들기</div>
+  <div class="item" data-tab="rename">이름 바꾸기<span class="key">두 번 클릭</span></div>
+  <div class="item" data-tab="delete">삭제</div>
+  <div class="line"></div>
+  <div class="item" data-tab="left">왼쪽으로 이동</div>
+  <div class="item" data-tab="right">오른쪽으로 이동</div>
 </div>
 
 <script>
@@ -682,7 +699,7 @@ function renderSheetBar() {
   sheets.forEach((s, i) => {
     parts.push(`<div class="tab${i === active ? " on" : ""}" data-i="${i}"`
                + ` title="${esc(s.name)} · ${rowCount(s)}행 x ${s.cols.length}열`
-               + ` (두 번 누르면 이름 바꾸기)">${esc(s.name)}</div>`);
+               + ` (끌어서 순서 바꾸기 · 오른쪽 클릭: 이름 바꾸기·복사·삭제)">${esc(s.name)}</div>`);
   });
   parts.push('<button type="button" class="add" id="addSheet" title="시트 추가">+</button>');
   parts.push(`<span class="count">${rows().length}행 x ${cols().length}열`
@@ -1034,49 +1051,246 @@ function renameCol(c) {
 // ===================================================================
 // 아래 시트 탭
 // ===================================================================
-sheetbar.addEventListener("click", (e) => {
-  if (e.target.closest("#addSheet")) {
-    pushUndo();
-    sheets.push({ name: nextSheetName(), cols: ["새칸"], rows: [[""]] });
-    active = sheets.length - 1;
-    anchor = focus = { r: 0, c: 0 };
-    renderAll();
-    publish();
-    return;
-  }
-  const tab = e.target.closest(".tab");
-  if (!tab) return;
-  const i = Number(tab.dataset.i);
-  if (i === active) return;
+// 시트를 고친다(추가·삭제·이름·복사·순서)는 것은 그 파일을 고친다는 것이다.
+// 다른 사람이 고치는 중인 파일이면 막는다.
+function refuseSheetEdit() {
+  if (!bookLock) return false;
+  window.alert(bookLock);
+  return true;
+}
+
+function selectSheet(i) {
+  if (i === active || !sheets[i]) return;
   endEdit(true);
   active = i;
   anchor = { r: 0, c: 0 };
   focus = { r: 0, c: 0 };
   renderAll();
   armGhost();
-});
+}
 
-sheetbar.addEventListener("dblclick", (e) => {
-  const tab = e.target.closest(".tab");
-  if (!tab) return;
-  const i = Number(tab.dataset.i);
-  if (bookLock) { window.alert(bookLock); return; }
+// 엑셀이 받아 주는 시트 이름인가. 안 맞는 이름은 저장할 때 몰래 고쳐 적게
+// 되는데(파이썬 _sheet_name), 그러면 화면의 이름과 파일의 이름이 다르고 그
+// 시트를 가리키는 수식도 어긋난다. 그래서 정할 때 엑셀처럼 막는다.
+function sheetNameProblem(name, except) {
+  if (!name) return "시트 이름을 비워 둘 수 없습니다.";
+  if (name.length > 31) return "시트 이름은 31자까지입니다.";
+  if (/[:\\/?*\[\]]/.test(name)) return "시트 이름에는 : \\ / ? * [ ] 를 쓸 수 없습니다.";
+  if (name.startsWith("'") || name.endsWith("'")) return "시트 이름은 ' 로 시작하거나 끝날 수 없습니다.";
+  const low = name.toLowerCase();
+  if (sheets.some((s, j) => j !== except && s.name.toLowerCase() === low)) {
+    return `'${name}' 은(는) 이미 있는 시트 이름입니다.`;   // 엑셀은 대소문자를 안 가린다
+  }
+  return "";
+}
+
+function insertSheet(at) {
+  if (refuseSheetEdit()) return;
+  endEdit(true);
+  pushUndo();
+  sheets.splice(at, 0, { name: nextSheetName(), cols: ["새칸"], rows: [[""]] });
+  active = at;
+  anchor = focus = { r: 0, c: 0 };
+  renderAll();
+  publish();
+}
+
+function renameSheet(i) {
+  if (refuseSheetEdit()) return;
   if (sheets[i].locked) {
     window.alert(`'${sheets[i].name}' 은(는) 저장할 때 자동으로 적히는 시트라 이름을 바꿀 수 없습니다.`);
     return;
   }
-  const name = window.prompt("시트 이름", sheets[i].name);
-  if (name === null) return;
-  const trimmed = name.trim();
-  if (!trimmed || trimmed === sheets[i].name) return;
-  if (sheets.some((s, j) => j !== i && s.name === trimmed)) {
-    window.alert(`'${trimmed}' 은(는) 이미 있는 시트 이름입니다.`);
-    return;
+  let name = sheets[i].name;
+  for (;;) {
+    const got = window.prompt("시트 이름", name);
+    if (got === null) return;
+    name = got.trim();
+    if (name === sheets[i].name) return;
+    const problem = sheetNameProblem(name, i);
+    if (!problem) break;
+    window.alert(problem);
   }
   pushUndo();
-  sheets[i].name = trimmed;
+  sheets[i].name = name;
   renderAll();
   publish();
+}
+
+function deleteSheet(i) {
+  if (refuseSheetEdit()) return;
+  const s = sheets[i];
+  if (s.locked) {
+    window.alert(`'${s.name}' 은(는) 저장할 때 자동으로 적히는 시트라 지울 수 없습니다.`);
+    return;
+  }
+  if (sheets.length <= 1) { window.alert("시트가 하나뿐이라 지울 수 없습니다."); return; }
+  if (!window.confirm(`'${s.name}' 시트를 삭제할까요?\n저장하기 전에는 되돌리기(Ctrl+Z)로 살릴 수 있습니다.`)) return;
+  endEdit(true);
+  pushUndo();
+  sheets.splice(i, 1);
+  active = Math.min(i, sheets.length - 1);
+  anchor = focus = { r: 0, c: 0 };
+  renderAll();
+  publish();
+}
+
+// 엑셀처럼 'STEP (2)'. 31자를 넘지 않게 앞 이름을 줄인다.
+function copyName(name) {
+  const used = new Set(sheets.map(s => s.name.toLowerCase()));
+  for (let n = 2; ; n++) {
+    const tail = ` (${n})`;
+    const cand = name.slice(0, 31 - tail.length) + tail;
+    if (!used.has(cand.toLowerCase())) return cand;
+  }
+}
+
+// 복사본은 원본의 줄들을 그대로 나눠 쓴다 (고칠 때 줄을 새로 만들어 갈아
+// 끼우므로 원본이 같이 바뀌지 않는다). 원래 시트(orig)도 같이 들고 가서,
+// 저장할 때 '받은 표의 몇 번째 줄' 로 짚어 보낼 수 있고 파이썬은 원본의
+// 수식을 복사본에도 걸어 준다.
+function copySheetAt(i) {
+  if (refuseSheetEdit()) return;
+  const src = sheets[i];
+  if (src.locked) {
+    window.alert(`'${src.name}' 은(는) 저장할 때 자동으로 적히는 시트라 복사하지 않습니다.`);
+    return;
+  }
+  endEdit(true);
+  const rs = loadRows(src);
+  const copy = { name: copyName(src.name), orig: src.orig, touched: true, locked: false,
+                 cols: src.cols.slice(), rows: rs.slice(), raw: null, n: rs.length,
+                 base: src.base };
+  pushUndo();
+  sheets.splice(i + 1, 0, copy);
+  active = i + 1;
+  anchor = focus = { r: 0, c: 0 };
+  renderAll();
+  publish();
+}
+
+// from 번째 시트를 to 자리(그 앞)에 놓는다. to 는 0..시트 수.
+function moveSheet(from, to) {
+  let t = to > from ? to - 1 : to;
+  t = Math.max(0, Math.min(t, sheets.length - 1));
+  if (t === from) { selectSheet(from); return; }
+  if (refuseSheetEdit()) return;
+  endEdit(true);
+  const was = sheets[active];
+  pushUndo();
+  const [moved] = sheets.splice(from, 1);
+  sheets.splice(t, 0, moved);
+  active = t;                            // 엑셀처럼 옮긴 시트를 고른다
+  if (moved !== was) anchor = focus = { r: 0, c: 0 };
+  renderAll();
+  publish();
+}
+
+let tabDrag = null;          // {from, x, moved, to}
+let skipTabClick = false;    // 끌기를 마친 뒤 따라오는 click 은 버린다
+
+sheetbar.addEventListener("click", (e) => {
+  if (skipTabClick) { skipTabClick = false; return; }
+  if (e.target.closest("#addSheet")) {
+    insertSheet(sheets.length);
+    return;
+  }
+  const tab = e.target.closest(".tab");
+  if (tab) selectSheet(Number(tab.dataset.i));
+});
+
+sheetbar.addEventListener("dblclick", (e) => {
+  const tab = e.target.closest(".tab");
+  if (tab) renameSheet(Number(tab.dataset.i));
+});
+
+sheetbar.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  tabDrag = { from: Number(tab.dataset.i), x: e.clientX, moved: false, to: null };
+});
+
+// 놓일 자리: 탭의 가운데보다 왼쪽이면 그 탭 앞, 오른쪽이면 그 뒤
+function tabDropAt(x) {
+  const tabs = sheetbar.querySelectorAll(".tab");
+  for (let i = 0; i < tabs.length; i++) {
+    const r = tabs[i].getBoundingClientRect();
+    if (x < r.left + r.width / 2) return i;
+  }
+  return tabs.length;
+}
+
+function paintTabDrop(d) {
+  sheetbar.querySelectorAll(".tab").forEach((t, i) => {
+    t.classList.toggle("lifted", !!d && i === d.from);
+    t.classList.toggle("drop-before", !!d && d.to === i);
+    t.classList.toggle("drop-after", !!d && d.to === sheets.length && i === sheets.length - 1);
+  });
+}
+
+document.addEventListener("mousemove", (e) => {
+  if (!tabDrag) return;
+  if (!tabDrag.moved && Math.abs(e.clientX - tabDrag.x) < 6) return;   // 그냥 누른 것
+  tabDrag.moved = true;
+  document.body.classList.add("tab-dragging");
+  tabDrag.to = tabDropAt(e.clientX);
+  paintTabDrop(tabDrag);
+});
+
+document.addEventListener("mouseup", () => {
+  if (!tabDrag) return;
+  const d = tabDrag;
+  tabDrag = null;
+  document.body.classList.remove("tab-dragging");
+  paintTabDrop(null);
+  if (!d.moved) return;
+  skipTabClick = true;
+  setTimeout(() => { skipTabClick = false; }, 0);
+  moveSheet(d.from, d.to);
+});
+
+const tabMenu = document.getElementById("tabmenu");
+let tabMenuFor = 0;
+
+sheetbar.addEventListener("contextmenu", (e) => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  e.preventDefault();
+  const i = Number(tab.dataset.i);
+  selectSheet(i);                        // 엑셀처럼 그 탭을 먼저 고른다
+  tabMenuFor = i;
+  const s = sheets[i];
+  const why = bookLock ? bookLock
+    : s.locked ? "저장할 때 자동으로 적히는 시트입니다" : "";
+  const off = {
+    insert: bookLock, copy: why, rename: why,
+    delete: why || (sheets.length <= 1 ? "시트가 하나뿐입니다" : ""),
+    left: bookLock || (i === 0 ? "맨 왼쪽입니다" : ""),
+    right: bookLock || (i === sheets.length - 1 ? "맨 오른쪽입니다" : ""),
+  };
+  tabMenu.querySelectorAll(".item").forEach(item => {
+    const reason = off[item.dataset.tab] || "";
+    item.classList.toggle("off", !!reason);
+    item.title = reason;
+  });
+  armGhost();
+  openMenu(e.clientX, e.clientY, tabMenu);
+});
+
+tabMenu.addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (!item || item.classList.contains("off")) return;
+  closeMenu();
+  const i = tabMenuFor;
+  ({
+    insert: () => insertSheet(i),
+    copy: () => copySheetAt(i),
+    rename: () => renameSheet(i),
+    delete: () => deleteSheet(i),
+    left: () => moveSheet(i, i - 1),
+    right: () => moveSheet(i, i + 2),
+  })[item.dataset.tab]();
 });
 
 // ===================================================================
@@ -1551,7 +1765,9 @@ function doAction(act) {
 // ===================================================================
 const menu = document.getElementById("menu");
 
-function openMenu(x, y) {
+function openMenu(x, y, which = menu) {
+  closeMenu();
+  const menu = which;
   menu.classList.add("on");
   // 차림표는 iframe 밖으로 못 나간다 (부모 페이지 위로 넘칠 수 없다).
   // 그래서 끝에 붙으면 반대쪽으로 펼치고, 그래도 프레임보다 길면 프레임을
@@ -1566,8 +1782,9 @@ function openMenu(x, y) {
 }
 
 function closeMenu() {
-  if (!menu.classList.contains("on")) return;
-  menu.classList.remove("on");
+  const open = document.querySelectorAll(".menu.on");
+  if (!open.length) return;
+  open.forEach(m => m.classList.remove("on"));
   syncHeight();                 // 늘려 둔 프레임을 되돌린다
 }
 
@@ -1599,7 +1816,7 @@ menu.addEventListener("click", (e) => {
 });
 
 document.addEventListener("mousedown", (e) => {
-  if (!menu.contains(e.target)) closeMenu();
+  if (!(e.target instanceof Element && e.target.closest(".menu"))) closeMenu();
 }, true);
 document.addEventListener("scroll", closeMenu, true);
 window.addEventListener("blur", closeMenu);

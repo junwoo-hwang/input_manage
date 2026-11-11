@@ -1092,3 +1092,123 @@ def test_coming_back_turns_a_kept_lock_into_a_normal_one():
     im.keep_lock_until("A", "hong", datetime.now(timezone.utc) + timedelta(seconds=30))
     im.hold_lock("A", "hong")                 # 돌아와서 다시 고친다
     assert "until" not in im.edit_lock("A")
+
+
+# ------------------------------------- 시트 이름 바꾸기 · 복사 · 삭제 · 순서
+#
+# 격자는 시트마다 원래 어느 시트였는지(orig)를 같이 올린다. 그걸 따라가서
+# 엑셀처럼: 이름을 바꾸면 그 시트를 가리키는 수식도 새 이름으로, 복사본은
+# 원본의 수식을 그대로, 지운 시트를 가리키는 수식은 값으로 굳힌다.
+
+def book_with_lookup():
+    """STEP 의 C 칸이 MAP 시트를 VLOOKUP 한다."""
+    step = pd.DataFrame([{"step": "0010", "ppid": "P-01", "찾은값": "가"},
+                         {"step": "0020", "ppid": "P-02", "찾은값": "나"}], dtype=object)
+    lookup = pd.DataFrame([{"ppid": "P-01", "이름": "가"},
+                           {"ppid": "P-02", "이름": "나"}], dtype=object)
+    sheets = {"STEP": step, "MAP": lookup}
+    formulas = {"STEP": {(0, "찾은값"): "VLOOKUP(B2,MAP!$A$1:$B$99,2,0)",
+                         (1, "찾은값"): "VLOOKUP(B3,MAP!$A$1:$B$99,2,0)"}}
+    return sheets, formulas
+
+
+def _from_grid(sheets, *items):
+    """격자가 올리는 꼴로 받아 (표들, 내력)."""
+    origins: dict = {}
+    got = {"sheets": list(items)}
+    return im.to_frames(got, sheets, origins), origins
+
+
+def test_renaming_a_looked_up_sheet_points_the_formulas_at_the_new_name():
+    sheets, formulas = book_with_lookup()
+    after, origins = _from_grid(sheets, {"name": "STEP", "keep": "STEP"},
+                                {"name": "코드 표", "keep": "MAP"})
+    kept, lost = im.surviving_formulas(sheets, after, formulas, origins)
+    assert not lost
+    assert kept["STEP"][(0, "찾은값")] == "VLOOKUP(B2,'코드 표'!$A$1:$B$99,2,0)"
+    # 저장한 파일을 엑셀이 열면 새 이름의 시트를 찾아야 한다
+    im.save_workbook("A", after, "hong", formulas=kept)
+    book = openpyxl.load_workbook(io.BytesIO(fake_s3.STORE["2GAPU/input/A.xlsx"]))
+    assert book.sheetnames == ["STEP", "코드 표"]
+    assert book["STEP"]["C2"].value == "=VLOOKUP(B2,'코드 표'!$A$1:$B$99,2,0)"
+
+
+def test_a_renamed_sheet_keeps_its_own_formulas():
+    sheets, formulas = book_with_lookup()
+    after, origins = _from_grid(sheets, {"name": "공정", "keep": "STEP"},
+                                {"name": "MAP", "keep": "MAP"})
+    kept, lost = im.surviving_formulas(sheets, after, formulas, origins)
+    assert set(kept) == {"공정"} and len(kept["공정"]) == 2 and not lost
+
+
+def test_a_copied_sheet_brings_its_formulas_along():
+    sheets, formulas = book_with_lookup()
+    after, origins = _from_grid(
+        sheets, {"name": "STEP", "keep": "STEP"},
+        {"name": "STEP (2)", "orig": "STEP", "cols": ["step", "ppid", "찾은값"],
+         "diff": [{"k": [0, 2]}]},
+        {"name": "MAP", "keep": "MAP"})
+    kept, lost = im.surviving_formulas(sheets, after, formulas, origins)
+    assert kept["STEP (2)"] == kept["STEP"] == formulas["STEP"]
+    assert not lost
+
+
+def test_formulas_pointing_at_a_deleted_sheet_turn_into_values():
+    """엑셀이면 #REF! 가 된다. 마지막 값으로 굳히고 몇 개인지 알린다."""
+    sheets, formulas = book_with_lookup()
+    after, origins = _from_grid(sheets, {"name": "STEP", "keep": "STEP"})
+    kept, lost = im.surviving_formulas(sheets, after, formulas, origins)
+    assert "STEP" not in kept and lost == {"STEP": 2}
+
+
+def test_a_sheet_reference_inside_a_text_is_left_alone():
+    got = im._retarget('IF(A1="MAP!x",MAP!B2,"")', {"MAP": "새"}, set())
+    assert got == 'IF(A1="MAP!x",\'새\'!B2,"")'
+
+
+def test_sheet_names_in_formulas_match_regardless_of_case():
+    """엑셀은 시트 이름의 대소문자를 가리지 않는다."""
+    assert im._retarget("map!A1+'Map'!B1", {"MAP": "X"}, set()) == "'X'!A1+'X'!B1"
+
+
+def test_an_array_formula_stays_an_array_formula_after_retargeting():
+    arr = im.ArrayFormula.of("SUM(MAP!A1:A3*2)", "C1:C3")
+    got = im._retarget(arr, {"MAP": "X"}, set())
+    assert isinstance(got, im.ArrayFormula) and got.span == (3, 1)
+
+
+def test_the_review_says_renamed_copied_deleted_and_reordered():
+    sheets, _formulas = book_with_lookup()
+    sheets["ETC"] = frame([["1", "x"]])
+    after, origins = _from_grid(
+        sheets,
+        {"name": "코드", "keep": "MAP"},
+        {"name": "STEP", "keep": "STEP"},
+        {"name": "STEP (2)", "orig": "STEP", "cols": ["step", "ppid", "찾은값"],
+         "diff": [{"k": [0, 2]}]})
+    got = im.workbook_changes(sheets, after, origins)
+    assert got["코드"]["note"] == "이름 변경: MAP → 코드" and got["코드"]["total"] == 0
+    assert got["STEP (2)"]["note"] == "'STEP' 복사"
+    assert got["ETC"]["note"] == "시트 삭제"
+    assert got[im.SHEET_ORDER]["note"] == "코드 → STEP → STEP (2)"
+    assert "STEP" not in got, "손대지 않은 원본은 바뀐 것이 없다"
+
+
+def test_only_a_new_order_still_counts_as_a_change():
+    """순서만 바꿔도 저장할 것이 있다 -- 안 그러면 '바뀐 것이 없습니다' 로 막힌다."""
+    sheets, _formulas = book_with_lookup()
+    after, origins = _from_grid(sheets, {"name": "MAP", "keep": "MAP"},
+                                {"name": "STEP", "keep": "STEP"})
+    got = im.workbook_changes(sheets, after, origins)
+    assert list(got) == [im.SHEET_ORDER]
+
+
+def test_a_new_sheet_taking_a_renamed_sheets_old_name_is_new():
+    sheets, _formulas = book_with_lookup()
+    after, origins = _from_grid(
+        sheets, {"name": "옛STEP", "keep": "STEP"},
+        {"name": "STEP", "cols": ["a"], "rows": [["1"]]},
+        {"name": "MAP", "keep": "MAP"})
+    got = im.workbook_changes(sheets, after, origins)
+    assert got["옛STEP"]["note"] == "이름 변경: STEP → 옛STEP"
+    assert got["STEP"]["note"].startswith("새 시트")
