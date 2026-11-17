@@ -1212,3 +1212,18 @@ def test_a_new_sheet_taking_a_renamed_sheets_old_name_is_new():
     got = im.workbook_changes(sheets, after, origins)
     assert got["옛STEP"]["note"] == "이름 변경: STEP → 옛STEP"
     assert got["STEP"]["note"].startswith("새 시트")
+
+
+def test_people_whose_ids_look_alike_do_not_share_a_temporary_save():
+    """파일 이름에 못 쓰는 글자를 빼면 'kim a' 와 'kima' 가 같아진다."""
+    im.write_backup("A", "kim a", "etag1", [{"name": "S", "keep": "S"}])
+    assert im.read_backup("A", "kima") is None, "남의 임시 저장을 내 것으로 띄웠습니다"
+    im.write_backup("A", "kima", "etag2", [])
+    assert im.read_backup("A", "kim a")["stamp"] == "etag1", "남의 임시 저장을 덮어썼습니다"
+
+
+def test_reloading_a_book_drops_a_restore_meant_for_the_old_one():
+    import streamlit as st
+    st.session_state[im.S_RESTORE] = {"token": "r-1", "version": "old", "sheets": []}
+    im._seed("A", b"", {"S": pd.DataFrame()}, {}, "etag1")
+    assert im.S_RESTORE not in st.session_state

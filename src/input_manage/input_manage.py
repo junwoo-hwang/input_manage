@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import functools
 import gc
+import hashlib
 import inspect
 import json
 import io
@@ -1075,7 +1076,10 @@ def release_lock(book: str, user: str) -> None:
 # 판이 바뀌었으면 그 위에 얹을 수 없다 (엉뚱한 줄에 얹힌다).
 # ----------------------------------------------------------------------
 def _backup_key(book: str, user: str) -> str:
-    return _key(INPUT_S3_BACKUP_DIR, book, f"{_safe(user)}.json")
+    # _safe 는 못 쓰는 글자를 빼므로 'kim a' 와 'kima' 가 같은 이름이 된다.
+    # 원래 아이디로 만든 짧은 꼬리를 붙여 남의 임시 저장과 섞이지 않게.
+    tail = hashlib.sha1(str(user).encode("utf-8")).hexdigest()[:8]
+    return _key(INPUT_S3_BACKUP_DIR, book, f"{_safe(user)}_{tail}.json")
 
 
 def write_backup(book: str, user: str, stamp: str, sheets: list,
@@ -1096,7 +1100,7 @@ def read_backup(book: str, user: str) -> dict | None:
         return None
     try:
         body = json.loads(got[0].decode("utf-8"))
-        if not isinstance(body.get("sheets"), list):
+        if not isinstance(body.get("sheets"), list) or body.get("user") != user:
             raise ValueError
         if body.get("until") and datetime.now(timezone.utc) >= datetime.fromisoformat(body["until"]):
             s3.delete_object(key)          # 5분이 지났다
@@ -2228,8 +2232,10 @@ def _seed(book: str, raw: bytes, sheets: dict[str, pd.DataFrame],
     st.session_state[S_STAMP] = stamp
     st.session_state[S_NONCE] = st.session_state.get(S_NONCE, 0) + 1
     # 다른 파일의 값과 진행 중이던 저장·업로드는 들고 가지 않는다
+    # 되살려 달라고 해 둔 것도 버린다 -- 지난 판에 얹을 것이라 새 판의 격자는
+    # 안 받고, 그러면 '되살리는 중입니다...' 가 끝없이 떠 있다.
     for key in (S_EDITED, S_REVIEW, S_KEPT, S_WANT, S_PENDING,
-                S_UPLOAD, S_UPLOADED, S_SAVING, S_SAVE_ERR):
+                S_UPLOAD, S_UPLOADED, S_SAVING, S_SAVE_ERR, S_RESTORE):
         st.session_state.pop(key, None)
 
 

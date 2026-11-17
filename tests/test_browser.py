@@ -241,6 +241,23 @@ def test_dragging_selects_a_rectangle(page):
     assert "선택 1x3" in grid(page).locator(".sheetbar .count").inner_text()
 
 
+def test_shift_arrows_extend_the_selection_right_after_enter(page):
+    """값을 치고 Enter 로 내려온 바로 그 자리에서 Shift+↓ 로 범위를 넓힌다 (엑셀처럼).
+    고른 자리의 두 끝이 같은 것을 가리키면, 한쪽만 옮기려 해도 둘 다 옮겨져
+    범위가 안 넓어지고 칸만 내려간다."""
+    reset(page)
+    click_cell(page, 0, 0)
+    page.keyboard.type("가")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(200)
+    page.keyboard.press("Shift+ArrowUp")          # 방금 친 칸까지 두 칸
+    page.wait_for_timeout(300)
+    assert grid(page).locator(".cell.sel").count() == 2
+    assert "선택 2x1" in grid(page).locator(".sheetbar .count").inner_text()
+    page.keyboard.press("Control+z")
+    _forget_edits(page)
+
+
 def test_clicking_a_column_header_selects_the_whole_column(page):
     reset(page)
     grid(page).locator(".colhead[data-c='1']").click()
@@ -1992,6 +2009,54 @@ def test_after_the_wait_the_edits_are_gone_and_others_can_edit(backup_server, pa
         hong.close()
 
 
+def test_saying_yes_to_a_menu_click_that_stays_here_keeps_the_page_working(backup_server, page):
+    """지금 화면의 메뉴를 또 눌러 '확인' 했다 -- 다른 화면으로 안 간다. 떠난 것으로
+    쳐서 고치던 것은 임시 저장되고 화면은 새로 읽히며 '복구하시겠습니까?' 를
+    묻는다. 그 뒤로도 떠날 때 묻고, 임시 저장도 계속 돼야 한다."""
+    hong = _open_as(page, backup_server, "hong", menu="1")
+    try:
+        settle(hong)
+        _edit(hong, 0, 3, "제자리")
+        wait_dirty(hong)
+        hong.once("dialog", lambda d: d.accept())
+        hong.locator("[data-testid='stSidebar']").get_by_text("기준 정보 관리", exact=True).click()
+        _answer(hong, "복구")
+        wait_dirty(hong)
+        hong.wait_for_timeout(800)
+        assert table(hong)["rows"][0][3] == "제자리"
+
+        asked = []
+        hong.once("dialog", lambda d: (asked.append(d.message), d.dismiss()))
+        hong.get_by_text("Home", exact=True).click()
+        hong.wait_for_timeout(1500)
+        assert asked == [LEAVE_MSG], "한 번 '확인' 한 뒤로는 떠날 때 안 묻습니다"
+        assert "홈 화면" not in hong.inner_text("body")
+        hong.get_by_role("button", name="초기화").click()   # 뒷정리
+        settle(hong)
+    finally:
+        _forget_edits(hong)
+        hong.close()
+
+
+def test_folding_the_sidebar_is_not_leaving(page):
+    """사이드바 접기 단추는 다른 화면으로 가는 것이 아니다."""
+    _open_with_menu(page)
+    _edit(page, 0, 2, "접기")
+    wait_dirty(page)
+    asked = []
+    handler = lambda d: (asked.append(d.message), d.dismiss())
+    page.on("dialog", handler)
+    try:
+        page.locator("[data-testid='stSidebar']").hover()
+        page.locator("[data-testid='stSidebarCollapseButton'] button").click()
+        page.wait_for_timeout(1000)
+        assert asked == []
+        assert table(page)["rows"][0][2] == "접기"
+    finally:
+        page.remove_listener("dialog", handler)
+        _forget_edits(page)
+
+
 @pytest.mark.parametrize("menu", ["sac", "option"])
 def test_leaving_through_the_portal_menu_takes_one_confirm(backup_server, page, menu):
     """포털이 쓰는 메뉴 컴포넌트 그대로. 확인 한 번에 넘어가야 한다."""
@@ -2158,6 +2223,50 @@ def test_the_tab_menu_renames_and_refuses_names_excel_would_refuse(page):
     open_review(page, table=False)
     assert "이름 변경: A → 새이름" in review_text(page)
     page.get_by_role("button", name="취소").click()
+
+
+def test_a_quote_in_a_column_or_sheet_name_does_not_break_the_page(page):
+    """엑셀은 시트·칸 이름에 " 를 허용한다. 격자는 이름을 title="..." 에 넣는데,
+    " 를 그대로 넣으면 거기서 속성이 끊겨 툴팁이 잘리고 뒷글자가 엉뚱한 속성이 된다."""
+    _open_tab_book(page)
+    col_name = '길이 "mm" onclick="x'
+    sheet_name = '큰"따옴표'
+    answers = iter([col_name, sheet_name])
+    handler = lambda d: d.accept(next(answers)) if d.type == "prompt" else d.accept()
+    page.on("dialog", handler)
+    try:
+        grid(page).locator(".colhead").first.dblclick()
+        page.wait_for_timeout(300)
+        _tab(page, "A").click(button="right")
+        page.wait_for_timeout(300)
+        grid(page).locator("#tabmenu .item", has_text="이름 바꾸기").click()
+        page.wait_for_timeout(500)
+    finally:
+        page.remove_listener("dialog", handler)
+    head = grid(page).locator(".colhead").first
+    assert head.get_attribute("title") == col_name
+    assert head.get_attribute("onclick") is None
+    assert head.inner_text() == col_name
+    tab = grid(page).locator(".sheetbar .tab").first
+    assert (tab.get_attribute("title") or "").startswith(sheet_name + " · ")
+    assert tab.inner_text() == sheet_name
+    page.keyboard.press("Control+z")
+    page.keyboard.press("Control+z")
+    _forget_edits(page)
+
+
+def test_a_new_sheet_name_does_not_clash_with_one_in_other_case(page):
+    """엑셀은 'sheet5' 와 'Sheet5' 를 같은 이름으로 본다."""
+    _open_tab_book(page)
+    page.once("dialog", lambda d: d.accept("sheet5"))
+    _tab(page, "A").dblclick()
+    page.wait_for_timeout(400)
+    grid(page).locator("#addSheet").click()
+    page.wait_for_timeout(400)
+    names = _tab_names(page)
+    assert names[0] == "sheet5"
+    assert len({n.lower() for n in names}) == len(names), names
+    _forget_edits(page)
 
 
 def test_the_tab_menu_deletes_a_sheet_after_asking(page):

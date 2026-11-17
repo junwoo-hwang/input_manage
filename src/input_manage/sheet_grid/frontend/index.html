@@ -497,10 +497,11 @@ function nextColName(base) {
 }
 
 function nextSheetName() {
-  const used = new Set(sheets.map(s => s.name));
+  // 엑셀은 시트 이름의 대소문자를 안 가린다 -- 'sheet4' 가 있으면 'Sheet4' 도 못 쓴다
+  const used = new Set(sheets.map(s => s.name.toLowerCase()));
   for (let i = sheets.length + 1; ; i++) {
     const name = `Sheet${i}`;
-    if (!used.has(name)) return name;
+    if (!used.has(name.toLowerCase())) return name;
   }
 }
 
@@ -732,7 +733,8 @@ function renderFormula() {
 // 한글 조합 중 Enter 는 칸에서와 같이 조합이 끝난 뒤에 처리한다 (아래 '자판').
 function formulaEnter() {
   commitFormula();
-  anchor = focus = { r: Math.min(anchor.r + 1, rows().length - 1), c: anchor.c };
+  anchor = { r: Math.min(anchor.r + 1, rows().length - 1), c: anchor.c };
+  focus = { ...anchor };
   // 아래 칸 값으로 먼저 바꿔 둔다. 입력줄은 초점이 있는 동안 새 칸 값으로
   // 안 바뀌는데(renderFormula), 그대로 초점을 빼면 blur 가 방금 친 글자를
   // 아래 칸에 한 번 더 써 넣는다.
@@ -780,8 +782,11 @@ function colWidth(c) {
   return Math.min(Math.max(w * 7.6 + 20, 68), 320);
 }
 
+// 따옴표도 바꾼다 -- 칸·시트 이름은 title="..." 안에도 들어가는데, 엑셀은
+// 이름에 " 를 허용한다. 그대로 넣으면 거기서 속성이 끊긴다.
 function esc(text) {
-  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // 칸을 찾을 때 선택자(.cell[data-r=..][data-c=..])로 찾으면 브라우저가 표의
@@ -1090,7 +1095,8 @@ function insertSheet(at) {
   pushUndo();
   sheets.splice(at, 0, { name: nextSheetName(), cols: ["새칸"], rows: [[""]] });
   active = at;
-  anchor = focus = { r: 0, c: 0 };
+  anchor = { r: 0, c: 0 };
+  focus = { r: 0, c: 0 };
   renderAll();
   publish();
 }
@@ -1130,7 +1136,8 @@ function deleteSheet(i) {
   pushUndo();
   sheets.splice(i, 1);
   active = Math.min(i, sheets.length - 1);
-  anchor = focus = { r: 0, c: 0 };
+  anchor = { r: 0, c: 0 };
+  focus = { r: 0, c: 0 };
   renderAll();
   publish();
 }
@@ -1164,7 +1171,8 @@ function copySheetAt(i) {
   pushUndo();
   sheets.splice(i + 1, 0, copy);
   active = i + 1;
-  anchor = focus = { r: 0, c: 0 };
+  anchor = { r: 0, c: 0 };
+  focus = { r: 0, c: 0 };
   renderAll();
   publish();
 }
@@ -1181,7 +1189,8 @@ function moveSheet(from, to) {
   const [moved] = sheets.splice(from, 1);
   sheets.splice(t, 0, moved);
   active = t;                            // 엑셀처럼 옮긴 시트를 고른다
-  if (moved !== was) anchor = focus = { r: 0, c: 0 };
+  if (moved !== was) anchor = { r: 0, c: 0 };
+  focus = { r: 0, c: 0 };
   renderAll();
   publish();
 }
@@ -1330,9 +1339,10 @@ function isEcho(e) {
 function editKey(key, shift) {
   const { r, c } = editingCell;
   endEdit(true);
-  anchor = focus = key === "Tab"
+  anchor = key === "Tab"
     ? { r, c: Math.min(c + 1, cols().length - 1) }
     : { r: Math.min(r + 1, rows().length - 1), c };
+  focus = { ...anchor };   // 같은 객체를 가리키면 Shift+화살표가 범위를 못 넓힌다
   repaintSelection();
 }
 
@@ -1664,7 +1674,8 @@ function gotoHit(i) {
   if (prev) { prev.classList.remove("hit-now"); prev.classList.add("hit"); }
   hitAt = (i + hits.length) % hits.length;
   const h = hits[hitAt];
-  anchor = focus = { r: h.r, c: h.c };
+  anchor = { r: h.r, c: h.c };
+  focus = { r: h.r, c: h.c };
   repaintSelection();
   const td = cellEl(h.r, h.c);
   if (td) {
@@ -1800,7 +1811,8 @@ scroll.addEventListener("contextmenu", (e) => {
   if (Number.isFinite(r) && Number.isFinite(c)) {
     const { r0, r1, c0, c1 } = selRange();
     if (r < r0 || r > r1 || c < c0 || c > c1) {
-      anchor = focus = { r, c };
+      anchor = { r, c };
+      focus = { r, c };
       repaintSelection();
     }
   }
@@ -1910,6 +1922,13 @@ window.addEventListener("message", (event) => {
   lastBackup = null;
   clearTimeout(backupTimer);
   backupTimer = null;
+  // 새 판을 받았으면 이 화면에 그대로 있는 것이다. '떠나는 중' 이었으면(확인을
+  // 눌렀는데 메뉴가 다른 화면으로 안 데려갔다) 끝낸다 -- 안 그러면 그 뒤로는
+  // 떠날 때 묻지도, 임시 저장하지도 않는다.
+  leaving = false;
+  leaveTarget = null;
+  leaveToken = "";
+  unsavedFromPython = !!args.unsaved;
   // have: 이 판을 받았다. 파이썬은 이걸 보고 다음부터 표를 안 딸려 보낸다.
   setValue({ rev: ++rev, dirty: false, full: false, have: version });
   maybeRestore(args.restore);
@@ -2049,6 +2068,9 @@ const hooked = new Set();                // 귀를 단 문서들
 let leaving = false;
 let leaveTarget = null;
 let leaveToken = "";
+// 사이드바 안에 있어도 다른 화면으로 가는 것이 아닌 것들 (접기, 메뉴 더 보기)
+const NOT_LEAVING = '[data-testid="stSidebarCollapseButton"], '
+  + '[data-testid="stSidebarNavViewButton"], [data-testid="stSidebarResizeHandle"]';
 
 function onLeaveClick(e) {
   // 이 격자가 이미 치워졌으면(벗어나기로 했다) 아무것도 안 한다
@@ -2057,6 +2079,7 @@ function onLeaveClick(e) {
   // Element 로 만들어져서, 이 틀의 Element 로 견주면 늘 false 다.
   const t = e.target && e.target.nodeType === 1 ? e.target : null;
   if (!t || !t.closest("a, button, li, label, input, select, [role], .nav-link")) return;
+  if (t.closest(NOT_LEAVING)) return;
   const doc = t.ownerDocument;
   if (doc === window.parent.document && !t.closest('[data-testid="stSidebar"]')) return;
   e.preventDefault();
@@ -2077,8 +2100,19 @@ function onLeaveClick(e) {
 
 function goOn() {
   const t = leaveTarget;
+  if (!t) return;
   leaveTarget = null;
-  if (t && t.isConnected) t.click();
+  if (t.isConnected) t.click();
+  // 눌러 준 메뉴가 다른 화면으로 안 데려갔다 (지금 화면의 메뉴를 또 눌렀다 등).
+  // 파이썬은 이미 '떠났다' 로 쳐서 이 파일을 새로 읽을 참이니, 깨워서 새 판(과
+  // '복구하시겠습니까?')을 받는다. 새 판이 오면 '떠나는 중' 도 끝난다.
+  const token = leaveToken;
+  setTimeout(() => {
+    if (leaving && leaveToken === token && window.frameElement
+        && window.frameElement.isConnected) {
+      setValue({ rev: ++rev, dirty: false, full: false, have: version, beat: Date.now() });
+    }
+  }, 3000);
 }
 
 function onBeforeUnload(e) {
