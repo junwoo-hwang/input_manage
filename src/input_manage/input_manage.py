@@ -2379,7 +2379,19 @@ def _backup_offer(book: str, user: str) -> dict | None:
             found = None
         held = {"key": key, "backup": found}
         st.session_state[S_BACKUP_OFFER] = held
-    return held.get("backup")
+    # 떠나며 남긴 것(5분짜리)은 들고 있는 사이에도 때가 지날 수 있다. 떠나기를
+    # 확인한 뒤 화면이 넘어가기 전에 이 화면이 한 번 더 돌면 그때 읽은 것을
+    # 들고 있다가, 한참 뒤 돌아왔을 때 지난 것을 또 묻는다.
+    bk = held.get("backup")
+    if isinstance(bk, dict) and bk.get("until"):
+        try:
+            over = datetime.now(timezone.utc) >= datetime.fromisoformat(bk["until"])
+        except (ValueError, TypeError):
+            over = True
+        if over:
+            held["backup"] = None
+            return None
+    return bk
 
 
 def _backup_popup(book: str, user: str, version: str, bk: dict) -> None:

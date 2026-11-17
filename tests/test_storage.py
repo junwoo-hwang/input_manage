@@ -1227,3 +1227,16 @@ def test_reloading_a_book_drops_a_restore_meant_for_the_old_one():
     st.session_state[im.S_RESTORE] = {"token": "r-1", "version": "old", "sheets": []}
     im._seed("A", b"", {"S": pd.DataFrame()}, {}, "etag1")
     assert im.S_RESTORE not in st.session_state
+
+
+def test_a_held_offer_left_behind_is_not_offered_after_its_time():
+    """떠나기 직전에 읽어 둔 5분짜리 임시 저장을 한참 뒤 돌아와서 또 묻지 않는다."""
+    import streamlit as st
+    from datetime import datetime, timedelta, timezone
+    st.session_state.pop(im.S_BACKUP_OFFER, None)
+    st.session_state[im.S_NONCE] = 7
+    im.write_backup("A", "hong", "etag1", [], until=datetime.now(timezone.utc) + timedelta(minutes=5))
+    assert im._backup_offer("A", "hong") is not None
+    held = st.session_state[im.S_BACKUP_OFFER]["backup"]
+    held["until"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    assert im._backup_offer("A", "hong") is None
